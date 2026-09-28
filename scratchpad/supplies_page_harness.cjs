@@ -39,7 +39,7 @@ const ID_LIST = [
   'supRoot', 'supBookInModal', 'supBookInMsg', 'supBiProduct', 'supBiScanBlock', 'supBiScanLabel',
   'supBiScanInput', 'supBiScanHint', 'supBiStaged', 'supBiCountLabel', 'supBiQtyLabel',
   'supBiManualBtn', 'supBiExpected', 'supBiExpectedLabel', 'supBiExpectedHint', 'supBiPiecesBlock',
-  'supBiPieces', 'supBiCost', 'supBiDate', 'supBiSource', 'supBiBankField', 'supBiBank',
+  'supBiPieces', 'supBiPiecesLabel', 'supBiCost', 'supBiDate', 'supBiSource', 'supBiBankField', 'supBiBank',
   'supBiStockOnly', 'supBiNote', 'supBiSave', 'supProductModal', 'supPrMsg', 'supPrTitle',
   'supPrName', 'supPrMode', 'supPrPlu', 'supPrBarcode', 'supPrPiecesPer', 'supPrLow',
   'supPrActive', 'supPrCategory', 'supPrSave', 'supPrLockedHint', 'supPrPacketBarcode', 'supPrPacketKg',

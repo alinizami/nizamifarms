@@ -115,9 +115,24 @@ class HubController extends Controller
         // --- Apply scope -----------------------------------------------------------------------
         if ($scope === 'nf' || $scope === 'khaas') {
             $buId = $scope === 'nf' ? 1 : 2;
+            // ⚠⚠ The ROW's own business unit decides, as HQ Executive already does
+            //    (ExecutiveClosingService::scopeLedgerToUnit). Deciding by the ACCOUNTS put
+            //    every Frozen vendor purchase and payment under NF: all 20 Frozen vendor
+            //    accounts (and "Purchases") were created on BU 1, while the ledger rows
+            //    themselves carry BU 2 — 646 Frozen rows were invisible here, 1,236 showed
+            //    under NF. Moving the accounts instead would also change account visibility
+            //    and pay-from lists, so the rule is fixed here, not the data (Sep-2026).
+            //    Transfers still show on BOTH sides: money moving between the units
+            //    belongs to each of them.
             $buAccountIds = AccountModel::where('business_unit_id', $buId)->pluck('id')->toArray();
-            $query->where(function ($q) use ($buAccountIds) {
-                $q->whereIn('from_account_id', $buAccountIds)->orWhereIn('to_account_id', $buAccountIds);
+            $query->where(function ($q) use ($buId, $buAccountIds) {
+                $q->where('t_fin_ledger.business_unit_id', $buId)
+                  ->orWhere(function ($t) use ($buAccountIds) {
+                      $t->whereIn('transaction_type', ['transfer', 'company_transfer'])
+                        ->where(function ($a) use ($buAccountIds) {
+                            $a->whereIn('from_account_id', $buAccountIds)->orWhereIn('to_account_id', $buAccountIds);
+                        });
+                  });
             });
         } elseif ($scope === 'qurbani') {
             $query->tap(function ($q) {

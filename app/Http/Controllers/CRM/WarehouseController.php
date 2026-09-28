@@ -194,10 +194,21 @@ class WarehouseController extends Controller
                 // Non-critical, continue without sales data
             }
 
+            // 🛒 Sep-26: open-order demand per product — the SAME service and the same number
+            //   as the web Khaas Products card (accepted today + accepted for a later day).
+            //   Additive key; an older APK ignores it. Fails soft inside the service.
+            $orderDemand = [];
+            // ⭐ Sep-27 (owner): the Shopify approval queue rides along as `shopify` — shown
+            //   BESIDE the number on the phone, never added into `total` or Short by.
+            foreach (app(\App\Services\Khaas\OpenOrderDemandService::class)->byProduct((int) $businessUnitId, true) as $pid => $row) {
+                $orderDemand[(string) $pid] = $row;
+            }
+
             return response()->json([
                 'success' => true,
                 'warehouse_inventory' => $result,
                 'product_sales' => $salesByProduct,
+                'order_demand' => (object) $orderDemand,
                 // Empty skeleton for products with no sales at all, so the client renders the
                 // same labelled week rather than inventing its own day names.
                 'sales_window' => $salesWindow,
@@ -2875,7 +2886,7 @@ class WarehouseController extends Controller
             }
 
             try {
-                $startDate = \Carbon\Carbon::createFromFormat('Y-m', $monthStr)->startOfMonth();
+                $startDate = \Carbon\Carbon::createFromFormat('!Y-m', $monthStr)->startOfMonth();
             } catch (\Exception $e) {
                 return response()->json(['success' => false, 'message' => 'Invalid month format. Use YYYY-MM'], 400);
             }

@@ -37,12 +37,19 @@ class RecipeService
     /** @return array<int,array> */
     public function ingredients(int $businessUnitId = self::FROZEN_BU, bool $includeInactive = false): array
     {
+        // ⭐ Sep-26: how many recipe lines use each — additive, one grouped query. The
+        //   product form says "counted in PIECES in your recipes" before Save, not after.
+        $recipeCounts = RecipeLineModel::query()
+            ->groupBy('ingredient_id')
+            ->pluck(DB::raw('COUNT(*)'), 'ingredient_id')
+            ->all();
+
         return IngredientModel::where('business_unit_id', $businessUnitId)
             ->when(!$includeInactive, fn ($q) => $q->where('is_active', 1))
             ->orderByRaw("FIELD(kind,'meat','vegetable','dairy','dry','packaging','other')")
             ->orderBy('name')
             ->get()
-            ->map(fn (IngredientModel $i) => $i->shape())
+            ->map(fn (IngredientModel $i) => $i->shape() + ['recipe_count' => (int) ($recipeCounts[$i->id] ?? 0)])
             ->values()
             ->all();
     }
@@ -140,18 +147,31 @@ class RecipeService
         return $ingredient;
     }
 
+    /**
+     * ⚠ Anything that stores a number in this ingredient's unit. The plain edit form may
+     *   not change the unit under any of these — the "change everywhere" operation
+     *   (IngredientUnitChangeService) is the door that re-types them.
+     *   Sep-26: now also tagged vendor products (their pack size is in this unit — product
+     *   #82's "1 piece" would silently have become 1 g), consumption rows and openings.
+     */
     public function ingredientInUse(IngredientModel $ingredient): bool
     {
         if (RecipeLineModel::where('ingredient_id', $ingredient->id)->exists()) {
             return true;
         }
 
-        try {
-            return DB::table('t_fin_vendor_purchase_items')
-                ->where('ingredient_id', $ingredient->id)->exists();
-        } catch (\Throwable $e) {
-            return false;
+        foreach (['t_fin_vendor_purchase_items', 't_fin_vendor_products',
+                  't_crm_khaas_batch_consumption', 't_crm_khaas_ingredient_opening'] as $table) {
+            try {
+                if (DB::table($table)->where('ingredient_id', $ingredient->id)->exists()) {
+                    return true;
+                }
+            } catch (\Throwable $e) {
+                // column / table not there yet on this database
+            }
         }
+
+        return false;
     }
 
     // =================================================================
@@ -211,6 +231,8 @@ class RecipeService
                 'supply_state'    => $supply,
                 'linked_products' => $fact['linked_products'],
                 'linked_vendors'  => $fact['linked_vendors'],
+                // 🔗 Sep-27: WHICH products, so the recipe sheet can open one to change it.
+                'linked_list'     => $fact['linked_list'] ?? [],
                 'last_bought_on'  => $fact['last_bought_on'],
                 'ingredient_id'   => (int) $line->ingredient_id,
                 'ingredient_name' => $ing->name,
@@ -462,6 +484,9 @@ class RecipeService
                 'recipe_count'    => (int) $usage[$id]['count'],
                 'products'        => $usage[$id]['products'],
                 'linked_products' => (int) $link['count'],
+                // 🔗 Sep-27: linked, but only at vendors whose bills are one total
+                'at_total_only'   => !empty($link['list'])
+                    && !array_filter($link['list'], fn ($x) => $x['vendor_by_weight']),
                 'linked_vendors'  => $link['vendors'],
                 'last_bought_on'  => $when,
                 'hint'            => $state === 'not_linked'
@@ -491,6 +516,7 @@ class RecipeService
             $id = (int) $id;
             $out[$id] = [
                 'linked_products' => (int) ($links[$id]['count'] ?? 0),
+                'linked_list'     => $links[$id]['list'] ?? [],
                 'linked_vendors'  => $links[$id]['vendors'] ?? [],
                 'last_bought_on'  => $last[$id] ?? null,
             ];
@@ -529,13 +555,23 @@ class RecipeService
                 ->join('t_fin_vendors as v', 'v.id', '=', 'vp.vendor_id')
                 ->whereIn('vp.ingredient_id', $ingredientIds)
                 ->where('vp.is_active', 1)
-                ->select('vp.ingredient_id', 'v.vendor_name')
+                ->select('vp.ingredient_id', 'v.vendor_name', 'vp.id', 'vp.vendor_id', 'vp.product_name',
+                    'vp.unit', 'v.default_purchase_method')
                 ->get();
 
             foreach ($rows as $r) {
                 $id = (int) $r->ingredient_id;
-                $out[$id] ??= ['count' => 0, 'vendors' => []];
+                $out[$id] ??= ['count' => 0, 'vendors' => [], 'list' => []];
                 $out[$id]['count']++;
+                $out[$id]['list'][] = [
+                    'product_id'   => (int) $r->id,
+                    'vendor_id'    => (int) $r->vendor_id,
+                    'vendor_name'  => $r->vendor_name,
+                    'product_name' => $r->product_name,
+                    'unit'         => $r->unit,
+                    // ⚠ a product at a by-TOTAL vendor never gets a bill line, so never a price
+                    'vendor_by_weight' => $r->default_purchase_method === 'by_weight',
+                ];
                 if (!in_array($r->vendor_name, $out[$id]['vendors'], true)) {
                     $out[$id]['vendors'][] = $r->vendor_name;
                 }
@@ -565,6 +601,20 @@ class RecipeService
             }
         } catch (\Throwable $e) {
             // same as above
+        }
+
+        // 💲 Sep-27: a bill recorded BEFORE stamping existed still counts as "bought" —
+        //    the recipe card prices it (labelled "older bill"), so the badge beside the
+        //    same line must not say "never bought yet".
+        try {
+            $older = (new IngredientPriceService())->olderBillDates(self::FROZEN_BU, $ingredientIds);
+            foreach ($older as $id => $d) {
+                if (!isset($out[$id]) || $out[$id] === null || $d > $out[$id]) {
+                    $out[$id] = $d;
+                }
+            }
+        } catch (\Throwable $e) {
+            // pricing is a nicety here; the stamped answer above stands
         }
         return $out;
     }

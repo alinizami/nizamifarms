@@ -1013,6 +1013,17 @@ class RequestController extends Controller
             ], 400);
         }
 
+        // ⚠ A Storage take-out's expense is priced by the stock it drew, not typed. Editing its
+        // amount here would post a different figure than left the shelf, and the stock account
+        // and the shelf would never agree again (Sep-26 review). Storage has its own door.
+        if (!empty($requestModel->supply_takeout_id)) {
+            return response()->json([
+                'success' => false,
+                'message' => 'This expense comes from a Storage take-out. Undo it, or ask Taimur or Shabib '
+                    . 'to edit or delete the take-out on the Storage page.',
+            ], 422);
+        }
+
         $validated = $request->validate([
             'title' => 'required|string|max:255',
             'description' => 'nullable|string',

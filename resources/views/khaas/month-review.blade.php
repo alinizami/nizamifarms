@@ -292,6 +292,153 @@
         </div>
     </div>
 
+    {{-- ── 💲 Recipe vs purchases (Sep-27) ─────────────────────────
+         "N packs were made — what should they have cost, and what did we buy?" Three
+         honest parts: what CAN be compared, purchase money that cannot (bills with no
+         lines / lines not linked), and packs with no recipe. History is not restated
+         (owner ruling 27-Sep), so this fills in as itemised bills and recipes build up.
+         Rupees need view_khaas_costing and are stripped on the server; counts and
+         quantities stay for everyone in Frozen mode. --}}
+    @php $rvp = $review['recipe_vs_purchases'] ?? null; @endphp
+    @if($rvp && $rvp['packs']['made'] > 0)
+    <details class="mr-card" open>
+        <summary>
+            <span>Recipe vs purchases</span>
+            <span class="mr-amt">{{ number_format($rvp['packs']['costed']) }} of {{ number_format($rvp['packs']['made']) }} packs costed</span>
+        </summary>
+        <div class="mr-body">
+            <div class="mr-scroll">
+            <table class="mr-table">
+                <tbody>
+                    <tr>
+                        <td><b>Packs made</b><div class="mr-ing-kind">stocked into the warehouse, through a plan or entered directly</div></td>
+                        <td>{{ number_format($rvp['packs']['made']) }}
+                            <div class="mr-ing-kind">{{ number_format($rvp['packs']['plan']) }} plan · {{ number_format($rvp['packs']['direct']) }} direct</div></td>
+                    </tr>
+                    <tr>
+                        <td><b>Packs with a recipe</b><div class="mr-ing-kind">only these can be costed</div></td>
+                        <td>{{ number_format($rvp['packs']['costed']) }}
+                            @if($rvp['packs']['uncosted'] > 0)<div class="mr-ing-kind">{{ number_format($rvp['packs']['uncosted']) }} had no recipe</div>@endif</td>
+                    </tr>
+                    @if($canSeeIngredientCost)
+                    <tr>
+                        <td><b>What the recipes say they cost</b><div class="mr-ing-kind">at this month's average prices</div></td>
+                        <td>Rs {{ number_format($rvp['recipe_cost'] ?? 0) }}
+                            @if($rvp['packs']['costed'] > 0)<div class="mr-ing-kind">Rs {{ number_format($rvp['recipe_per_pack'] ?? 0, 2) }} a pack</div>@endif</td>
+                    </tr>
+                    @endif
+                    @if($canSeeIngredientCost && $canSeeCosts && $rvp['purchases']['total'] !== null)
+                    <tr>
+                        <td><b>Product purchases this month</b></td>
+                        <td>Rs {{ number_format($rvp['purchases']['total']) }}</td>
+                    </tr>
+                    <tr>
+                        <td style="padding-left:18px;">· meat, from storage orders</td>
+                        <td>Rs {{ number_format($rvp['purchases']['meat']) }}</td>
+                    </tr>
+                    <tr>
+                        <td style="padding-left:18px;">· ingredients on itemised bills <div class="mr-ing-kind">these can be compared with the recipes</div></td>
+                        <td>Rs {{ number_format($rvp['purchases']['itemised']) }}</td>
+                    </tr>
+                    @if(($rvp['purchases']['untagged'] ?? 0) > 0)
+                    <tr>
+                        <td style="padding-left:18px;">· bill lines not linked to an ingredient</td>
+                        <td>Rs {{ number_format($rvp['purchases']['untagged']) }}</td>
+                    </tr>
+                    @endif
+                    <tr>
+                        <td style="padding-left:18px;">· bills recorded as one total <div class="mr-ing-kind">cannot be matched to a recipe</div></td>
+                        <td>Rs {{ number_format($rvp['purchases']['not_itemised']) }}</td>
+                    </tr>
+                    @endif
+                </tbody>
+            </table>
+            </div>
+
+            @if(!empty($rvp['ingredients']['rows']))
+                <div class="mr-ing-note" style="margin-top:10px;"><b>Ingredient by ingredient</b> — bought on itemised bills vs what the recipes say the packs used</div>
+                <div class="mr-scroll">
+                <table class="mr-table">
+                    <thead><tr><th>Ingredient</th><th>Bought</th><th>Recipes used</th><th>Difference</th></tr></thead>
+                    <tbody>
+                    @foreach($rvp['ingredients']['rows'] as $r)
+                        <tr>
+                            <td>{{ $r['name'] }}</td>
+                            <td>{{ $r['bought_text'] }}</td>
+                            <td>{{ $r['used_text'] }}</td>
+                            <td class="{{ $r['direction'] === 'used_more' ? 'mr-ing-short' : '' }}">
+                                @switch($r['direction'])
+                                    @case('not_bought') not bought this month @break
+                                    @case('not_used') none used @break
+                                    @case('used_more') recipes used more than was bought @break
+                                    @default more bought than used
+                                @endswitch
+                                @if($canSeeIngredientCost && $r['diff_value'] !== null && $r['has_rate'])
+                                    <div class="mr-ing-kind">Rs {{ number_format(abs($r['diff_value'])) }}</div>
+                                @endif
+                            </td>
+                        </tr>
+                    @endforeach
+                    </tbody>
+                </table>
+                </div>
+            @endif
+
+            @if(!empty($rvp['meat']))
+                <div class="mr-ing-note" style="margin-top:10px;"><b>Meat</b> — what the recipes say vs what storage says left the freezer</div>
+                <div class="mr-scroll">
+                <table class="mr-table">
+                    <thead><tr><th>Meat</th><th>Recipes say</th><th>Storage says</th><th>Difference</th></tr></thead>
+                    <tbody>
+                    @foreach($rvp['meat'] as $m)
+                        <tr>
+                            <td>{{ $m['name'] }}</td>
+                            <td>{{ $m['direction'] === 'no_recipe' ? '—' : $m['recipe_text'] }}</td>
+                            <td>{{ $m['storage_text'] }}</td>
+                            <td>
+                                @if($m['direction'] === 'no_recipe') no recipe covered these packs
+                                @elseif($m['direction'] === 'matches') matches
+                                @else {{ $m['diff_text'] }} {{ $m['direction'] === 'more_used' ? 'more used than the recipes say' : 'less used than the recipes say' }}
+                                @endif
+                                @if($canSeeIngredientCost && $m['diff_value'] !== null && $m['direction'] !== 'matches' && $m['direction'] !== 'no_recipe')
+                                    <div class="mr-ing-kind">Rs {{ number_format(abs($m['diff_value'])) }}</div>
+                                @endif
+                            </td>
+                        </tr>
+                    @endforeach
+                    </tbody>
+                </table>
+                </div>
+            @endif
+
+            @if(!empty($rvp['products']))
+                <div class="mr-ing-note" style="margin-top:10px;"><b>By product</b> — recipe cost of what was made, against its price</div>
+                <div class="mr-scroll">
+                <table class="mr-table">
+                    <thead><tr><th>Product</th><th>Made (with a recipe)</th>@if($canSeeIngredientCost)<th>Ingredients a pack</th><th>Share of price</th>@endif</tr></thead>
+                    <tbody>
+                    @foreach($rvp['products'] as $p)
+                        <tr>
+                            <td>{{ $p['product_name'] }}</td>
+                            <td>{{ number_format($p['made']) }}</td>
+                            @if($canSeeIngredientCost)
+                                <td>Rs {{ number_format($p['cost_per_pack'] ?? 0, 2) }}</td>
+                                <td>{{ $p['share_of_price'] !== null ? $p['share_of_price'] . '% of Rs ' . number_format($p['selling_price']) : '—' }}</td>
+                            @endif
+                        </tr>
+                    @endforeach
+                    </tbody>
+                </table>
+                </div>
+            @endif
+
+            @foreach($rvp['notes'] as $n)
+                <div class="mr-ing-note">ℹ {{ $n }}</div>
+            @endforeach
+        </div>
+    </details>
+    @endif
+
     {{-- ── ❄ Ingredients: bought, used, left ──────────────────────
          An ESTIMATE, and it says so on the face. Quantities are open to anyone in
          Frozen mode; the rupees need view_khaas_costing and are stripped on the

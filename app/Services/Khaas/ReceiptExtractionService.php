@@ -29,28 +29,69 @@ use Illuminate\Support\Facades\Storage;
  */
 class ReceiptExtractionService
 {
-    public const VERSION = 'receipt@v1';
+    public const VERSION = 'receipt@v2';
+
+    // Why a read failed — the controller turns each into an honest sentence for the
+    // person holding the phone. Before this there was ONE sentence ("better light") for
+    // every failure, and in production every failure was actually the model stalling.
+    public const FAIL_NO_KEY     = 'no_key';
+    public const FAIL_NO_IMAGE   = 'no_image';
+    public const FAIL_TIMEOUT    = 'timeout';     // no answer inside the per-try window
+    public const FAIL_LOOPED     = 'looped';      // answered, but ran into the output cap
+    public const FAIL_BUSY       = 'busy';        // 429 rate / 5xx
+    public const FAIL_NO_CREDIT  = 'no_credit';   // prepaid balance used up
+    public const FAIL_REFUSED    = 'refused';     // 400/401/403/404 — a setup problem
+    public const FAIL_UNREADABLE = 'unreadable';  // empty / blocked / not JSON
+
+    /**
+     * ⚠⚠ THE PRODUCTION FAILURE (Sep-2026): with `NUMBER` fields in the schema, Gemini
+     *    sometimes falls into a digit loop INSIDE a number ("0000000…", "20932093…") and
+     *    keeps generating until the model's own output ceiling (~65k tokens). A
+     *    non-streamed call returns nothing until it finishes, so our timeout saw
+     *    "0 bytes received" — all three of Qasim's scans died exactly at 45 s. And the
+     *    stalled generation is still BILLED at the full ceiling after we hang up.
+     *    Measured fix: amounts as STRING (6/6 clean) + a hard output cap, so a loop that
+     *    still happens ends in seconds as MAX_TOKENS instead of billing for minutes.
+     *    A normal 15-line slip is ~850–1,800 output tokens.
+     */
+    private const MAX_OUTPUT_TOKENS = 6144;
+    /** Per attempt. Two attempts stay inside the phone's 90 s request timeout. */
+    private const PER_TRY_TIMEOUT   = 25;
+    private const MAX_ATTEMPTS      = 2;
+
+    /** @var array{reason: string, detail: string, status: ?int, seconds: float, attempts: int}|null */
+    private ?array $lastFailure = null;
+
+    /** Why the last extract() returned null. Null after a successful read. */
+    public function lastFailure(): ?array
+    {
+        return $this->lastFailure;
+    }
 
     /**
      * @return array{lines: array, store_name: ?string, receipt_no: ?string,
      *               receipt_date: ?string, grand_total: ?float, subtotal: ?float,
      *               discount_total: ?float, confidence: string, raw: string}|null
-     *         Null on a hard failure so the caller can keep the draft and retry.
+     *         Null on a hard failure so the caller can keep the draft and retry;
+     *         lastFailure() says why.
      */
     public function extract(string $storageRelativePath): ?array
     {
+        $this->lastFailure = null;
+        $started = microtime(true);
+
         $cfg    = config('assistant.gemini');
         $apiKey = $cfg['api_key'] ?? config('payment_signals.gemini.api_key') ?? '';
 
         if (!$apiKey) {
             Log::warning('ReceiptExtraction: no API key configured');
-            return null;
+            return $this->fail(self::FAIL_NO_KEY, 'no API key configured', null, $started, 0);
         }
 
         $disk = Storage::disk(config('whatsapp.media_disk', 'public'));
         if (!$disk->exists($storageRelativePath)) {
             Log::warning('ReceiptExtraction: image not found', ['path' => $storageRelativePath]);
-            return null;
+            return $this->fail(self::FAIL_NO_IMAGE, 'stored image not found', null, $started, 0);
         }
 
         $bytes = $disk->get($storageRelativePath);
@@ -60,51 +101,91 @@ class ReceiptExtractionService
         $endpoint = rtrim($cfg['base_url'] ?? 'https://generativelanguage.googleapis.com', '/')
             . '/v1beta/models/' . $model . ':generateContent';
 
-        $payload = [
-            'contents' => [[
-                'parts' => [
-                    ['text' => $this->prompt()],
-                    ['inline_data' => ['mime_type' => $mime, 'data' => base64_encode($bytes)]],
+        $attempt  = 0;
+        $response = null;
+        $parsed   = null;
+        $text     = null;
+
+        while ($attempt < self::MAX_ATTEMPTS) {
+            $attempt++;
+
+            $payload = [
+                'contents' => [[
+                    'parts' => [
+                        ['text' => $this->prompt()],
+                        ['inline_data' => ['mime_type' => $mime, 'data' => base64_encode($bytes)]],
+                    ],
+                ]],
+                'generationConfig' => [
+                    // A retry nudges the temperature: the digit loop is a decoding rut, and
+                    // an identical request at 0 is the likeliest way back into it.
+                    'temperature'      => $attempt === 1 ? 0 : 0.2,
+                    'maxOutputTokens'  => self::MAX_OUTPUT_TOKENS,
+                    'responseMimeType' => 'application/json',
+                    'responseSchema'   => $this->responseSchema(),
+                    // Reading a printed list is mechanical; thought tokens are billed as
+                    // output and buy nothing here. Same setting the Assistant uses.
+                    'thinkingConfig'   => ['thinkingBudget' => 0],
                 ],
-            ]],
-            'generationConfig' => [
-                'temperature'      => 0,
-                'responseMimeType' => 'application/json',
-                'responseSchema'   => $this->responseSchema(),
-                // Reading a printed list is mechanical; thought tokens are billed as
-                // output and buy nothing here. Same setting the Assistant uses.
-                'thinkingConfig'   => ['thinkingBudget' => 0],
-            ],
-        ];
+            ];
 
-        try {
-            $response = Http::timeout((int) ($cfg['timeout'] ?? 45))
-                ->withQueryParameters(['key' => $apiKey])
-                ->post($endpoint, $payload);
-        } catch (\Throwable $e) {
-            // ⚠ SECURITY: a cURL error message carries the full request URL, and the
-            //   URL carries ?key=<API_KEY>. Redact before it reaches the log.
-            Log::error('ReceiptExtraction: request failed', ['error' => $this->redactKey($e->getMessage())]);
-            return null;
+            try {
+                $response = Http::timeout(self::PER_TRY_TIMEOUT)
+                    ->withQueryParameters(['key' => $apiKey])
+                    ->post($endpoint, $payload);
+            } catch (\Throwable $e) {
+                // ⚠ SECURITY: a cURL error message carries the full request URL, and the
+                //   URL carries ?key=<API_KEY>. Redact before it reaches the log.
+                $msg = $this->redactKey($e->getMessage());
+                Log::error('ReceiptExtraction: request failed', ['attempt' => $attempt, 'error' => $msg]);
+                $this->lastFailure = $this->failure(self::FAIL_TIMEOUT, mb_substr($msg, 0, 160), null, $started, $attempt);
+                continue; // a stall is worth one more try
+            }
+
+            if (!$response->successful()) {
+                $status = $response->status();
+                $body   = $this->redactKey(mb_substr($response->body(), 0, 400));
+                Log::error('ReceiptExtraction: non-200', ['attempt' => $attempt, 'status' => $status, 'body' => $body]);
+
+                $reason = $this->reasonForStatus($status, $body);
+                $this->lastFailure = $this->failure($reason, mb_substr($body, 0, 160), $status, $started, $attempt);
+                if ($reason === self::FAIL_BUSY) {
+                    continue;
+                }
+                return null; // no credit / refused: asking again changes nothing
+            }
+
+            $finish = (string) data_get($response->json(), 'candidates.0.finishReason', '');
+            $text   = data_get($response->json(), 'candidates.0.content.parts.0.text');
+
+            if ($finish === 'MAX_TOKENS') {
+                Log::warning('ReceiptExtraction: hit the output cap (model looped)', [
+                    'attempt' => $attempt,
+                    'tail'    => mb_substr((string) $text, -60),
+                ]);
+                $this->lastFailure = $this->failure(self::FAIL_LOOPED, 'output cap reached', 200, $started, $attempt);
+                continue;
+            }
+
+            if (!$text) {
+                Log::warning('ReceiptExtraction: empty candidate', ['attempt' => $attempt, 'finish' => $finish]);
+                $this->lastFailure = $this->failure(self::FAIL_UNREADABLE, 'empty reply (' . ($finish ?: 'no reason') . ')', 200, $started, $attempt);
+                continue;
+            }
+
+            $parsed = json_decode($text, true);
+            if (!is_array($parsed)) {
+                Log::warning('ReceiptExtraction: reply was not JSON', ['attempt' => $attempt, 'text' => mb_substr($text, 0, 300)]);
+                $this->lastFailure = $this->failure(self::FAIL_UNREADABLE, 'reply was not JSON', 200, $started, $attempt);
+                $parsed = null;
+                continue;
+            }
+
+            $this->lastFailure = null;
+            break;
         }
 
-        if (!$response->successful()) {
-            Log::error('ReceiptExtraction: non-200', [
-                'status' => $response->status(),
-                'body'   => $this->redactKey(mb_substr($response->body(), 0, 400)),
-            ]);
-            return null;
-        }
-
-        $text = data_get($response->json(), 'candidates.0.content.parts.0.text');
-        if (!$text) {
-            Log::warning('ReceiptExtraction: empty candidate');
-            return null;
-        }
-
-        $parsed = json_decode($text, true);
         if (!is_array($parsed)) {
-            Log::warning('ReceiptExtraction: reply was not JSON', ['text' => mb_substr($text, 0, 300)]);
             return null;
         }
 
@@ -196,12 +277,19 @@ and grand_total.
 Lines that are charges rather than goods — "FBR POS Charges", service or delivery fees,
 rounding — are still real printed lines: return them, with sold_by "unknown".
 
+Write every number as the digits printed, as a short string like "520.93" or "5.00" —
+no currency word, no thousands commas. Never pad a number with extra digits.
+
 Read only what is printed. Do not calculate, correct or complete anything: if a number is
 unreadable, return null for it. Somebody will check every line against the paper before
 any of it is saved.
 TXT;
     }
 
+    /**
+     * ⚠⚠ Every amount is a STRING on purpose — see MAX_OUTPUT_TOKENS. `NUMBER` is what
+     *    let the model loop on digits. toAmount() reads the strings back.
+     */
     private function responseSchema(): array
     {
         return [
@@ -210,9 +298,9 @@ TXT;
                 'store_name'     => ['type' => 'STRING', 'nullable' => true],
                 'receipt_no'     => ['type' => 'STRING', 'nullable' => true],
                 'receipt_date'   => ['type' => 'STRING', 'nullable' => true],
-                'subtotal'       => ['type' => 'NUMBER', 'nullable' => true],
-                'discount_total' => ['type' => 'NUMBER', 'nullable' => true],
-                'grand_total'    => ['type' => 'NUMBER', 'nullable' => true],
+                'subtotal'       => ['type' => 'STRING', 'nullable' => true],
+                'discount_total' => ['type' => 'STRING', 'nullable' => true],
+                'grand_total'    => ['type' => 'STRING', 'nullable' => true],
                 'confidence'     => ['type' => 'STRING'],
                 'lines' => [
                     'type'  => 'ARRAY',
@@ -220,12 +308,12 @@ TXT;
                         'type'       => 'OBJECT',
                         'properties' => [
                             'raw_name'        => ['type' => 'STRING'],
-                            'qty'             => ['type' => 'NUMBER', 'nullable' => true],
-                            'unit_price'      => ['type' => 'NUMBER', 'nullable' => true],
-                            'line_total'      => ['type' => 'NUMBER', 'nullable' => true],
-                            'discount'        => ['type' => 'NUMBER', 'nullable' => true],
+                            'qty'             => ['type' => 'STRING', 'nullable' => true],
+                            'unit_price'      => ['type' => 'STRING', 'nullable' => true],
+                            'line_total'      => ['type' => 'STRING', 'nullable' => true],
+                            'discount'        => ['type' => 'STRING', 'nullable' => true],
                             'sold_by'         => ['type' => 'STRING', 'nullable' => true],
-                            'pack_size_value' => ['type' => 'NUMBER', 'nullable' => true],
+                            'pack_size_value' => ['type' => 'STRING', 'nullable' => true],
                             'pack_size_unit'  => ['type' => 'STRING', 'nullable' => true],
                         ],
                         'required' => ['raw_name'],
@@ -308,16 +396,60 @@ TXT;
         }
     }
 
+    /**
+     * Amounts arrive as STRINGS (see MAX_OUTPUT_TOKENS) and are printed the shop's way:
+     * "Rs1,188.63", "Rs. 2,895.00", "PKR 60", "-60.00".
+     * ⚠ The old version stripped every non-digit, so "Rs.1,000" became ".1000" = 0.1.
+     *   The currency word is removed FIRST, then separators.
+     */
     private function toAmount($v): ?float
     {
         if ($v === null || $v === '') {
             return null;
         }
-        if (is_numeric($v)) {
+        if (is_int($v) || is_float($v)) {
             return round((float) $v, 3);
         }
-        $clean = preg_replace('/[^0-9.\-]/', '', (string) $v);
-        return is_numeric($clean) ? round((float) $clean, 3) : null;
+        $s = trim((string) $v);
+        $s = preg_replace('/^(?:rs\.?|pkr)\s*/i', '', $s);
+        $s = str_replace([',', ' '], '', $s);
+        if (preg_match('/^-?\d+(?:\.\d+)?$/', $s)) {
+            return round((float) $s, 3);
+        }
+        // Anything else ("2.00 kg", "Rs 60 off"): the first number in it, or nothing.
+        if (preg_match('/-?\d+(?:\.\d+)?/', $s, $m)) {
+            return round((float) $m[0], 3);
+        }
+        return null;
+    }
+
+    private function reasonForStatus(int $status, string $body): string
+    {
+        if ($status === 429) {
+            // Google answers a used-up prepaid balance with 429 too — but no retry helps it.
+            return preg_match('/credit|billing|prepay/i', $body) ? self::FAIL_NO_CREDIT : self::FAIL_BUSY;
+        }
+        if ($status >= 500) {
+            return self::FAIL_BUSY;
+        }
+        return self::FAIL_REFUSED;
+    }
+
+    private function failure(string $reason, string $detail, ?int $status, float $started, int $attempts): array
+    {
+        return [
+            'reason'   => $reason,
+            'detail'   => $detail,
+            'status'   => $status,
+            'seconds'  => round(microtime(true) - $started, 1),
+            'attempts' => $attempts,
+        ];
+    }
+
+    private function fail(string $reason, string $detail, ?int $status, float $started, int $attempts): ?array
+    {
+        $this->lastFailure = $this->failure($reason, $detail, $status, $started, $attempts);
+        return null;
     }
 
     private function redactKey(string $s): string

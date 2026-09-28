@@ -527,7 +527,10 @@ class FrozenCostingService
                 ->whereIn('l.approval_status', self::POSTED_STATUSES)
                 ->whereBetween('l.transaction_date', [$from->toDateString(), $to->toDateString()])
                 ->whereIn('i.ingredient_id', $ingredientIds)
-                ->where('i.qty_base', '>', 0);
+                ->where('i.qty_base', '>', 0)
+                // ⚠ Sep-27: a Rs 350 bill typed as "350 at Rs 1" is money, not a quantity —
+                //   it must not set a rate here either (same rule as the recipe card).
+                ->whereRaw(IngredientPriceService::NOT_MONEY_AS_QUANTITY);
 
             QurbaniFinanceFilter::applyToLedgerQuery($q, 'l', QurbaniFinanceFilter::MODE_EXCLUDE);
 

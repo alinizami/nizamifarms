@@ -297,9 +297,9 @@
             </div>
         </div>
 
-        {{-- pieces --}}
+        {{-- pieces, and packet products: a typed count --}}
         <div class="sup-field sup-none" id="supBiPiecesBlock">
-            <label class="sup-label">How many pieces?</label>
+            <label class="sup-label" id="supBiPiecesLabel">How many pieces?</label>
             <input type="number" class="sup-input" id="supBiPieces" min="1" step="1" placeholder="e.g. 500">
         </div>
 
@@ -454,7 +454,7 @@
             <label class="sup-label">How is one packet counted?</label>
             <select class="sup-select" id="supPrMode" onchange="supPrModeChanged()">
                 <option value="weight">By weight — scan the scale label (kg)</option>
-                <option value="scan">By packet — scan a fixed barcode, 1 scan = 1 packet</option>
+                <option value="scan">By packet — scan a barcode or scale label, 1 scan = 1 packet</option>
                 <option value="pieces">By piece — no scanning, type the count</option>
             </select>
         </div>
@@ -468,6 +468,13 @@
         <div class="sup-field sup-none" id="supPrBarcodeField">
             <label class="sup-label">Product barcode</label>
             <input type="text" class="sup-input" id="supPrBarcode" maxlength="40" placeholder="Scan it, or type it">
+            {{-- ⭐ Sep-25: labels printed on the Czerlop scale carry a count ("1 pcs") inside
+                 the barcode, so the full 13 digits change with the count. The bare scale
+                 number is what identifies the product — the server reads 1-6 digits here
+                 as a scale number and accepts every label that carries it. --}}
+            <div class="sup-hint">The vendor's barcode — or, if you print the labels on the Czerlop scale,
+                just the scale number (e.g. <b>176</b>). Every label with that number then counts as one
+                packet, whatever count it prints.</div>
         </div>
 
         {{-- ⭐ Only needed when the INNER packets carry a vendor barcode with no weight in
@@ -672,12 +679,19 @@
                         '<td>' + esc(t.taken_by_name || (t.mine ? 'you' : '')) + '</td>' +
                         '<td>' + esc(t.status) + (t.request_number ? '<div class="sup-pmeta">' + esc(t.request_number) + '</div>' : '') + '</td>' +
                         '<td style="white-space:nowrap;">' +
-                          (t.can_edit ? '<button class="sup-btn" onclick="supOpenEditTakeout(' + t.id + ',' + Number(t.qty) + ',\'' + esc(t.product_name) + '\')">Edit weight</button> ' : '') +
+                          (t.can_edit ? '<button class="sup-btn" onclick="supOpenEditTakeout(' + t.id + ',' + Number(t.qty) + ',\'' + esc(t.product_name) + '\',\'' + esc(t.unit || '') + '\')">' + (t.unit === 'pcs' ? 'Edit count' : 'Edit weight') + '</button> ' : '') +
                           (t.can_delete ? '<button class="sup-btn sup-btn-danger" onclick="supDeleteTakeout(' + t.id + ',\'' + esc(t.qty_label || '') + '\')">Delete</button>' : '') +
                         '</td></tr>';
                 }).join('') + '</tbody></table></div>';
         });
     };
+
+    /* The stock cards are drawn by the server, so a fix still reloads the page — but it
+       comes back on the Take-outs tab, where the manager was working (Sep-26). */
+    function supReloadOnTakeouts() {
+        try { window.sessionStorage.setItem('supTab', 'takeouts'); } catch (e) { /* private mode */ }
+        window.location.reload();
+    }
 
     window.supDeleteTakeout = function (id, label) {
         if (!window.confirm('Delete this take-out?\n\n' + label + ' goes back into Storage, and if it was ' +
@@ -685,17 +699,19 @@
         post('/supplies/take-out/' + id + '/delete', { reason: 'Deleted from the Storage page' }).then(function (r) {
             if (!r.ok || !r.data.success) { window.alert((r.data && r.data.message) || 'Could not delete it.'); return; }
             window.alert(r.data.message);
-            window.location.reload();
+            supReloadOnTakeouts();
         }).catch(function () { window.alert('Could not reach the server. Nothing was changed.'); });
     };
 
     /* ⭐ Editing a weight moves money, so the figure is previewed BEFORE anything happens —
        and if it would restate a month already reported, it says so. */
     var editingTakeout = null;
-    window.supOpenEditTakeout = function (id, qty, name) {
+    window.supOpenEditTakeout = function (id, qty, name, unit) {
         editingTakeout = id;
         msg('supEdMsg', '');
-        document.getElementById('supEdTitle').textContent = 'Correct the weight — ' + name;
+        document.getElementById('supEdTitle').textContent =
+            (unit === 'pcs' ? 'Correct the count — ' : 'Correct the weight — ') + name;
+        document.getElementById('supEdQty').step = unit === 'pcs' ? '1' : '0.001';
         document.getElementById('supEdQty').value = qty;
         document.getElementById('supEdReason').value = '';
         document.getElementById('supEdPreview').innerHTML = 'Change the figure and press <b>Show me what changes</b>.';
@@ -723,7 +739,7 @@
                       'that month\'s packaging cost — which is the honest figure, but it will move.</div>'
                     : '');
             document.getElementById('supEdApply').classList.remove('sup-none');
-        });
+        }).catch(function () { msg('supEdMsg', 'Could not reach the server. Nothing was changed.'); });
     };
 
     window.supApplyEditTakeout = function () {
@@ -736,7 +752,7 @@
             btn.disabled = false;
             if (!r.ok || !r.data.success) { msg('supEdMsg', (r.data && r.data.message) || 'Could not save.'); return; }
             window.alert(r.data.message);
-            window.location.reload();
+            supReloadOnTakeouts();
         }).catch(function () { btn.disabled = false; msg('supEdMsg', 'Could not reach the server. Nothing was changed.'); });
     };
 
@@ -897,9 +913,16 @@
         staged = [];
         renderStaged();
         if (!p) { return; }
-        var isPieces = p.mode === 'pieces';
-        show('supBiScanBlock', !isPieces);
-        show('supBiPiecesBlock', isPieces);
+        // ⭐ Only a WEIGHED product is scanned in — each label carries a different weight.
+        // A packet product is booked by COUNT ("10 packets, Rs X"): its labels are all the
+        // same, so scanning ten of them tells the server nothing a typed 10 does not.
+        var typedCount = p.mode === 'pieces' || p.mode === 'scan';
+        show('supBiScanBlock', !typedCount);
+        show('supBiPiecesBlock', typedCount);
+        document.getElementById('supBiPiecesLabel').textContent =
+            p.mode === 'scan' ? 'How many packets?' : 'How many pieces?';
+        document.getElementById('supBiPieces').placeholder = p.mode === 'scan' ? 'e.g. 10' : 'e.g. 500';
+        document.getElementById('supBiPieces').max = p.mode === 'scan' ? '200' : '';
 
         var label = document.getElementById('supBiScanLabel');
         var hint = document.getElementById('supBiScanHint');
@@ -1103,6 +1126,11 @@
         if (p.mode === 'pieces') {
             body.pieces_qty = parseFloat(document.getElementById('supBiPieces').value || '0');
             if (!(body.pieces_qty > 0)) { msg('supBookInMsg', 'How many pieces are you adding?'); return; }
+        } else if (p.mode === 'scan') {
+            var n = Number(document.getElementById('supBiPieces').value || '0');
+            if (!(n >= 1) || Math.floor(n) !== n) { msg('supBookInMsg', 'How many packets are you adding? (a whole number)'); return; }
+            if (n > 200) { msg('supBookInMsg', 'At most 200 packets in one purchase — split it into two.'); return; }
+            body.packet_count = n;
         } else {
             if (!staged.length) { msg('supBookInMsg', 'Scan at least one packet.'); return; }
             body.packets = staged;
@@ -1199,6 +1227,8 @@
             // a torn label must never stop the store.
             if (takeOut.pooled) {
                 var isWeight = p.mode === 'weight';
+                // (Sep-26: exactly as it was — the owner ruled weighed and counted products
+                // stay typeable for everyone; only PACKET products are scan-only for staff.)
                 body.innerHTML =
                     '<div class="sup-field">' +
                       '<label class="sup-label">Scan the packet</label>' +
@@ -1223,27 +1253,79 @@
                 return;
             }
 
-            get('/supplies/' + encodeURIComponent(productId) + '/packets').then(function (r) {
-                var packets = (r.data && r.data.packets) || [];
-                takeOut.packets = packets;
-                if (!packets.length) {
-                    body.innerHTML = '<div class="sup-empty">Nothing left in Storage. Ask Taimur or Shabib to book the new stock.</div>';
-                    document.getElementById('supToConfirm').disabled = true;
-                    return;
-                }
-                document.getElementById('supToConfirm').disabled = false;
-                body.innerHTML =
-                    '<div class="sup-field"><label class="sup-label">Which packet?</label>' +
-                    '<select class="sup-select" id="supToPacket">' +
-                    packets.map(function (pk, i) {
-                        return '<option value="' + pk.id + '">' + esc(pk.qty_label) +
-                            ' — Rs ' + money(pk.cost) + (pk.batch_date ? ' (bought ' + esc(pk.batch_date) + ')' : '') +
-                            (i === 0 ? ' · oldest' : '') + '</option>';
-                    }).join('') +
-                    '</select>' +
-                    '<div class="sup-hint">The oldest packet is picked first. Scanning on the phone chooses it for you.</div></div>';
-            });
+            // ⭐ A PACKET product: one scan = one packet, the oldest on the shelf. The
+            // server picks it and prices it; this page only shows what it said. There is
+            // no "which packet?" list any more — every packet is the same thing, and the
+            // list was a take-out without a scan, open to everyone.
+            takeOut.chosen = null;
+            takeOut.scanned = null;
+            document.getElementById('supToConfirm').disabled = true;
+            body.innerHTML =
+                '<div class="sup-field">' +
+                  '<label class="sup-label">Scan the packet</label>' +
+                  '<input type="text" class="sup-input" id="supToScan" autocomplete="off"' +
+                    ' placeholder="Scan the label" onkeydown="supToPacketScanKey(event)">' +
+                  '<div class="sup-hint" id="supToQuote">One scan = one packet. The oldest one on the shelf is taken first.</div>' +
+                '</div>' +
+                (CAN_MANAGE
+                    ? '<button class="sup-btn" onclick="supToWithoutScan()">Take one out without scanning</button>'
+                    : '');
+            setTimeout(function () {
+                var i = document.getElementById('supToScan');
+                if (i) { i.focus(); }
+            }, 120);
         });
+    };
+
+    /* Show the packet the server picked — "1 packet — Rs X · of 10 packets on the shelf". */
+    function supToShowPacket(d, scanned) {
+        takeOut.chosen = d.packet.id;
+        takeOut.scanned = scanned || null;
+        var hint = document.getElementById('supToQuote');
+        if (hint) {
+            hint.innerHTML = '<b>' + esc(d.packet.qty_label) + '</b> — ' +
+                (d.packet.free ? 'no charge (already expensed)' : 'Rs ' + money(d.packet.cost)) +
+                (d.on_shelf_label ? ' · of ' + esc(d.on_shelf_label) + ' on the shelf' : '') +
+                (d.packet.batch_date ? ' · bought ' + esc(d.packet.batch_date) : '') +
+                (scanned ? '' : ' <span style="color:#B45309;">(without scanning)</span>');
+        }
+        document.getElementById('supToConfirm').disabled = false;
+    }
+
+    window.supToPacketScanKey = function (ev) {
+        if (ev.key !== 'Enter') { return; }
+        ev.preventDefault();
+        var input = ev.target;
+        var raw = (input.value || '').trim();
+        input.value = '';
+        if (!raw) { return; }
+
+        post('/supplies/resolve-scan', { barcode: raw }).then(function (r) {
+            var d = r.data || {};
+            if (!r.ok || !d.success || !d.packet) {
+                msg('supToMsg', d.message || 'Could not read that label.');
+                return;
+            }
+            if (Number(d.product && d.product.id) !== Number(takeOut.productId)) {
+                msg('supToMsg', 'That label is ' + esc((d.product || {}).name || 'another item') + '.');
+                return;
+            }
+            msg('supToMsg', '');
+            supToShowPacket(d, d.scanned_barcode || raw);
+        }).catch(supToOffline);
+    };
+
+    /* Managers only — the server refuses anyone else. */
+    window.supToWithoutScan = function () {
+        post('/supplies/take-out/quote', { product_id: takeOut.productId }).then(function (r) {
+            var d = r.data || {};
+            if (!r.ok || !d.success || !d.packet) {
+                msg('supToMsg', d.message || 'Could not work that out.');
+                return;
+            }
+            msg('supToMsg', '');
+            supToShowPacket(d, null);
+        }).catch(supToOffline);
     };
 
     /* The scan box on a pooled take-out. The SERVER reads the weight off the label — the
@@ -1270,8 +1352,13 @@
             takeOut.scanned = d.scanned_barcode || raw;
             document.getElementById('supToQty').value = d.qty;
             supToShowQuote(d);
-        });
+        }).catch(supToOffline);
     };
+
+    /* Sep-26: a dropped connection used to clear the scan box and say nothing at all. */
+    function supToOffline() {
+        msg('supToMsg', 'Could not reach the server — check the connection and scan again. Nothing was recorded.');
+    }
 
     /* Price what has been typed, so the figure is on screen BEFORE the button is pressed.
        Debounced — a person typing "1.25" would otherwise fire three requests. */
@@ -1279,14 +1366,17 @@
     window.supToQuoteSoon = function () {
         takeOut.scanned = null;                       // typed now, not scanned
         takeOut.confirmed = [];
+        // ⚠ Sep-26: a new figure has not been checked yet. Keeping the old warnings meant a
+        // press inside the 350 ms debounce sent THEM back as "confirmed" for this figure.
+        supToShowWarnings([]);
         if (quoteTimer) { clearTimeout(quoteTimer); }
         quoteTimer = setTimeout(function () {
             var qty = parseFloat((document.getElementById('supToQty') || {}).value || '0');
             if (!(qty > 0)) { return; }
             post('/supplies/take-out/quote', { product_id: takeOut.productId, qty: qty }).then(function (r) {
-                if (r.ok && r.data && r.data.success) { supToShowQuote(r.data); }
+                if (r.ok && r.data && r.data.success) { msg('supToMsg', ''); supToShowQuote(r.data); }
                 else { msg('supToMsg', (r.data && r.data.message) || ''); }
-            });
+            }).catch(supToOffline);
         }, 350);
     };
 
@@ -1298,8 +1388,12 @@
                 ' · of ' + esc(d.pool_label) + ' on the shelf' +
                 (d.capped ? ' <span style="color:#B45309;">(that is all that is left)</span>' : '');
         }
+        supToShowWarnings(d.warnings || []);
+    }
+
+    function supToShowWarnings(warnings) {
         var warn = document.getElementById('supToWarn');
-        takeOut.warnings = d.warnings || [];
+        takeOut.warnings = warnings || [];
         if (warn) {
             if (takeOut.warnings.length) {
                 warn.classList.remove('sup-none');
@@ -1323,9 +1417,9 @@
             // against them. Pressing the button a second time is the deliberate act.
             body.confirmed_warnings = (takeOut.warnings || []).map(function (w) { return w.code; });
         } else {
-            var sel = document.getElementById('supToPacket');
-            if (!sel || !sel.value) { msg('supToMsg', 'Nothing to take out.'); return; }
-            body.packet_id = parseInt(sel.value, 10);
+            if (!takeOut.chosen) { msg('supToMsg', 'Scan the packet first.'); return; }
+            body.packet_id = takeOut.chosen;
+            if (takeOut.scanned) { body.scanned_barcode = takeOut.scanned; body.source = 'scan'; }
         }
 
         var btn = document.getElementById('supToConfirm');
@@ -1337,10 +1431,9 @@
                 // everything, and a stale quote can miss one). Show it and let the next
                 // press confirm — never write behind a warning nobody has seen.
                 if (r.data && r.data.code === 'needs_confirmation') {
-                    supToShowQuote({
-                        qty_label: document.getElementById('supToQty').value,
-                        cost: 0, free: false, pool_label: '', warnings: r.data.warnings || []
-                    });
+                    // ⚠ Sep-26: the WARNINGS only. This used to repaint the whole quote line
+                    // as "Rs 0 · of  on the shelf" right before the confirming press.
+                    supToShowWarnings(r.data.warnings || []);
                     msg('supToMsg', '');
                     return;
                 }
@@ -1351,7 +1444,8 @@
             window.location.reload();
         }).catch(function () {
             btn.disabled = false;
-            msg('supToMsg', 'Could not reach the server. Nothing was recorded.');
+            // Honest copy (Sep-27): the reply may have been lost after the server saved it.
+            msg('supToMsg', 'Could not reach the server. Check the Take-outs tab before trying again — it may already be recorded.');
         });
     };
 
@@ -1375,7 +1469,8 @@
             document.getElementById('supPrPacketBarcode').value = p && p.packet_barcode ? p.packet_barcode : '';
             document.getElementById('supPrPacketKg').value = p && p.packet_kg ? p.packet_kg : '';
             document.getElementById('supPrPiecesPer').value = p && p.pieces_per_packet ? p.pieces_per_packet : '';
-            document.getElementById('supPrLow').value = p && p.low_stock_qty ? p.low_stock_qty : '';
+            // trimQty: "2.000" -> "2" (the column is decimal:3, but packets are whole)
+            document.getElementById('supPrLow').value = p && p.low_stock_qty ? trimQty(p.low_stock_qty) : '';
             document.getElementById('supPrActive').value = (p && !(Number(p.is_active) === 1 || p.is_active === true)) ? '0' : '1';
             if (p && p.expense_config_id) { cat.value = String(p.expense_config_id); }
 
@@ -1591,6 +1686,14 @@
 
     // preload so the first modal opens instantly
     loadCatalogue();
+
+    // back on the tab a delete / edit reloaded from (see supReloadOnTakeouts)
+    try {
+        if (window.sessionStorage.getItem('supTab') === 'takeouts') {
+            window.sessionStorage.removeItem('supTab');
+            supShowTab('takeouts');
+        }
+    } catch (e) { /* storage blocked — the Stock tab is a fine default */ }
 })();
 </script>
 @endpush

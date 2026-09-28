@@ -61,6 +61,30 @@ class ReceiptController extends Controller
         return false;
     }
 
+    /** One honest sentence per failure reason (ReceiptExtractionService::FAIL_*). */
+    private function failureMessage(string $reason): string
+    {
+        $saved = ' The picture is saved either way.';
+
+        return match ($reason) {
+            ReceiptExtractionService::FAIL_TIMEOUT,
+            ReceiptExtractionService::FAIL_LOOPED,
+            ReceiptExtractionService::FAIL_BUSY =>
+                'The bill reader is busy right now and did not finish. Wait a minute and try again, '
+                . 'or type the bill in by hand.' . $saved,
+            ReceiptExtractionService::FAIL_NO_CREDIT =>
+                'The bill reader is out of credit. Tell Shabib, and type this bill in by hand for now.' . $saved,
+            ReceiptExtractionService::FAIL_REFUSED,
+            ReceiptExtractionService::FAIL_NO_KEY =>
+                'The bill reader is not set up correctly. Tell Shabib, and type this bill in by hand for now.' . $saved,
+            ReceiptExtractionService::FAIL_NO_IMAGE =>
+                'The photo did not arrive properly. Take it again.',
+            default =>
+                'The reader could not make out this bill. Lay the whole slip flat, fill the frame with it '
+                . 'and try again — or type it in by hand.' . $saved,
+        };
+    }
+
     /**
      * Photo in, draft + card out.
      *
@@ -76,9 +100,14 @@ class ReceiptController extends Controller
             ], 403);
         }
 
+        // ⚠ 5 MB, the SAME ceiling as the purchase's own bill_image (VendorController::
+        //   imageValidationRules). It used to be 8 MB here, so a 5–8 MB photo read fine and
+        //   then could never be recorded — Record replays the photo into that door.
         $request->validate([
-            'image'       => 'required|image|mimes:jpeg,png,jpg|max:8192',
+            'image'       => 'required|image|mimes:jpeg,png,jpg|max:5120',
             'client_uuid' => 'nullable|string|max:36',
+        ], [
+            'image.max' => 'That photo is too large (over 5 MB). Take it again with the camera, or pick a smaller copy.',
         ]);
 
         $vendor = VendorModel::find($vendorId);
@@ -142,7 +171,17 @@ class ReceiptController extends Controller
                 'created_by'  => auth()->id(),
             ]);
         } else {
+            // A retry replaces the photo. The old one is never recorded (Record only ever
+            // replays the draft's CURRENT photo), so drop it rather than leave it orphaned.
+            $previous = $draft->image_path;
             $draft->update(['image_path' => $path, 'vendor_id' => (int) $vendorId]);
+            if ($previous && $previous !== $path && str_starts_with($previous, 'receipts/')) {
+                try {
+                    Storage::disk(config('whatsapp.media_disk', 'public'))->delete($previous);
+                } catch (\Throwable $e) {
+                    // housekeeping only
+                }
+            }
         }
 
         // ⚠ Counted here, on every READ, not by counting draft rows: a client that
@@ -157,16 +196,30 @@ class ReceiptController extends Controller
         $read   = $reader->extract($path);
 
         if (!$read) {
+            // ⚠⚠ Tell the truth about WHY. The old single sentence ("try again in better
+            //    light") was wrong for every failure production ever had — they were all
+            //    the model stalling — and it sent Qasim re-photographing a sharp bill.
+            $failure = method_exists($reader, 'lastFailure') ? $reader->lastFailure() : null;
+            $reason  = $failure['reason'] ?? ReceiptExtractionService::FAIL_UNREADABLE;
+
             $draft->update([
                 'status' => ReceiptDraftModel::STATUS_FAILED,
-                'error'  => 'The reader could not make anything of this photo.',
+                'error'  => mb_substr(sprintf(
+                    '%s: %s (HTTP %s, %ss, %d attempt%s)',
+                    $reason,
+                    $failure['detail'] ?? 'no detail',
+                    $failure['status'] ?? '-',
+                    $failure['seconds'] ?? '?',
+                    $failure['attempts'] ?? 0,
+                    ($failure['attempts'] ?? 0) === 1 ? '' : 's'
+                ), 0, 250),
             ]);
 
             return response()->json([
                 'success'  => false,
                 'draft_id' => $draft->id,
-                'message'  => 'Could not read that photo. Try again in better light, or type the bill in by hand — '
-                    . 'the picture is saved either way.',
+                'reason'   => $reason,
+                'message'  => $this->failureMessage($reason),
             ], 422);
         }
 
@@ -319,7 +372,24 @@ class ReceiptController extends Controller
                 ? round($qty * $packQty, 3)
                 : null;
 
+            // ⚠⚠ A PRINTED DISCOUNT the line total already took off: "Non-Woven Bag 2 × 65,
+            //    discount 60, Rs 70". The purchase is recorded as qty × rate, so without this
+            //    the bag was booked at Rs 130 and the whole bill Rs 60 over — with no warning,
+            //    because the total check reads the printed (discounted) line totals.
+            $discount = (float) ($raw['discount'] ?? 0);
+            $discountApplied = $discount > 0 && $qty !== null && $rate !== null && $total !== null
+                && abs(($qty * $rate) - $discount - $total) <= 1.0;
+
+            // ⭐ The unit a NEW product for this line should start with — from the one unit
+            //   engine, never a guessed kg ("Eggs 30's" is a pack of 30 pieces).
+            $prefill = \App\Services\FIN\VendorUnits::fromReceipt(
+                $raw['sold_by'] ?? null, $raw['pack_size_value'] ?? null, $raw['pack_size_unit'] ?? null
+            );
+
             $lines[] = [
+                'discount_applied' => $discountApplied,
+                'suggested_unit'   => $prefill['unit'],
+                'suggested_pack_qty_base' => $prefill['pack_qty_base'],
                 'raw_name'        => $raw['raw_name'],
                 'qty'             => $qty,
                 'unit_price'      => $rate,
@@ -354,7 +424,20 @@ class ReceiptController extends Controller
 
         $check = $reader->reconcile($lines, $read['grand_total']);
 
+        // Lines are recorded at their printed PRICE, so the printed discounts go into the
+        // bill's adjustment instead — the card pre-fills it and says so.
+        $lineDiscounts = round(array_sum(array_map(
+            fn ($l) => $l['discount_applied'] ? (float) $l['discount'] : 0.0, $lines
+        )), 2);
+
         $warnings = [];
+        if ($lineDiscounts > 0) {
+            $warnings[] = sprintf(
+                'The bill takes Rs %s off in discounts. That is filled into the adjustment (−%s) so the purchase '
+                . 'matches the paper — check it before recording.',
+                number_format($lineDiscounts, 2), number_format($lineDiscounts, 2)
+            );
+        }
         if (!$check['matches']) {
             $warnings[] = sprintf(
                 'The lines add up to Rs %s but the receipt says Rs %s. Fix a line, or put the Rs %s '
@@ -404,6 +487,8 @@ class ReceiptController extends Controller
             'discount_total' => $read['discount_total'],
             'grand_total'    => $read['grand_total'],
             'reconcile'      => $check,
+            // ⭐ Negative: what the adjustment box should start at. 0 when nothing was discounted.
+            'discount_adjustment' => $lineDiscounts > 0 ? -$lineDiscounts : 0.0,
             'confidence'     => $read['confidence'],
             'warnings'       => $warnings,
             // ⭐ How many products this vendor has at all. Zero means "add some", which is a
@@ -495,7 +580,7 @@ class ReceiptController extends Controller
 
         try {
             $response = app(\App\Http\Controllers\FIN\VendorController::class)
-                ->recordWeightedPurchase($this->purchaseRequest($request, $vendorId), $vendorId);
+                ->recordWeightedPurchase($this->purchaseRequest($request, $vendorId, $draft), $vendorId);
 
             $body = json_decode($response->getContent(), true) ?: [];
 
@@ -527,6 +612,19 @@ class ReceiptController extends Controller
                 'learned'        => $learned,
                 'message'        => $body['message'] ?? 'Purchase recorded.',
             ]);
+        } catch (\Illuminate\Validation\ValidationException $e) {
+            // ⚠ The money door's own validation (a blank qty, an oversized photo…). It used
+            //   to fall into the catch-all below and read "Nothing was saved — try again",
+            //   which no retry could ever fix. Hand back the real reason instead.
+            $draft->update(['status' => ReceiptDraftModel::STATUS_DRAFT]);
+            $errors = $e->errors();
+            $first  = collect($errors)->flatten()->first();
+
+            return response()->json([
+                'success' => false,
+                'message' => $first ? 'Not recorded: ' . $first : 'Not recorded — please check the lines.',
+                'errors'  => $errors,
+            ], 422);
         } catch (\Throwable $e) {
             $draft->update(['status' => ReceiptDraftModel::STATUS_DRAFT]);
             \Log::error('Receipt record failed', ['draft' => $draft->id, 'error' => $e->getMessage()]);
@@ -605,16 +703,52 @@ class ReceiptController extends Controller
         }
     }
 
-    private function purchaseRequest(Request $request, $vendorId): Request
+    private function purchaseRequest(Request $request, $vendorId, ?ReceiptDraftModel $draft = null): Request
     {
         $body = $request->except(['client_uuid', 'draft_id']);
+
+        $files = $request->allFiles();
+        // ⭐ A draft picked up again LATER ("Continue it") has no photo on the phone — the
+        //   photo lives on the server with the draft. Without this the purchase was
+        //   recorded with no bill image at all. Attach the draft's own photo instead.
+        if (empty($files) && $draft && $draft->image_path) {
+            try {
+                $disk = Storage::disk(config('whatsapp.media_disk', 'public'));
+                if ($disk->exists($draft->image_path)) {
+                    $photo = new \Illuminate\Http\UploadedFile(
+                        $disk->path($draft->image_path),
+                        basename($draft->image_path),
+                        $disk->mimeType($draft->image_path) ?: 'image/jpeg',
+                        null,
+                        true   // a file already on our disk, not a fresh upload
+                    );
+                    // ⚠ Sep-27: attach it only if the purchase's OWN photo rule accepts it.
+                    //   A damaged file would otherwise fail that validation and refuse the
+                    //   whole purchase — the opposite of "no photo beats no purchase".
+                    //   (Found by PROOF-RECEIPT-CAPTURE, whose stand-in photo is not a real
+                    //   image.)
+                    $okPhoto = \Illuminate\Support\Facades\Validator::make(
+                        ['p' => $photo], ['p' => 'image|mimes:jpeg,png,jpg,gif|max:5120']
+                    )->passes();
+                    if ($okPhoto) {
+                        $files['bill_images'] = [$photo];
+                    } else {
+                        \Log::warning('Receipt record: draft photo not attached (not a valid image)', [
+                            'draft_id' => $draft->id,
+                        ]);
+                    }
+                }
+            } catch (\Throwable $e) {
+                // no photo is better than no purchase
+            }
+        }
 
         $fresh = Request::create(
             "/api/vendors/{$vendorId}/weighted-purchase",
             'POST',
             $body,
             [],
-            $request->allFiles(),
+            $files,
             ['HTTP_ACCEPT' => 'application/json']
         );
         $fresh->setUserResolver($request->getUserResolver());

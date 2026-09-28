@@ -321,8 +321,12 @@
                         </div>
                     </div>
                     <p id="ingFormLock" class="hidden text-xs mb-3" style="color:#B45309;">
-                        This ingredient is already used, so how it is measured can no longer change.
+                        How it is measured is changed everywhere at once — its recipes and the vendor products
+                        linked to it — so it is not changed here.
+                        <button type="button" id="ingUnitChangeBtn" class="underline font-semibold ml-1">Change how it is measured…</button>
                     </p>
+                    {{-- 🔀 Sep-27: the same change-everywhere engine the vendor product form uses. --}}
+                    <div id="ingUnitChange" class="hidden mb-3"></div>
                     <div class="flex gap-2">
                         <button type="button" id="ingFormSave"
                                 class="flex-1 px-3 py-2 rounded-lg text-sm font-semibold text-white"
@@ -383,6 +387,11 @@
 
                         <div id="recWarn" class="hidden rounded-lg px-3 py-2 mb-3 text-xs"
                              style="background:#FFFBEB;border:1px solid #FDE68A;color:#92400E;"></div>
+
+                        {{-- 💲 Sep-27: the recipe at TODAY'S prices (each ingredient's newest bill),
+                             recalculated as you type. Lines with no price are named, never zero. --}}
+                        <div id="recCost" class="hidden rounded-lg px-3 py-2 mb-3 text-xs"
+                             style="background:#EEF2FF;border:1px solid #C7D2FE;color:#312E81;"></div>
 
                         <div class="mb-3">
                             <label class="block text-xs font-medium text-gray-700 mb-1">Note (optional)</label>
@@ -980,6 +989,7 @@ function saveRecipeMappings() {
                 if (!d.success) { throw new Error(d.message || 'Could not load ingredients.'); }
                 ingredients = d.ingredients || [];
                 gaps = d.gaps || {items: [], not_linked: 0, never_bought: 0};
+                LINK_VENDORS = d.link_vendors || [];
                 renderIngredients(d.can_manage);
                 renderGaps();
                 return ingredients;
@@ -1101,6 +1111,30 @@ function saveRecipeMappings() {
      * has never seen, with the exact spelling to use on the vendor side. This is how
      * "salt" in a recipe and "salt" as a vendor product end up being the same salt.
      */
+    // 🔗 Sep-27: "Link at…" — open that vendor's Manage Products with the ingredient
+    // pre-chosen. Only vendors whose bills are entered line by line are offered.
+    var LINK_VENDORS = [];
+    var VENDOR_PRODUCTS_URL = @json(route('fin.vendors.products', ['id' => '__VID__']));
+
+    function linkPicker(ingredientId) {
+        if (!LINK_VENDORS.length) { return ''; }
+        return ' <select class="ing-link text-[11px] ml-1 px-1 py-0.5 border border-indigo-200 rounded bg-white" ' +
+            'style="color:#4338CA;" data-id="' + ingredientId + '">' +
+            '<option value="">🔗 Link at…</option>' +
+            LINK_VENDORS.map(function (v) { return '<option value="' + v.id + '">' + esc(v.vendor_name) + '</option>'; }).join('') +
+            '</select>';
+    }
+
+    function wireLinkPickers(box) {
+        Array.prototype.forEach.call(box.querySelectorAll('.ing-link'), function (s) {
+            s.onchange = function () {
+                if (!s.value) { return; }
+                window.location.href = VENDOR_PRODUCTS_URL.replace('__VID__', s.value) +
+                    '?link_ingredient=' + encodeURIComponent(s.getAttribute('data-id'));
+            };
+        });
+    }
+
     function renderGaps() {
         var box = document.getElementById('ingGaps');
         var items = gaps.items || [];
@@ -1118,7 +1152,7 @@ function saveRecipeMappings() {
                     '<ul class="text-[12px] mb-2" style="color:#78350F;">' +
                     notLinked.map(function (g) {
                         return '<li>• <b>' + esc(g.name) + '</b> <span class="text-gray-500">— in ' + g.recipe_count +
-                               ' recipe' + (g.recipe_count === 1 ? '' : 's') + '</span></li>';
+                               ' recipe' + (g.recipe_count === 1 ? '' : 's') + '</span>' + linkPicker(g.ingredient_id) + '</li>';
                     }).join('') + '</ul>';
         }
         if (neverBought.length) {
@@ -1126,13 +1160,18 @@ function saveRecipeMappings() {
                     'the cost per pack leaves these out until the first bill:</div>' +
                     '<ul class="text-[12px]" style="color:#78350F;">' +
                     neverBought.map(function (g) {
-                        return '<li>• <b>' + esc(g.name) + '</b> <span class="text-gray-500">— ' +
-                               esc((g.linked_vendors || []).join(', ')) + '</span></li>';
+                        // ⭐ linked only where bills are one total: no bill line will ever price it
+                        var why = g.at_total_only
+                            ? ' <span style="color:#B45309;font-weight:600;">— ' + esc((g.linked_vendors || []).join(', ')) +
+                              ' enters bills as one total, so no price will come; switch it to by weight or link elsewhere</span>'
+                            : ' <span class="text-gray-500">— ' + esc((g.linked_vendors || []).join(', ')) + '</span>';
+                        return '<li>• <b>' + esc(g.name) + '</b>' + why + linkPicker(g.ingredient_id) + '</li>';
                     }).join('') + '</ul>';
         }
 
         box.innerHTML = html;
         box.classList.remove('hidden');
+        wireLinkPickers(box);
     }
 
     function openIngForm(id) {
@@ -1147,6 +1186,10 @@ function saveRecipeMappings() {
         // rather than letting someone type it and be turned away.
         document.getElementById('ingFormUnit').disabled = !!ing;
         document.getElementById('ingFormLock').classList.toggle('hidden', !ing);
+        var uc = document.getElementById('ingUnitChange');
+        uc.classList.add('hidden');
+        uc.innerHTML = '';
+        document.getElementById('ingUnitChangeBtn').onclick = function () { if (ing) { openUnitChange(ing); } };
 
         form.classList.remove('hidden');
         document.getElementById('ingFormName').focus();
@@ -1226,6 +1269,7 @@ function saveRecipeMappings() {
                     unitOptions(base, ln.unit) +
                 '</select>' +
                 '<span class="rec-per text-[11px] text-gray-500 w-24 text-right"></span>' +
+                '<span class="rec-cost text-[11px] w-28 text-right"></span>' +
                 '<button type="button" class="rec-del text-gray-400 hover:text-red-600 px-1" data-i="' + idx + '">✕</button>' +
             '</div>';
         }).join('');
@@ -1287,6 +1331,208 @@ function saveRecipeMappings() {
             }
             span.textContent = (Math.round(shown * 1000) / 1000) + ' ' + unit + '/pack';
         });
+
+        updateCost();
+    }
+
+    // ── 💲 the recipe at today's prices ────────────────────────────────
+    // PRICES is the unit's price book from the server: ingredient id => the newest
+    // bill's price per BASE unit (g / ml / piece). A missing key means "no price" — it
+    // is never treated as zero. Without view_khaas_costing the keys arrive with the
+    // rupees nulled, so the page can still say which lines are priced.
+    var PRICES   = {};
+    var CAN_COST = false;
+    var SELL     = null;
+    var SUPPLY   = {};   // ingredient id => supply_state, from the loaded recipe
+
+    function rs(n, dp) {
+        return 'Rs ' + Number(n).toLocaleString('en-PK', {minimumFractionDigits: dp || 0, maximumFractionDigits: dp || 0});
+    }
+
+    function lineBase(ln) {
+        var qty = parseFloat(ln && ln.qty);
+        if (!(qty > 0)) { return 0; }
+        return qty * ((ln.unit === 'kg' || ln.unit === 'L') ? 1000 : 1);
+    }
+
+    function whyNoPrice(ln) {
+        var ing = ingredients.filter(function (x) { return x.id === ln.ingredient_id; })[0];
+        if (ing && ing.is_meat) { return 'no meat order price yet'; }
+        var st = SUPPLY[ln.ingredient_id];
+        if (!st) {
+            // A line just added: the page-wide gaps list may still know its state.
+            var g = (gaps.items || []).filter(function (x) { return x.ingredient_id === ln.ingredient_id; })[0];
+            st = g ? g.state : null;
+        }
+        if (st === 'not_linked') { return 'not a vendor product yet'; }
+        if (st === 'never_bought') { return 'no bill yet'; }
+        return 'no price yet';
+    }
+
+    function updateCost() {
+        var basis = parseInt(document.getElementById('recBasis').value, 10) || 0;
+        var spans = document.getElementById('recLines').querySelectorAll('.rec-cost');
+        var box   = document.getElementById('recCost');
+
+        var batch = 0, priced = 0, missing = [], old = [], jumps = [];
+
+        Array.prototype.forEach.call(spans, function (span, idx) {
+            var ln = lines[idx];
+            var p  = ln ? PRICES[ln.ingredient_id] : null;
+            var ing = ln ? ingredients.filter(function (x) { return x.id === ln.ingredient_id; })[0] : null;
+            var name = ing ? ing.name : 'an ingredient';
+            if (!ln) { span.textContent = ''; return; }
+
+            if (!p) {
+                span.innerHTML = '<span style="color:#B45309;">' + esc(whyNoPrice(ln)) + '</span>';
+                missing.push(name + ' (' + whyNoPrice(ln) + ')');
+                return;
+            }
+            priced++;
+            if (p.stale) { old.push(name + (CAN_COST && p.price_text ? ' — ' + p.price_text : '') + ', bill of ' + p.bought_on); }
+            if (p.jump && p.previous) {
+                jumps.push(name + (CAN_COST && p.price_text ? ': ' + p.price_text + ' on ' + p.bought_on +
+                    ', was ' + p.previous.price_text + ' on ' + p.previous.bought_on : ''));
+            }
+            if (!CAN_COST || p.price_per_base == null) { span.textContent = '✓ priced'; span.style.color = '#4338CA'; return; }
+
+            var cost = lineBase(ln) * p.price_per_base;
+            batch += cost;
+            span.style.color = '#312E81';
+            span.title = p.price_text + ' · ' + (p.source === 'meat_order' ? 'meat order' : (p.source === 'older_bill' ? 'older bill' : 'bill')) +
+                ' of ' + p.bought_on + (p.vendor_name ? ' · ' + p.vendor_name : '');
+            span.textContent = lineBase(ln) > 0 ? rs(cost) + (basis ? ' · ' + rs(cost / basis, 2) + '/pack' : '') : '';
+        });
+
+        if (!lines.length) { box.classList.add('hidden'); return; }
+
+        var h = '';
+        if (CAN_COST && priced > 0) {
+            h += '<div class="font-semibold">💲 At today’s prices: ' + rs(batch) + ' a batch' +
+                (basis ? ' · <b>' + rs(batch / basis, 2) + ' a pack</b>' : '') +
+                (basis && SELL ? ' — ' + (Math.round(batch / basis * 1000 / SELL) / 10) + '% of the ' + rs(SELL) + ' price' : '') +
+                '</div>';
+        } else if (priced === 0) {
+            h += '<div class="font-semibold">💲 No line has a price yet, so this recipe cannot be costed.</div>';
+        }
+        if (missing.length) {
+            h += '<div class="mt-1" style="color:#92400E;">Not counted' + (priced ? ', so the real cost is higher' : '') +
+                ': ' + esc(missing.join(', ')) + '.</div>';
+        }
+        if (old.length) {
+            h += '<div class="mt-1" style="color:#92400E;">⚠ Old price (over 60 days): ' + esc(old.join('; ')) + '.</div>';
+        }
+        if (jumps.length) {
+            h += '<div class="mt-1" style="color:#B91C1C;">⚠ Price jumped 3× or more — check the bill (kg typed as g?): ' +
+                esc(jumps.join('; ')) + '.</div>';
+        }
+        h += '<div class="mt-1 text-[10px]" style="color:#6366F1;">Each price is from that ingredient’s newest bill; ' +
+             'meat from the latest meat order. Month Review uses the month’s average instead.</div>';
+        box.innerHTML = h;
+        box.classList.remove('hidden');
+    }
+
+    // ── 🔀 change how an ingredient is measured, everywhere ─────────────
+    var UNIT_IMPACT_URL = @json(route('khaas.ingredients.unit-impact', ['id' => '__ID__']));
+    var CHANGE_UNIT_URL = @json(route('khaas.ingredients.change-unit', ['id' => '__ID__']));
+    var KIND_WORD = {g: 'weight', ml: 'volume', pcs: 'pieces'};
+
+    function openUnitChange(ing) {
+        var box = document.getElementById('ingUnitChange');
+        box.innerHTML = '<div class="text-xs text-gray-700 mb-1">Change ' + esc(ing.name) + ' from ' +
+            esc(KIND_WORD[ing.base_unit]) + ' to:</div>' +
+            ['g', 'ml', 'pcs'].filter(function (u) { return u !== ing.base_unit; }).map(function (u) {
+                return '<button type="button" class="ing-to text-xs px-2.5 py-1 mr-1 rounded border border-gray-300 bg-white" data-to="' +
+                    u + '">' + esc(KIND_WORD[u]) + '</button>';
+            }).join('');
+        box.classList.remove('hidden');
+        Array.prototype.forEach.call(box.querySelectorAll('.ing-to'), function (b) {
+            b.onclick = function () {
+                api(UNIT_IMPACT_URL.replace('__ID__', ing.id) + '?to=' + b.getAttribute('data-to'))
+                    .then(function (d) {
+                        if (!d.success) { alert(d.message || 'Could not check that.'); return; }
+                        renderUnitImpact(d);
+                    })
+                    .catch(function () { alert('Could not reach the server.'); });
+            };
+        });
+    }
+
+    function renderUnitImpact(c) {
+        var box = document.getElementById('ingUnitChange');
+        var h = '<div class="p-3 rounded-md text-xs" style="background:#EEF2FF;border:1px solid #A5B4FC;">' +
+            '<div class="font-semibold" style="color:#312E81;">Change ' + esc(c.ingredient.name) + ' from ' + esc(c.from_word) +
+            ' to ' + esc(c.to_word) + ' everywhere?</div>';
+        if (!c.can_change) {
+            h += '<p class="mt-2" style="color:#991B1B;">It cannot change: ' + esc((c.locked_reasons || []).join('; ')) +
+                 '. Those numbers were written in ' + esc(c.from_word) + ' and would silently mean something else.</p>';
+        } else if (c.can_manage === false) {
+            h += '<p class="mt-2" style="color:#991B1B;">Only Taimur, Shabib or Qasim can change an ingredient’s unit.</p>';
+        } else {
+            if ((c.recipe_lines || []).length) {
+                h += '<p class="mt-2 text-gray-700">These recipes use it. ' + esc(c.from_word) + ' cannot be turned into ' +
+                     esc(c.to_word) + ' by arithmetic, so type each new amount in ' + esc(c.to_base_word) + ':</p>';
+                c.recipe_lines.forEach(function (l) {
+                    h += '<label class="flex items-center gap-2 mt-1"><span class="flex-1">' + esc(l.product_name) + ' v' + l.version +
+                         (l.is_current ? ' (current)' : '') + ' — was ' + Number(l.qty) + ' ' + esc(c.from_base_word || c.from) + '</span>' +
+                         '<input type="number" step="0.001" min="0.001" class="iu-recipe w-24 px-2 py-1 border rounded" data-id="' + l.id +
+                         '" placeholder="' + esc(c.to_base_word) + '"></label>';
+                });
+            } else {
+                h += '<p class="mt-2 text-gray-700">No recipe uses it yet.</p>';
+            }
+            (c.products || []).forEach(function (pr) {
+                h += '<div class="flex items-center gap-2 mt-1"><span class="flex-1">' + esc(pr.vendor_name || '') + ' · ' +
+                     esc(pr.product_name) + ' (' + esc(pr.unit) + ')' +
+                     (pr.needs_size ? '' : ' — automatic, ' + pr.new_pack_qty_base + ' ' + esc(c.to_base_word) + ' each') + '</span>' +
+                     (pr.needs_size ? '<input type="number" step="0.001" min="0.001" class="iu-size w-24 px-2 py-1 border rounded" data-id="' +
+                        pr.id + '" placeholder="' + esc(c.to_base_word) + ' in one">' : '') + '</div>';
+            });
+            h += '<button type="button" id="iuApply" class="mt-3 px-3 py-1.5 rounded text-white font-semibold" style="background:#4F46E5;">Change everywhere</button>';
+        }
+        h += ' <button type="button" id="iuCancel" class="mt-3 px-3 py-1.5 text-gray-600">Keep it in ' + esc(c.from_word) + '</button></div>';
+        box.innerHTML = h;
+
+        document.getElementById('iuCancel').onclick = function () { box.classList.add('hidden'); box.innerHTML = ''; };
+        var apply = document.getElementById('iuApply');
+        if (!apply) { return; }
+        apply.onclick = function () {
+            var body = {to: c.to, recipe_qty: {}, product_sizes: {}};
+            var bad = null;
+            Array.prototype.forEach.call(box.querySelectorAll('.iu-recipe'), function (i) {
+                var v = Number(i.value);
+                if (!(v > 0) || (c.to === 'pcs' && Math.round(v) !== v)) { bad = bad || i; }
+                body.recipe_qty[i.getAttribute('data-id')] = v;
+            });
+            Array.prototype.forEach.call(box.querySelectorAll('.iu-size'), function (i) {
+                if (!(Number(i.value) > 0)) { bad = bad || i; }
+                body.product_sizes[i.getAttribute('data-id')] = Number(i.value);
+            });
+            if (bad) {
+                alert(c.to === 'pcs' ? 'Type every new amount — pieces are whole numbers.' : 'Type every new amount before changing.');
+                bad.focus();
+                return;
+            }
+            apply.disabled = true;
+            api(CHANGE_UNIT_URL.replace('__ID__', c.ingredient.id), {method: 'POST', body: body})
+                .then(function (d) {
+                    apply.disabled = false;
+                    alert(d.message || (d.success ? 'Changed.' : 'Nothing was changed.'));
+                    if (!d.success) { return; }
+                    box.classList.add('hidden');
+                    box.innerHTML = '';
+                    document.getElementById('ingForm').classList.add('hidden');
+                    // Recipes were re-typed on the server: reload what is on screen.
+                    loadIngredients().then(function () {
+                        var sel = document.getElementById('recProduct');
+                        if (sel.value) { sel.dispatchEvent(new Event('change')); }
+                    });
+                })
+                .catch(function () {
+                    apply.disabled = false;
+                    alert('Could not reach the server. Nothing was changed.');
+                });
+        };
     }
 
     function refreshLineSelects() { if (lines.length) { renderLines(); } }
@@ -1315,6 +1561,11 @@ function saveRecipeMappings() {
 
                 current = d.recipe;
                 ingredients = d.ingredients || ingredients;
+                PRICES   = d.prices || {};
+                CAN_COST = !!d.can_see_cost;
+                SELL     = d.selling_price || null;
+                SUPPLY   = {};
+                (current.lines || []).forEach(function (l) { SUPPLY[l.ingredient_id] = l.supply_state; });
 
                 document.getElementById('recBasis').value = current.basis_packets || '';
                 document.getElementById('recNote').value  = current.note || '';

@@ -963,6 +963,8 @@ Route::middleware('auth:sanctum')->group(function () {
         Route::post('/{id}/purchase', [\App\Http\Controllers\FIN\VendorController::class, 'recordPurchase']);
         Route::post('/{id}/payment', [\App\Http\Controllers\FIN\VendorController::class, 'recordPayment']);
         Route::post('/{id}/weighted-purchase', [\App\Http\Controllers\FIN\VendorController::class, 'recordWeightedPurchase']);
+        // 🔀 Sep-27: switch a vendor between by-total and by-weight (Frozen staff on Frozen vendors).
+        Route::post('/{id}/purchase-method', [\App\Http\Controllers\FIN\VendorController::class, 'setPurchaseMethod']);
 
         // 🧾 Sep-2026 RECEIPT CAPTURE — photo in, a card to confirm out.
         // ⚠ None of these write money. The card becomes a purchase only through
@@ -983,6 +985,9 @@ Route::middleware('auth:sanctum')->group(function () {
         Route::get('/{id}/products/list', [\App\Http\Controllers\FIN\VendorProductController::class, 'list']);
         Route::post('/{id}/products', [\App\Http\Controllers\FIN\VendorProductController::class, 'store']);
         Route::put('/{vendorId}/products/{productId}', [\App\Http\Controllers\FIN\VendorProductController::class, 'update']);
+        // Sep-26: the phone's Products screen — same two doors the web page has always had.
+        Route::post('/{vendorId}/products/{productId}/toggle', [\App\Http\Controllers\FIN\VendorProductController::class, 'toggleStatus']);
+        Route::post('/{vendorId}/products/{productId}/set-default', [\App\Http\Controllers\FIN\VendorProductController::class, 'setAsDefault']);
         Route::delete('/{vendorId}/products/{productId}', [\App\Http\Controllers\FIN\VendorProductController::class, 'destroy']);
     });
 
@@ -1095,6 +1100,8 @@ Route::middleware('auth:sanctum')->group(function () {
         
         Route::get('/products/{productId}/store-log', [\App\Http\Controllers\KhaasController::class, 'getStoreInventoryLog']);
         Route::get('/products/{productId}/warehouse-log', [\App\Http\Controllers\KhaasController::class, 'getWarehouseInventoryLog']);
+        // 🛒 Sep-26: the orders behind a product's open-order number — the same method the web popup uses.
+        Route::get('/products/{productId}/pending-orders', [\App\Http\Controllers\KhaasController::class, 'pendingOrdersBreakdown']);
         Route::get('/sales-report', [\App\Http\Controllers\KhaasController::class, 'salesReportApi']);
         Route::get('/sales-report/daily', [\App\Http\Controllers\KhaasController::class, 'salesReportDaily']);
         Route::get('/sales-report/product/{productId}/daily', [\App\Http\Controllers\KhaasController::class, 'productDailyBreakdown']);
@@ -1122,6 +1129,9 @@ Route::middleware('auth:sanctum')->group(function () {
         Route::get('/ingredients', [\App\Http\Controllers\Khaas\RecipeController::class, 'ingredients']);
         Route::post('/ingredients', [\App\Http\Controllers\Khaas\RecipeController::class, 'saveIngredient']);
         Route::post('/ingredients/{id}/deactivate', [\App\Http\Controllers\Khaas\RecipeController::class, 'deactivateIngredient']);
+        // ⭐ Sep-26: one unit per ingredient, changed everywhere at once (recipes + tagged products).
+        Route::get('/ingredients/{id}/unit-impact', [\App\Http\Controllers\Khaas\RecipeController::class, 'unitImpact']);
+        Route::post('/ingredients/{id}/change-unit', [\App\Http\Controllers\Khaas\RecipeController::class, 'changeUnit']);
         Route::get('/ingredients/month', [\App\Http\Controllers\Khaas\RecipeController::class, 'ingredientMonth']);
         Route::post('/ingredients/opening', [\App\Http\Controllers\Khaas\RecipeController::class, 'saveOpening']);
         Route::get('/recipe', [\App\Http\Controllers\Khaas\RecipeController::class, 'show']);

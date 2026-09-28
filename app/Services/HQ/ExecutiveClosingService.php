@@ -940,7 +940,7 @@ class ExecutiveClosingService
             ksort($coh);
             $out = [];
             foreach ($coh as $key => $v) {
-                $fm = Carbon::createFromFormat('Y-m', $key)->startOfMonth();
+                $fm = Carbon::createFromFormat('!Y-m', $key)->startOfMonth();
                 $size = (int) $v['size'];
                 $cells = [];
                 for ($k = 1; $k <= 3; $k++) {

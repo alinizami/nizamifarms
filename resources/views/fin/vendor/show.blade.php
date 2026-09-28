@@ -2435,8 +2435,20 @@ function exportVendorToExcel() {
         .then(function (r) { return r.json().catch(function () { return {success:false, message:'The server replied with something unreadable.'}; }); })
         .then(function (d) {
             document.getElementById('rcReading').style.display = 'none';
-            if (!d.success) { showError(d.message || 'Could not read that photo.'); return; }
+            if (!d.success) {
+                // ⚠⚠ The uuid belongs to a bill that WAS recorded (a save whose answer was lost):
+                //    start a fresh card instead of refusing every new bill for this vendor.
+                if (/already been recorded/i.test(d.message || '')) {
+                    clientUuid = uuid();
+                    showError('The last bill was already recorded — nothing was booked twice. Choose the photo again to read this one.');
+                    return;
+                }
+                showError(d.message || 'Could not read that photo.');
+                return;
+            }
             card = d.card; draftId = d.draft_id;
+            // ⭐ Printed discounts start in the adjustment, so the purchase matches the paper.
+            document.getElementById('rcAdjust').value = card.discount_adjustment ? String(card.discount_adjustment) : '0';
             render();
         })
         .catch(function () {
@@ -2485,8 +2497,10 @@ function exportVendorToExcel() {
         var packValue = Number(l.pack_size_value) || 0;
         var isPack = l.sold_by === 'pack' && packValue > 0;
         var toBase = {l:1000, ltr:1000, litre:1000, liter:1000, kg:1000, g:1, ml:1, pcs:1};
-        var unit = isPack ? 'pack' : (l.unit || 'kg');
-        var packQty = (isPack && toBase[packUnit]) ? String(packValue * toBase[packUnit]) : '';
+        // ⭐ The server's own reading of the line (VendorUnits::fromReceipt) — never a guessed kg.
+        var unit = l.suggested_unit || (isPack ? 'pack' : (l.sold_by === 'weight' ? 'kg' : 'pack'));
+        var packQty = l.suggested_pack_qty_base ? String(l.suggested_pack_qty_base)
+            : ((isPack && toBase[packUnit]) ? String(packValue * toBase[packUnit]) : '');
         var inp = 'padding:5px 7px; border:1px solid #D1D5DB; border-radius:7px; font-size:12.5px;';
         var html =
             '<div class="rc-new" data-i="' + i + '" style="background:#F9FAFB; border:1px solid #D1D5DB; border-radius:10px; padding:10px; margin-top:8px;">' +
@@ -2494,7 +2508,9 @@ function exportVendorToExcel() {
               '<div style="font-size:11px; color:#6B7280; margin-bottom:6px;">The bill printed “' + esc(l.raw_name) + '”.</div>' +
               '<input class="rc-new-name" data-i="' + i + '" value="' + esc(String(l.raw_name || '').trim()) + '" placeholder="Product name" list="rcIngNames" autocomplete="off" style="width:100%; ' + inp + ' margin-bottom:6px;">' +
               '<div style="display:flex; gap:6px; margin-bottom:6px;">' +
-                '<input class="rc-new-unit" data-i="' + i + '" value="' + esc(unit) + '" placeholder="unit (kg, litre, pack…)" style="flex:1; ' + inp + '">' +
+                '<select class="rc-new-unit" data-i="' + i + '" style="flex:1; ' + inp + '">' + RC_UNITS.map(function (u) {
+                    return '<option value="' + u.code + '"' + (u.code === unit ? ' selected' : '') + '>' + esc(u.one) + '</option>';
+                }).join('') + '</select>' +
                 '<input class="rc-new-rate" data-i="' + i + '" type="number" step="0.01" value="' + (l.unit_price == null ? '' : l.unit_price) + '" placeholder="rate / unit" style="flex:1; ' + inp + '">' +
               '</div>';
         if (SUPPORTS_ING && INGREDIENTS.length) {
@@ -2515,7 +2531,7 @@ function exportVendorToExcel() {
             }
             html += '</select>';
             // ⚠ A "pack" could be any size — the server refuses a tag it cannot size.
-            var needs = !!newIng && (!OBVIOUS[unit.toLowerCase()] || OBVIOUS[unit.toLowerCase()] !== newIng.base_unit);
+            var needs = rcNeedsSize(unit, newIng);
             html += '<div class="rc-new-packwrap" data-i="' + i + '" style="' + (needs ? '' : 'display:none;') + '">' +
                       '<label style="font-size:11.5px; color:#374151; font-weight:600;">How many <span class="rc-new-baseword">' + (newIng ? baseWord(newIng) : 'grams') + '</span> in one <span class="rc-new-unitword">' + esc(unit) + '</span>?</label>' +
                       '<input class="rc-new-pack" data-i="' + i + '" type="number" step="0.001" value="' + esc(packQty) + '" placeholder="e.g. 1000" style="width:100%; ' + inp + ' margin:3px 0 4px;">' +
@@ -2530,7 +2546,15 @@ function exportVendorToExcel() {
         return html;
     }
 
-    var OBVIOUS = {kg:'g', gram:'g', grams:'g', g:'g', ton:'g', liter:'ml', litre:'ml', l:'ml', ml:'ml', piece:'pcs', pcs:'pcs', dozen:'pcs'};
+    // ⭐ Sep-26: the ONE unit catalogue (App\Services\FIN\VendorUnits), same as the phone.
+    var RC_UNITS = @json(\App\Services\FIN\VendorUnits::catalogue());
+    var RC_SUGGESTED = {g: 'kg', ml: 'litre', pcs: 'piece'};
+    var RC_KIND = {g: 'weight', ml: 'volume', pcs: 'pieces'};
+    function rcUnit(code) { return RC_UNITS.filter(function (u) { return u.code === String(code || '').toLowerCase(); })[0] || null; }
+    /** A pack / box against an ingredient asks its size; kg against grams does not. */
+    function rcNeedsSize(unit, ing) { var r = rcUnit(unit); return !!ing && !!r && r.kind === null; }
+    /** kg for an ingredient counted in PIECES is the wrong kind. */
+    function rcWrongKind(unit, ing) { var r = rcUnit(unit); return !!ing && !!r && r.kind !== null && r.kind !== ing.base_unit; }
     function baseWord(ing) { return ing.base_unit === 'pcs' ? 'pieces' : (ing.base_unit === 'ml' ? 'millilitres' : 'grams'); }
     function ingById(id) { return INGREDIENTS.filter(function (x) { return String(x.id) === String(id); })[0] || null; }
 
@@ -2638,7 +2662,8 @@ function exportVendorToExcel() {
             };
         });
         box.querySelectorAll('.rc-new-unit').forEach(function (el) {
-            el.oninput = function () { syncPackWrap(+el.getAttribute('data-i')); };
+            // (a <select> now — change as well as input, for older browsers)
+            el.oninput = el.onchange = function () { syncPackWrap(+el.getAttribute('data-i')); };
         });
         box.querySelectorAll('.rc-qty').forEach(function (el) {
             el.oninput = function () { card.lines[+el.getAttribute('data-i')].qty = el.value; totals(); };
@@ -2686,7 +2711,7 @@ function exportVendorToExcel() {
         var unitEl = box.querySelector('.rc-new-unit[data-i="' + i + '"]');
         if (!wrap || !unitEl) { return; }
         var unit = (unitEl.value || '').trim().toLowerCase();
-        var needs = !!newIng && (!OBVIOUS[unit] || OBVIOUS[unit] !== newIng.base_unit);
+        var needs = rcNeedsSize(unit, newIng);
         wrap.style.display = needs ? '' : 'none';
         if (needs) {
             wrap.querySelector('.rc-new-baseword').textContent = baseWord(newIng);
@@ -2707,7 +2732,18 @@ function exportVendorToExcel() {
         var pack = packEl ? parseFloat(packEl.value) : 0;
         if (!name) { alert('Give the product a name before saving it.'); return; }
         if (!(rate > 0)) { alert('Give the product a rate per unit before saving it.'); return; }
-        var needs = !!newIng && (!OBVIOUS[unit.toLowerCase()] || OBVIOUS[unit.toLowerCase()] !== newIng.base_unit);
+        if (rcWrongKind(unit, newIng)) {
+            // ⭐⭐ One unit per ingredient. The quick fix is right here; changing the
+            //    ingredient's own unit everywhere lives on Manage Products.
+            var s = RC_SUGGESTED[newIng.base_unit];
+            if (confirm(newIng.name + ' is counted in ' + RC_KIND[newIng.base_unit].toUpperCase() + ', but this product is set to ' + unit + '.\n\nUse ' + (rcUnit(s) ? rcUnit(s).many : s) + ' instead?\n\n(To change ' + newIng.name + ' itself to ' + RC_KIND[rcUnit(unit).kind] + ' everywhere, use Manage Products.)')) {
+                unit = s;
+                box.querySelector('.rc-new-unit[data-i="' + i + '"]').value = s;
+            } else {
+                return;
+            }
+        }
+        var needs = rcNeedsSize(unit, newIng);
         if (needs && !(pack > 0)) {
             alert('A ' + unit + ' could be any size. Say how many ' + baseWord(newIng) + ' one holds, or untag it.');
             return;
@@ -2761,12 +2797,22 @@ function exportVendorToExcel() {
             return;
         }
 
+        // ⭐ Pieces / packs / boxes are whole on a Frozen vendor (the server says which).
+        var frac = usable.filter(function (l) {
+            var p = PRODUCTS.filter(function (x) { return String(x.id) === String(l.product_id); })[0];
+            return p && p.whole_only && Math.floor(parseFloat(l.qty)) !== parseFloat(l.qty);
+        })[0];
+        if (frac) { alert('"' + frac.raw_name + '" is counted in whole ' + ((rcUnit(frac.unit) || {}).many || 'units') + ' — the quantity cannot be ' + frac.qty + '.'); return; }
+
         var btn = document.getElementById('rcSubmit');
         btn.disabled = true;
         btn.textContent = 'Recording…';
 
         var form = new FormData();
-        form.append('transaction_date', card.receipt_date || new Date().toISOString().slice(0, 10));
+        // ⚠ The LOCAL date, not toISOString() (UTC — a bill recorded before 5 am landed on yesterday).
+        var now = new Date();
+        var localYmd = now.getFullYear() + '-' + String(now.getMonth() + 1).padStart(2, '0') + '-' + String(now.getDate()).padStart(2, '0');
+        form.append('transaction_date', card.receipt_date || localYmd);
         form.append('description', ('Receipt ' + (card.receipt_no || '') + (card.store_name ? ' · ' + card.store_name : '')).trim());
         form.append('adjustment_amount', String(parseFloat(document.getElementById('rcAdjust').value) || 0));
         form.append('draft_id', String(draftId || ''));

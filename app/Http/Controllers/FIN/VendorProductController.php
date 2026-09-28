@@ -7,6 +7,7 @@ use App\Models\FIN\VendorModel;
 use App\Models\FIN\VendorProductModel;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Log;
+use App\Services\FIN\VendorUnits;
 
 class VendorProductController extends Controller
 {
@@ -68,25 +69,37 @@ class VendorProductController extends Controller
         $ingredients = [];
         if ($this->dealsInIngredients($vendor)) {
             try {
+                $recipeCounts = \App\Models\Khaas\RecipeLineModel::query()->groupBy('ingredient_id')
+                    ->pluck(\Illuminate\Support\Facades\DB::raw('COUNT(*)'), 'ingredient_id')->all();
                 $ingredients = \App\Models\Khaas\IngredientModel::where('business_unit_id', self::FROZEN_BU)
                     ->where('is_active', 1)->whereNull('storage_product_id')
                     ->orderBy('name')->get()
-                    ->map(fn ($i) => $i->shape())->values()->all();
+                    ->map(fn ($i) => $i->shape() + ['recipe_count' => (int) ($recipeCounts[$i->id] ?? 0)])->values()->all();
             } catch (\Throwable $e) {
                 $ingredients = [];
             }
         }
 
-        return view('fin.vendor.products', compact('vendor', 'products', 'categories', 'ingredients'));
+        // ⭐ Sep-26: the ONE unit list, and which products are locked by purchase history —
+        //   the same facts products/list gives the phone.
+        $unitCatalogue  = VendorUnits::catalogue();
+        $purchaseCounts = $this->purchaseCounts($products->pluck('id')->all());
+
+        return view('fin.vendor.products', compact('vendor', 'products', 'categories', 'ingredients', 'unitCatalogue', 'purchaseCounts'));
     }
 
     /**
      * Get products list as JSON (for AJAX)
      */
-    public function list($vendorId)
+    public function list(Request $request, $vendorId)
     {
+        $vendor = VendorModel::find($vendorId);
+
+        // ⭐ ?all=1 — the phone's Products screen shows retired products too, so one can be
+        //   switched back on (and an old purchase of a retired product can still be edited).
+        //   Absent = active only, exactly what every existing caller has always received.
         $products = VendorProductModel::forVendor($vendorId)
-                                      ->active()
+                                      ->when(!$request->boolean('all'), fn ($q) => $q->active())
                                       ->orderBy('product_name')
                                       ->get();
 
@@ -95,15 +108,28 @@ class VendorProductController extends Controller
         // phone already reads is untouched, and a product with no tag gets null.
         try {
             $ids = $products->pluck('ingredient_id')->filter()->unique()->all();
-            $names = $ids
-                ? \App\Models\Khaas\IngredientModel::whereIn('id', $ids)->pluck('name', 'id')->all()
-                : [];
-            $products->each(function ($p) use ($names) {
-                $p->setAttribute('ingredient_name', $p->ingredient_id ? ($names[$p->ingredient_id] ?? null) : null);
+            $ings = $ids
+                ? \App\Models\Khaas\IngredientModel::whereIn('id', $ids)->get(['id', 'name', 'base_unit'])->keyBy('id')
+                : collect();
+            $products->each(function ($p) use ($ings) {
+                $ing = $p->ingredient_id ? $ings->get($p->ingredient_id) : null;
+                $p->setAttribute('ingredient_name', $ing->name ?? null);
+                $p->setAttribute('ingredient_base_unit', $ing->base_unit ?? null);
             });
         } catch (\Throwable $e) {
             // Migration not run yet: the attribute simply stays absent.
         }
+
+        // ⭐ What each product's unit means, from the ONE unit engine — the qty label,
+        //   whether it takes whole numbers, its kind. Additive keys.
+        $bu = (int) ($vendor->business_unit_id ?? 1);
+        $purchaseCounts = $this->purchaseCounts($products->pluck('id')->all());
+        $products->each(function ($p) use ($bu, $purchaseCounts) {
+            foreach (VendorUnits::describe($p->unit, $bu) as $k => $v) {
+                $p->setAttribute($k, $v);
+            }
+            $p->setAttribute('purchase_count', $purchaseCounts[$p->id] ?? 0);
+        });
 
         return response()->json([
             'success' => true,
@@ -112,8 +138,78 @@ class VendorProductController extends Controller
             //   than guessing from the vendor payload, so the rule lives in ONE place.
             //   False for every BU 1 vendor, which is what keeps "Cheese" and "Cooking
             //   oil" out of the meat suppliers' product forms.
-            'supports_ingredients' => $this->dealsInIngredients(VendorModel::find($vendorId)),
+            'supports_ingredients' => $this->dealsInIngredients($vendor),
+            // ⭐ The unit catalogue both surfaces render — offered units only.
+            'unit_catalogue'       => VendorUnits::catalogue(),
+            'whole_numbers_apply'  => $bu === self::FROZEN_BU,
         ]);
+    }
+
+    /** product id => number of purchase lines that reference it. */
+    private function purchaseCounts(array $productIds): array
+    {
+        if (!$productIds) {
+            return [];
+        }
+        try {
+            return \Illuminate\Support\Facades\DB::table('t_fin_vendor_purchase_items')
+                ->whereIn('vendor_product_id', $productIds)
+                ->groupBy('vendor_product_id')
+                ->pluck(\Illuminate\Support\Facades\DB::raw('COUNT(*)'), 'vendor_product_id')
+                ->map(fn ($n) => (int) $n)->all();
+        } catch (\Throwable $e) {
+            return [];
+        }
+    }
+
+    /**
+     * ⭐ The unit a product may be saved with: one of the engine's codes. A free-text unit
+     *   ("800gm", "1") is refused with the list — the SIZE belongs in the pack size.
+     *   Refused as JSON outside any try, so it reaches the person as the sentence it is.
+     */
+    private function unitOrRefuse(Request $request): string
+    {
+        $raw  = trim((string) $request->input('unit'));
+        $code = VendorUnits::canonical($raw);
+        if ($code === null) {
+            abort(response()->json([
+                'success' => false,
+                'code'    => 'unit_unknown',
+                'message' => "\"{$raw}\" is not a unit. Choose kg, g, piece, dozen, litre, ml, pack or box — "
+                    . 'and if it is a pack of a certain size (like 800 g), choose "pack" and give the size.',
+                'allowed_units' => array_keys(VendorUnits::UNITS),
+            ], 422));
+        }
+        return $code;
+    }
+
+    /**
+     * ⚠⚠ A product with purchase history keeps its unit. Editing an old bill re-stamps its
+     *    lines from the product AS IT STANDS, so "5 kg" silently becoming "5 pieces" on
+     *    the next edit is the failure this prevents. The way out is a new product.
+     */
+    private function refuseUnitChangeWithHistory(VendorProductModel $product, string $newUnit, Request $request): void
+    {
+        $oldCode = VendorUnits::canonical($product->unit) ?? strtolower(trim((string) $product->unit));
+        $sizeChanged = $request->filled('pack_qty_base') && $product->pack_qty_base !== null
+            && abs((float) $request->input('pack_qty_base') - (float) $product->pack_qty_base) > 0.0005;
+
+        if ($oldCode === $newUnit && !$sizeChanged) {
+            return;
+        }
+        $n = $this->purchaseCounts([$product->id])[$product->id] ?? 0;
+        if ($n === 0) {
+            return;
+        }
+        abort(response()->json([
+            'success' => false,
+            'code'    => 'unit_locked',
+            'message' => "{$product->product_name} is on {$n} recorded purchase" . ($n === 1 ? '' : 's')
+                . " as {$product->unit}" . ($sizeChanged ? ' with its current size' : '') . ', so its '
+                . ($sizeChanged ? 'size' : 'unit') . ' cannot change — old bills would silently change meaning. '
+                . 'Add it as a new product with the right unit, and switch this one off.',
+            'purchase_count' => $n,
+        ], 422));
     }
 
     /**
@@ -132,6 +228,8 @@ class VendorProductController extends Controller
         // ⚠ Resolved OUTSIDE the try below on purpose. The helper refuses an unsizeable tag
         //   with a 422 by throwing; inside the try that catch-all turns it into a bare
         //   500 "Error adding product: " and the person never sees the question.
+        $unit = $this->unitOrRefuse($request);
+        $request->merge(['unit' => $unit]);
         $ingredientFields = $this->ingredientFields($request, null, $vendorId);
 
         try {
@@ -146,7 +244,7 @@ class VendorProductController extends Controller
                 'vendor_id' => $vendorId,
                 'product_name' => $request->product_name,
                 'category_level_1' => $this->cleanCategory($request->category_level_1),
-                'unit' => $request->unit,
+                'unit' => $unit,
                 'rate_per_unit' => $request->rate_per_unit,
                 'is_active' => 1,
                 'is_default' => $request->is_default ? 1 : 0
@@ -185,6 +283,9 @@ class VendorProductController extends Controller
         //   and an unsizeable tag reaches the person as the 422 question it is, instead
         //   of being swallowed into "Error updating product: ".
         $product = VendorProductModel::where('vendor_id', $vendorId)->findOrFail($productId);
+        $unit = $this->unitOrRefuse($request);
+        $request->merge(['unit' => $unit]);
+        $this->refuseUnitChangeWithHistory($product, $unit, $request);
         $ingredientFields = $this->ingredientFields($request, $product, $vendorId);
 
         try {
@@ -198,10 +299,16 @@ class VendorProductController extends Controller
 
             $product->update([
                 'product_name' => $request->product_name,
-                'category_level_1' => $this->cleanCategory($request->category_level_1),
-                'unit' => $request->unit,
+                // ⚠⚠ ABSENT = KEEP. This used to always write the field, so any caller that
+                //    did not send the category (the phone's edit) wiped it to NULL and the
+                //    product fell out of the Category Report. Sent-but-blank still clears.
+                'category_level_1' => $request->has('category_level_1')
+                    ? $this->cleanCategory($request->category_level_1)
+                    : $product->category_level_1,
+                'unit' => $unit,
                 'rate_per_unit' => $request->rate_per_unit,
-                'is_default' => $request->is_default ? 1 : 0
+                // ⚠ Same rule for the default star: an edit that does not mention it keeps it.
+                'is_default' => $request->has('is_default') ? ($request->is_default ? 1 : 0) : $product->is_default,
             ] + $ingredientFields);
 
             return response()->json([
@@ -268,10 +375,41 @@ class VendorProductController extends Controller
             return ['ingredient_id' => null, 'pack_qty_base' => null];
         }
 
-        $packQty = (float) $request->input('pack_qty_base', 0);
+        // ⚠ Only a live, Frozen, purchasable ingredient can be a tag. Meat ingredients are
+        //   the storage ledger's (the web page never offered them; the API used to accept
+        //   them), and a retired one must not quietly come back through a product.
+        $sameTag = $existing && (int) $existing->ingredient_id === (int) $ingredient->id;
+        if (!$sameTag && ((int) $ingredient->business_unit_id !== self::FROZEN_BU
+                || $ingredient->storage_product_id || !$ingredient->is_active)) {
+            abort(response()->json([
+                'success' => false,
+                'code'    => 'ingredient_not_taggable',
+                'message' => $ingredient->storage_product_id
+                    ? "{$ingredient->name} is meat — the storage ledger already tracks it, so a vendor product cannot count towards it."
+                    : "{$ingredient->name} is not an active Frozen ingredient, so it cannot be tagged here.",
+            ], 422));
+        }
 
-        if ($packQty <= 0) {
-            $packQty = $this->impliedPackQty((string) $request->input('unit'), $ingredient->base_unit);
+        $unit   = (string) $request->input('unit');
+        $factor = VendorUnits::factorTo($unit, $ingredient->base_unit);
+
+        if ($factor === 0.0) {
+            // ⭐⭐ ONE UNIT PER INGREDIENT (owner, Sep-26). "kg" against a pieces ingredient
+            //    used to be ACCEPTED once somebody typed "how many pieces in one kg" — an
+            //    average that drifts with every bag. Refused now, with the two ways out:
+            //    use the ingredient's own kind of unit, or change the ingredient's unit
+            //    everywhere (recipes and all), which the impact below describes.
+            abort(response()->json($this->mismatchPayload($ingredient, $unit, $existing), 422));
+        }
+
+        $packQty = $factor === null ? (float) $request->input('pack_qty_base', 0) : $factor;
+
+        if ($factor === null && $packQty > 0 && $ingredient->base_unit === 'pcs' && floor($packQty) != $packQty) {
+            abort(response()->json([
+                'success' => false,
+                'code'    => 'whole_number',
+                'message' => "How many whole pieces of {$ingredient->name} are in one " . VendorUnits::word($unit) . '? Pieces are whole numbers.',
+            ], 422));
         }
 
         if ($packQty <= 0) {
@@ -282,6 +420,7 @@ class VendorProductController extends Controller
             $unitWord = strtolower(trim((string) $request->input('unit'))) ?: 'unit';
             abort(response()->json([
                 'success' => false,
+                'code'    => 'pack_size_needed',
                 'message' => "How much {$ingredient->name} is in one {$unitWord}? "
                     . "A {$unitWord} could be any size, so type the amount (in "
                     . ($ingredient->base_unit === 'pcs' ? 'pieces' : ($ingredient->base_unit === 'ml' ? 'ml' : 'grams'))
@@ -293,29 +432,54 @@ class VendorProductController extends Controller
     }
 
     /**
-     * What one purchase unit obviously means in base units, or 0 when it is not
-     * obvious (a "pack", a "box" — only the person buying knows how big it is).
+     * The 422 a unit mismatch answers with. Both surfaces draw the same panel from it:
+     * a "Use pieces" button, and — when nothing forbids it — "Change Chicken Cubes to
+     * weight everywhere", listing every recipe line and product that moves with it.
+     * ⚠ Old APKs show only `message`, so the sentence carries the fix on its own.
      */
-    private function impliedPackQty(string $purchaseUnit, string $baseUnit): float
+    private function mismatchPayload(\App\Models\Khaas\IngredientModel $ingredient, string $unit, ?VendorProductModel $existing): array
     {
-        $u = strtolower(trim($purchaseUnit));
+        $base      = $ingredient->base_unit;
+        $unitKind  = VendorUnits::kindOf($unit);
+        $suggested = VendorUnits::suggestedFor($base);
+        $inRecipes = \App\Models\Khaas\RecipeLineModel::where('ingredient_id', $ingredient->id)->exists();
 
-        $map = [
-            'kg'    => ['g' => 1000.0],
-            'gram'  => ['g' => 1.0],
-            'grams' => ['g' => 1.0],
-            'g'     => ['g' => 1.0],
-            'ton'   => ['g' => 1000000.0],
-            'liter' => ['ml' => 1000.0],
-            'litre' => ['ml' => 1000.0],
-            'l'     => ['ml' => 1000.0],
-            'ml'    => ['ml' => 1.0],
-            'piece' => ['pcs' => 1.0],
-            'pcs'   => ['pcs' => 1.0],
-            'dozen' => ['pcs' => 12.0],
+        $impact = null;
+        if ($unitKind) {
+            $overrides = $existing ? [(int) $existing->id => $unit] : [];
+            try {
+                $impact = app(\App\Services\Khaas\IngredientUnitChangeService::class)->impact($ingredient, $unitKind, $overrides);
+            } catch (\Throwable $e) {
+                $impact = null;
+            }
+        }
+
+        $user = auth()->user();
+
+        return [
+            'success'        => false,
+            'code'           => 'unit_mismatch',
+            'message'        => "{$ingredient->name} is counted in " . strtoupper(VendorUnits::kindWord($base))
+                . ($inRecipes ? ' in your recipes' : '') . ', but this product is set to ' . VendorUnits::word($unit)
+                . '. Choose ' . VendorUnits::word($suggested) . ' (or pack / box with the number of '
+                . VendorUnits::baseWord($base) . ' in one)'
+                . ($unitKind ? ", or change {$ingredient->name} to " . VendorUnits::kindWord($unitKind) . ' everywhere.' : '.'),
+            'ingredient'     => [
+                'id'        => (int) $ingredient->id,
+                'name'      => $ingredient->name,
+                'base_unit' => $base,
+                'kind_word' => VendorUnits::kindWord($base),
+                'in_recipes'=> $inRecipes,
+            ],
+            'unit'           => VendorUnits::canonical($unit) ?? $unit,
+            'unit_kind'      => $unitKind,
+            'suggested_unit' => $suggested,
+            'allowed_units'  => VendorUnits::allowedFor($base),
+            // The second way out, described in full so the confirm needs no second request.
+            'change'         => $impact ? $impact + [
+                'can_manage' => $user ? $user->hasMobilePermission('manage_khaas_recipes') : false,
+            ] : null,
         ];
-
-        return (float) ($map[$u][$baseUnit] ?? 0.0);
     }
 
     /**

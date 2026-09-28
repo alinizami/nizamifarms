@@ -264,10 +264,14 @@
             // out of the Store figure above (prepared items are excluded server-side,
             // because those have already been deducted and counting them would make
             // the manager request twice as much as he needs).
+            // ⭐ Sep-26: the SAME number the phone shows (OpenOrderDemandService) — open
+            //   orders = accepted (today) + pending (accepted for a later day). The Shopify
+            //   approval queue is shown beside it, not inside it (owner).
             $demandRow = $orderDemand[$product->id] ?? null;
             $demandTotal = $demandRow['total'] ?? 0;
             $demandShopify = $demandRow['shopify'] ?? 0;
-            $demandOpen = $demandRow['open'] ?? 0;
+            $demandAccepted = $demandRow['accepted'] ?? 0;
+            $demandLater = $demandRow['pending'] ?? 0;
 
             $openRequest = $pendingRequestsByProduct[$product->id] ?? null;
             $requestedQty = $openRequest ? (int) $openRequest->quantity : 0;
@@ -342,7 +346,37 @@
                 @php
                     $rc  = $recipeCosts[$product->id] ?? null;
                     $cov = $recipeCoverage[$product->id] ?? null;
+                    $rp  = ($recipePrices ?? [])[$product->id] ?? null;
                 @endphp
+                {{-- 💲 Sep-27: the recipe at today's prices. A partial figure says how many
+                     lines it leaves out, so it never reads as the whole cost. --}}
+                @if($rp)
+                    <div class="mt-1 rounded-lg px-3 py-2"
+                         style="background-color:#F0FDF4; border:1px solid #BBF7D0;">
+                        @if($canSeeIngredientCost && $rp['per_pack'] !== null && $rp['priced_lines'] > 0)
+                            <div class="flex items-center justify-between">
+                                <span class="text-[11px]" style="color:#166534;">Recipe at today's prices</span>
+                                <span class="text-xs font-bold" style="color:#14532D;">Rs {{ number_format($rp['per_pack'], 2) }} / {{ Str::singular($unit) }}</span>
+                            </div>
+                            @if($rp['share_of_price'] !== null)
+                                <div class="text-[10px] mt-0.5" style="color:#15803D;">{{ $rp['share_of_price'] }}% of the Rs {{ number_format($rp['selling_price']) }} price</div>
+                            @endif
+                        @elseif($rp['priced_lines'] === 0)
+                            <span class="text-[11px]" style="color:#166534;">Recipe has no priced line yet</span>
+                        @else
+                            <span class="text-[11px]" style="color:#166534;">Recipe: {{ $rp['priced_lines'] }} line(s) priced</span>
+                        @endif
+                        @if($rp['unpriced_lines'] > 0)
+                            <div class="text-[10px] mt-0.5" style="color:#B45309;"
+                                 title="{{ implode(', ', $rp['unpriced_names']) }}">
+                                ⚠ {{ $rp['unpriced_lines'] }} ingredient(s) not priced yet{{ $rp['priced_lines'] > 0 ? ' — real cost is higher' : '' }}
+                            </div>
+                        @endif
+                        @if($rp['flagged_prices'] > 0)
+                            <div class="text-[10px] mt-0.5" style="color:#B45309;">⚠ {{ $rp['flagged_prices'] }} old or jumped price(s) — see the recipe</div>
+                        @endif
+                    </div>
+                @endif
                 @if($cov && !$cov['has_recipe'])
                     <div class="mt-1 rounded-lg px-3 py-2 flex items-center justify-between"
                          style="background-color:#F9FAFB; border:1px solid #E5E7EB;">
@@ -385,27 +419,28 @@
                 {{-- Pending order demand. Clickable: the number alone invites "says who?",
                      so the popup lists the exact orders behind it. Hidden entirely at 0
                      to keep cards clean. --}}
-                @if($demandTotal > 0)
+                @if($demandTotal > 0 || $demandShopify > 0)
                 <div class="mt-1 rounded-lg px-3 py-2" style="background-color:#faf5ff; border:1px solid #e9d5ff;">
                     <div class="flex items-center justify-between cursor-pointer group"
                          onclick="openPendingOrdersModal({{ $product->id }}, '{{ addslashes($product->title) }}')"
                          title="Click to see which orders need this">
                         <span class="text-xs" style="color:#6b21a8;">
-                            🛒 Pending orders
+                            🛒 Open orders
                             <span class="text-[10px] opacity-0 group-hover:opacity-100 transition-opacity">📋</span>
                         </span>
                         <span class="text-sm font-bold group-hover:underline" style="color:#6b21a8;">{{ $demandTotal }} {{ $unit }}</span>
                     </div>
                     <div class="flex items-center justify-between mt-0.5">
                         <span class="text-[10px]" style="color:#7e22ce;">
-                            @if($demandShopify > 0)Shopify {{ $demandShopify }}@endif
-                            @if($demandShopify > 0 && $demandOpen > 0) · @endif
-                            @if($demandOpen > 0)Open orders {{ $demandOpen }}@endif
+                            @if($demandTotal > 0)✅ Accepted {{ $demandAccepted }} · 🗓 Later day {{ $demandLater }}@endif
                         </span>
                         @if($shortfall > 0)
                             <span class="px-1.5 py-0.5 rounded text-[10px] font-bold" style="background-color:#fee2e2; color:#991b1b;">Short by {{ $shortfall }}</span>
                         @endif
                     </div>
+                    @if($demandShopify > 0)
+                    <div class="text-[10px] mt-0.5" style="color:#9ca3af;">⏳ {{ $demandShopify }} more in the Shopify approval queue (not counted)</div>
+                    @endif
                 </div>
                 @endif
 
@@ -1224,14 +1259,18 @@ function openPendingOrdersModal(productId, productName) {
                 return;
             }
             var html = '';
-            html += renderPendingOrderSection('⏳ Shopify approval queue', 'Not yet accepted into orders', d.shopify, d.shopify_total, '#faf5ff', '#6b21a8');
-            html += renderPendingOrderSection('🛒 Open orders', 'Accepted, not yet prepared', d.open, d.open_total, '#eff6ff', '#1e40af');
-            if (!d.total) {
+            var open = d.open || [];
+            var acc = open.filter(function (r) { return r.bucket !== 'pending'; });
+            var later = open.filter(function (r) { return r.bucket === 'pending'; });
+            html += renderPendingOrderSection('✅ Accepted', 'Open, not yet prepared', acc, d.accepted_total != null ? d.accepted_total : acc.reduce(function (s, r) { return s + r.qty; }, 0), '#eff6ff', '#1e40af');
+            html += renderPendingOrderSection('🗓 Later day', 'Accepted for delivery on a later day (pending)', later, d.pending_total != null ? d.pending_total : later.reduce(function (s, r) { return s + r.qty; }, 0), '#f0fdf4', '#166534');
+            html += renderPendingOrderSection('⏳ Shopify approval queue', 'Not accepted yet — not counted in the total', d.shopify, d.shopify_total, '#faf5ff', '#6b21a8');
+            if (!d.total && !d.shopify_total) {
                 html = '<div class="px-6 py-10 text-center text-sm text-gray-400">Nothing pending for this product.</div>';
             }
             body.innerHTML = html;
             document.getElementById('pendingOrdersFooter').textContent =
-                'Total pending: ' + d.total + ' units · already-prepared items are excluded';
+                'Open orders: ' + d.total + ' units · already-prepared items are excluded' + (d.shopify_total ? ' · Shopify queue ' + d.shopify_total + ' not counted' : '');
         })
         .catch(function() {
             body.innerHTML = '<div class="px-6 py-10 text-center text-sm text-gray-400">Could not load orders.</div>';

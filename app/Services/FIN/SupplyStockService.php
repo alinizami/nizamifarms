@@ -414,8 +414,25 @@ class SupplyStockService
         if (!$packet) {
             throw new \RuntimeException('That packet is not in Storage.');
         }
+
+        // ⭐ Sep-26: every packet of a packet product is the same thing under the same label,
+        // and the confirm card only ever offered "the oldest one". If somebody else took that
+        // very packet between the scan and the tap, the next oldest IS what this person is
+        // holding — so take that one instead of telling them to scan again for ever.
         if ($packet->status !== SupplyPacketModel::STATUS_IN_STOCK) {
-            throw new \RuntimeException('That packet has already been taken out.');
+            $next = SupplyPacketModel::query()
+                ->select('t_fin_supply_packet.*')
+                ->join('t_fin_supply_batch as b', 'b.id', '=', 't_fin_supply_packet.batch_id')
+                ->where('t_fin_supply_packet.product_id', $product->id)
+                ->where('t_fin_supply_packet.status', SupplyPacketModel::STATUS_IN_STOCK)
+                ->where('b.status', '!=', SupplyBatchModel::STATUS_VOIDED)
+                ->orderBy('b.purchase_date')->orderBy('b.id')->orderBy('t_fin_supply_packet.seq')
+                ->lockForUpdate()
+                ->first();
+            if (!$next) {
+                throw new \RuntimeException('No ' . $product->name . ' left in Storage — ask Taimur or Shabib to book the new stock.');
+            }
+            $packet = SupplyPacketModel::where('id', $next->id)->lockForUpdate()->first();
         }
 
         $batch = SupplyBatchModel::where('id', $packet->batch_id)->lockForUpdate()->first();
@@ -529,7 +546,7 @@ class SupplyStockService
             //    purchase lands on exactly zero instead of a few paisa short or over.
             $cost = $emptiesBatch
                 ? round((float) $batch->cost_remaining, 2)
-                : round(((float) $batch->total_cost) * $take / ((float) $batch->qty_total), 2);
+                : $this->poolLegCost($product, $batch, $remaining, (float) $batch->cost_remaining, $take);
 
             $batch->qty_remaining = round($remaining - $take, 3);
             $batch->cost_remaining = round(max(0, (float) $batch->cost_remaining - $cost), 2);
@@ -605,7 +622,7 @@ class SupplyStockService
             $empties = abs($take - $row['qty']) < 0.0005;
             $cost = $empties
                 ? round($row['cost'], 2)
-                : round(((float) $row['batch']->total_cost) * $take / ((float) $row['batch']->qty_total), 2);
+                : $this->poolLegCost($product, $row['batch'], $row['qty'], $row['cost'], $take);
 
             $legs[] = [
                 'batch_id' => $row['batch']->id,
@@ -632,6 +649,36 @@ class SupplyStockService
         ];
     }
 
+    /**
+     * The price of ONE leg that does not empty its purchase. consumeFromPool and
+     * previewPoolConsumption both call this, so a previewed figure is the figure that lands.
+     *
+     * ⚠ Sep-26 review: the old line was `round(total × take / qty_total, 2)` with nothing
+     * stopping it going past what was left. Each leg rounds on its own, so on a cheap
+     * counted item the half-paisa rounds UP every time — 1,000 pcs for Rs 2,345 taken one
+     * at a time charged Rs 2,347.65 and left the stock account Rs 2.65 below the shelf.
+     *
+     *   • pieces — priced from what is LEFT (cost_remaining ÷ qty_remaining), so rounding
+     *     corrects itself on the next take and the purchase lands on exactly its price.
+     *   • weight — UNCHANGED formula (owner: weighed products must behave exactly as they
+     *     do), only capped at what is left. At bag prices the cap never bites in practice.
+     */
+    private function poolLegCost(
+        SupplyProductModel $product,
+        SupplyBatchModel $batch,
+        float $qtyLeft,
+        float $costLeft,
+        float $take
+    ): float {
+        if ($product->mode === SupplyProductModel::MODE_PIECES) {
+            return $qtyLeft > 0 ? round($costLeft * $take / $qtyLeft, 2) : 0.0;
+        }
+
+        $prorated = round(((float) $batch->total_cost) * $take / max((float) $batch->qty_total, 0.0001), 2);
+
+        return round(min($prorated, max(0.0, $costLeft)), 2);
+    }
+
     /** "kg" or "pcs" — the unit a pooled product's quantity is counted in. */
     public function poolUnit(SupplyProductModel $product): string
     {
@@ -651,12 +698,20 @@ class SupplyStockService
      * endpoint runs the payment-source allow-list, which would refuse a store user
      * paying from the stock account. The rules that matter are applied explicitly
      * below instead.
+     *
+     * `$userId` is who is ACTING (decides self-approval, signs the audit row). Normally that
+     * is also the spender and the day is today. A LATER correction that makes a free
+     * take-out chargeable passes the original `$expenseDate` and `$requesterId` (the person
+     * who took it out) — Sep-26 review: it used to land dated the day of the edit, under
+     * the manager's name, so the cost moved into the wrong month.
      */
     private function raiseExpenseRequest(
         SupplyTakeoutModel $takeout,
         SupplyProductModel $product,
         array $legs,
-        int $userId
+        int $userId,
+        ?string $expenseDate = null,
+        ?int $requesterId = null
     ): void {
         $category = RequestCategoryModel::where('category_code', self::EXPENSE_CATEGORY_CODE)->first();
         if (!$category) {
@@ -687,12 +742,12 @@ class SupplyStockService
         $request = RequestModel::create([
             'request_number' => RequestModel::generateRequestNumber(),
             'category_id' => $category->id,
-            'requester_user_id' => $userId,          // the SCANNER is the spender (owner ruling)
+            'requester_user_id' => $requesterId ?? $userId, // the SCANNER is the spender (owner ruling)
             'title' => 'Storage: ' . $product->name . ' ' . $qtyPhrase,
             'description' => $this->takeoutDescription($product, $qtyPhrase, $legs),
             'amount' => $takeout->cost,
             'expense_category' => $product->expense_category_name,
-            'expense_date' => now()->toDateString(),  // the day it was USED — the whole point
+            'expense_date' => $expenseDate ?? now()->toDateString(), // the day it was USED — the whole point
             // ⭐⭐ The money leg. NEVER the batch's paying account: that cash already
             //    left when the stock was bought, and naming it here would take it twice.
             'payment_source_account_id' => $stock->id,
@@ -751,16 +806,32 @@ class SupplyStockService
         $takeout->save();
 
         if ($autoApprove) {
+            // ⚠⚠ Sep-26 review: this was a try/catch around a method that never throws —
+            // postExpenseFromRequest catches everything itself and RETURNS success:false.
+            // The result was ignored, so a failed post (e.g. no expense account for the
+            // category) left the take-out "approved", the stock off the shelf and NO expense:
+            // the stock account then sat above the shelf for ever, and nothing said so.
+            //
+            // Every caller runs inside a transaction, so failing here rolls the WHOLE
+            // take-out back — nothing is half-recorded, and the person gets a message
+            // they can act on instead of a take-out that silently cost nothing.
             try {
-                app(LedgerPostingService::class)->postExpenseFromRequest($request);
+                $result = app(LedgerPostingService::class)->postExpenseFromRequest($request);
             } catch (\Throwable $e) {
-                // Same posture as RequestController::store — a ledger failure is logged,
-                // never allowed to lose the take-out itself.
-                Log::error('Storage take-out: expense post failed', [
+                $result = ['success' => false, 'message' => $e->getMessage()];
+            }
+            if (empty($result['success'])) {
+                Log::error('Storage take-out: expense post failed — take-out rolled back', [
                     'request_id' => $request->id,
                     'takeout_id' => $takeout->id,
-                    'error' => $e->getMessage(),
+                    'product_id' => $product->id,
+                    'expense_category' => $product->expense_category_name,
+                    'error' => $result['message'] ?? null,
                 ]);
+                throw new \RuntimeException(
+                    'The expense for this could not be booked (' . ($result['message'] ?? 'unknown error') . '), '
+                    . 'so nothing was taken out. Tell Taimur or Shabib — the product\'s expense category may need fixing.'
+                );
             }
         }
     }
@@ -860,14 +931,16 @@ class SupplyStockService
      * same cost the reversal just returned to SUPPLIES_STOCK. Only syncWithRequest() passes
      * it, and only after checking the ledger row really is `reversed`.
      */
-    public function restore(SupplyTakeoutModel $takeout, string $status, ?string $reason = null, bool $expenseDeleted = false): void
+    public function restore(SupplyTakeoutModel $takeout, string $status, ?string $reason = null, bool $expenseDeleted = false): bool
     {
-        DB::transaction(function () use ($takeout, $status, $reason, $expenseDeleted) {
+        // Returns whether stock actually went back — a caller that promises "it is back in
+        // Storage" must be able to tell a restore from a no-op (Sep-26 review).
+        return DB::transaction(function () use ($takeout, $status, $reason, $expenseDeleted) {
             $fresh = SupplyTakeoutModel::where('id', $takeout->id)->lockForUpdate()->first();
             $allowed = $fresh && ($fresh->isUndoable()
                 || ($expenseDeleted && $fresh->status === SupplyTakeoutModel::STATUS_APPROVED));
             if (!$allowed) {
-                return;
+                return false;
             }
 
             $product = SupplyProductModel::find($fresh->product_id);
@@ -898,6 +971,8 @@ class SupplyStockService
             $fresh->status = $status;
             $fresh->settled_at = now();
             $fresh->save();
+
+            return true;
         });
     }
 
@@ -1056,7 +1131,13 @@ class SupplyStockService
                 $fresh->status = SupplyTakeoutModel::STATUS_PENDING;
                 $fresh->settled_at = null;
                 $fresh->save();
-                $this->raiseExpenseRequest($fresh->fresh(), $product, $legs, $userId);
+                // ⭐ On the day it was TAKEN, under the person who TOOK it — the same rule as
+                // every other correction here (recostTakeout re-applies on the original date).
+                $this->raiseExpenseRequest(
+                    $fresh->fresh(), $product, $legs, $userId,
+                    optional($fresh->taken_at)->toDateString(),
+                    $fresh->taken_by ? (int) $fresh->taken_by : null
+                );
                 $fresh = $fresh->fresh();
                 $crossed = 'now_billable';
             } elseif ($fresh->status !== SupplyTakeoutModel::STATUS_NO_CHARGE && !$billable) {
@@ -1274,8 +1355,7 @@ class SupplyStockService
                     ->sum(fn ($p) => (float) $p->cost), 2);
             } else {
                 // POOLED (weight or pieces): re-cost each leg at the new rate; the shelf
-                // absorbs the rounding.
-                $unit = $newTotal / max((float) $b->qty_total, 0.0001);
+                // absorbs the rounding (or, once used up, the finishing leg does).
                 $legTotal = 0.0;
 
                 // ⭐ A weighed purchase also has packet rows — intake audit, not stock. They
@@ -1295,14 +1375,16 @@ class SupplyStockService
                 }
                 $legs = SupplyTakeoutLegModel::where('batch_id', $b->id)->orderBy('id')->lockForUpdate()->get();
 
+                // ⚠ Sep-26 review: a USED-UP purchase must land on exactly zero — see
+                // pooledCorrectionCosts(), which the preview uses too.
+                $newCosts = $this->pooledCorrectionCosts($b, $legs, $newTotal);
+
                 foreach ($legs as $leg) {
-                    $takeout = SupplyTakeoutModel::find($leg->takeout_id);
-                    // A rejected / undone take-out gave its quantity back, so it costs nothing.
-                    if ($takeout && in_array($takeout->status, SupplyTakeoutModel::RESTORED_STATUSES, true)) {
-                        continue;
+                    if (!array_key_exists($leg->id, $newCosts)) {
+                        continue;   // a rejected / undone take-out gave its quantity back
                     }
                     $wasCost = (float) $leg->cost;
-                    $cost = round($unit * (float) $leg->qty, 2);
+                    $cost = $newCosts[$leg->id];
                     $leg->cost = $cost;
                     $leg->save();
                     $legTotal += $cost;
@@ -1357,6 +1439,37 @@ class SupplyStockService
     }
 
     /**
+     * A pooled purchase's legs at a corrected price: each at `new rate × qty`, EXCEPT that
+     * when the purchase is used up, the leg that finished it takes the remainder — so the
+     * purchase lands on exactly zero instead of stranding a few paisa with no quantity left
+     * to carry them (Sep-26 review). Restored take-outs are left out. The correction and its
+     * preview both use this, so the previewed figure is the one that lands.
+     *
+     * @return array [leg_id => cost]
+     */
+    private function pooledCorrectionCosts(SupplyBatchModel $b, $legs, float $newTotal): array
+    {
+        $unit = $newTotal / max((float) $b->qty_total, 0.0001);
+        $active = $legs->filter(function ($leg) {
+            $t = SupplyTakeoutModel::find($leg->takeout_id);
+            return !($t && in_array($t->status, SupplyTakeoutModel::RESTORED_STATUSES, true));
+        })->sortBy('id')->values();
+
+        $lastId = ((float) $b->qty_remaining < 0.0005 && $active->isNotEmpty()) ? $active->last()->id : null;
+        $out = [];
+        $sum = 0.0;
+        foreach ($active as $leg) {
+            $cost = $leg->id === $lastId
+                ? round($newTotal - $sum, 2)
+                : round($unit * (float) $leg->qty, 2);
+            $sum += $cost;
+            $out[$leg->id] = $cost;
+        }
+
+        return $out;
+    }
+
+    /**
      * Re-cost ONE take-out after its packet's share changed. A pending one has no ledger
      * yet, so only the request amount moves; an approved one has its expense reversed,
      * amended and re-applied on its ORIGINAL date.
@@ -1383,6 +1496,37 @@ class SupplyStockService
         $takeout->save();
 
         $request = $takeout->request_id ? RequestModel::find($takeout->request_id) : null;
+
+        // ⚠ Sep-26 review: a FREE take-out (it cost under a paisa, so it raised no expense)
+        // whose share of a purchase goes UP after a price correction now owes one. Without
+        // this its cost changed but no expense ever existed, and that share sat in the stock
+        // account for ever. Raised on the day it was taken, under the person who took it.
+        if (!$request && $takeout->status === SupplyTakeoutModel::STATUS_NO_CHARGE
+            && $newCost >= self::MIN_BILLABLE) {
+            $product = SupplyProductModel::find($takeout->product_id);
+            $legs = SupplyTakeoutLegModel::where('takeout_id', $takeout->id)->orderBy('id')->get()
+                ->map(fn ($l) => ['batch_id' => $l->batch_id, 'packet_id' => $l->packet_id,
+                                  'qty' => (float) $l->qty, 'cost' => (float) $l->cost])
+                ->all();
+            if ($product && $legs) {
+                $takeout->status = SupplyTakeoutModel::STATUS_PENDING;
+                $takeout->settled_at = null;
+                $takeout->save();
+                $this->raiseExpenseRequest(
+                    $takeout->fresh(), $product, $legs, $userId,
+                    optional($takeout->taken_at)->toDateString(),
+                    $takeout->taken_by ? (int) $takeout->taken_by : null
+                );
+                $request = RequestModel::find($takeout->fresh()->request_id);
+                return [
+                    'request_number' => $request?->request_number,
+                    'was' => $was,
+                    'now' => $newCost,
+                    'month' => $request && $request->expense_date ? substr((string) $request->expense_date, 0, 7) : null,
+                ];
+            }
+        }
+
         if (!$request) {
             return null;
         }
@@ -1449,13 +1593,17 @@ class SupplyStockService
             ? $newTotal / (float) $batch->qty_total
             : null;
 
+        $poolCosts = $poolUnit !== null
+            ? $this->pooledCorrectionCosts($batch, SupplyTakeoutLegModel::where('batch_id', $batch->id)->get(), $newTotal)
+            : [];
+
         foreach ($takeouts as $t) {
             $legs = SupplyTakeoutLegModel::where('takeout_id', $t->id)->where('batch_id', $batch->id)->get();
             $legCost = (float) $legs->sum('cost');
             if ($newByPacket !== null) {
                 $newLegCost = (float) $legs->sum(fn ($l) => $newByPacket[$l->packet_id] ?? (float) $l->cost);
             } elseif ($poolUnit !== null) {
-                $newLegCost = (float) $legs->sum(fn ($l) => round($poolUnit * (float) $l->qty, 2));
+                $newLegCost = (float) $legs->sum(fn ($l) => $poolCosts[$l->id] ?? round($poolUnit * (float) $l->qty, 2));
             } else {
                 $newLegCost = round($legCost * $ratio, 2);
             }

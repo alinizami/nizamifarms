@@ -51,7 +51,7 @@ class FrozenMonthService
     /** @return array{0:Carbon,1:Carbon} */
     public function window(string $month): array
     {
-        $start = Carbon::createFromFormat('Y-m', $month)->startOfMonth();
+        $start = Carbon::createFromFormat('!Y-m', $month)->startOfMonth();
         return [$start, $start->copy()->endOfMonth()];
     }
 
@@ -61,7 +61,7 @@ class FrozenMonthService
             return false;
         }
         try {
-            Carbon::createFromFormat('Y-m', $month);
+            Carbon::createFromFormat('!Y-m', $month);
             return true;
         } catch (\Throwable $e) {
             return false;
@@ -249,6 +249,21 @@ class FrozenMonthService
     }
 
     // ── production sub-queries (each guarded: a failure degrades to 0) ──
+
+    /**
+     * The shelf price per product — the SAME rule Month Review values packs at, so the
+     * recipe card's "% of the price" and the page's shelf value speak of one price.
+     *
+     * @return array<int,float>
+     */
+    public function sellingPrices(array $productIds): array
+    {
+        if (!$productIds) {
+            return [];
+        }
+        $products = ProductModel::whereIn('id', $productIds)->get(['id', 'price_min']);
+        return $this->pricePerProduct($products, $productIds);
+    }
 
     private function pricePerProduct($products, array $productIds): array
     {
@@ -937,7 +952,15 @@ class FrozenMonthService
         $madeBatch  = (int) $production['totals']['made_batch'];
         $madeManual = (int) $production['totals']['made_manual'];
 
+        $recipeVsPurchases = $this->recipeVsPurchases(
+            // Always the purchases AS BOUGHT: "as used" swaps the meat row for what
+            // production took, which would compare the recipe with itself.
+            $production, round($product - $meatAdjustment, 2), $meatBought,
+            $ingredients, $productCost, $madeBatch, $madeManual, $businessUnitId, $month
+        );
+
         return [
+            'recipe_vs_purchases' => $recipeVsPurchases,
             'month'        => $month,
             'basis'        => $basis,
             'production'   => $production,
@@ -972,6 +995,198 @@ class FrozenMonthService
                 'meat_adjustment'  => $meatAdjustment,
             ],
         ];
+    }
+
+    /**
+     * 💲 Recipe vs purchases — "N packs were made: what should they have cost, and what
+     * did we buy?" Owner's ask, 27-Sep. The gap analysis, in three honest parts:
+     *
+     *   1. What CAN be compared — ingredients bought on itemised bills against what the
+     *      recipes say the month's packs used (same month-average prices as the
+     *      Ingredients panel, so the two panels never disagree), and meat: what the
+     *      recipes say against what storage says left the freezer.
+     *   2. Purchase money that CANNOT be compared — bills recorded as one total, with no
+     *      product lines, so nothing ties them to an ingredient.
+     *   3. Packs that CANNOT be costed — made with no recipe behind them.
+     *
+     * ⭐ Owner ruling 27-Sep: history is NOT restated. Packs made before a recipe existed,
+     *   and bills recorded as a total, stay outside; the block fills in as itemised bills
+     *   and recipes accumulate, and says plainly how much sits outside meanwhile.
+     *
+     * ⚠ A difference is not a loss. Bought-but-not-used is usually still on the shelf;
+     *   the block says so every time, rather than inviting the wrong conclusion.
+     */
+    private function recipeVsPurchases(
+        array $production,
+        float $productBought,
+        float $meatBought,
+        array $ingredients,
+        array $productCost,
+        int $madeBatch,
+        int $madeManual,
+        int $businessUnitId,
+        string $month
+    ): array {
+        $made     = (int) $production['totals']['made'];
+        $costed   = (int) ($productCost['totals']['made'] ?? 0);
+        $uncosted = max(0, $made - $costed);
+
+        $boughtIng = 0.0;   // itemised, non-meat, this month
+        $usedIng   = 0.0;   // recipe standard of the same ingredients, at the month's rates
+        $rows      = [];
+        $meatRows  = [];
+
+        foreach ($ingredients['rows'] ?? [] as $r) {
+            if (empty($r['has_movement']) && empty($r['standard_qty'])) {
+                continue;
+            }
+            $rate = (float) ($r['rate_per_base'] ?? 0);
+
+            if (!empty($r['is_meat'])) {
+                // Recipe standard vs the storage ledger — both in grams here.
+                $recipeQty  = (float) $r['standard_qty'];
+                $storageQty = (float) $r['used_qty'];
+                if ($recipeQty <= 0 && $storageQty <= 0) {
+                    continue;
+                }
+                $diff = $storageQty - $recipeQty;
+                $meatRows[] = [
+                    'name'         => $r['name'],
+                    'recipe_text'  => $r['standard_text'],
+                    'storage_text' => $r['used_text'],
+                    'diff_qty'     => round($diff, 3),
+                    'diff_text'    => $this->kgText($diff),
+                    'diff_value'   => round($diff * $rate, 2),
+                    'direction'    => $recipeQty <= 0 ? 'no_recipe'
+                        : ($diff > 0.5 ? 'more_used' : ($diff < -0.5 ? 'less_used' : 'matches')),
+                ];
+                continue;
+            }
+
+            $bought = (float) $r['bought_qty'];
+            $used   = (float) $r['used_qty'];
+            $boughtIng += (float) ($r['bought_cost'] ?? 0);
+            $usedIng   += (float) ($r['used_value'] ?? 0);
+
+            $diff = $bought - $used;
+            $rows[] = [
+                'name'        => $r['name'],
+                'base_unit'   => $r['base_unit'],
+                'bought_text' => $r['bought_text'],
+                'used_text'   => $r['used_text'],
+                'diff_qty'    => round($diff, 3),
+                'diff_value'  => round($diff * $rate, 2),
+                'direction'   => $bought <= 0 ? 'not_bought'
+                    : ($used <= 0 ? 'not_used' : ($diff >= 0 ? 'bought_more' : 'used_more')),
+                'has_rate'    => $rate > 0,
+            ];
+        }
+
+        // Biggest rupee gap first; a gap with no rate cannot be ranked by money.
+        usort($rows, fn ($a, $b) => abs($b['diff_value']) <=> abs($a['diff_value']));
+
+        // Lines that exist but carry no ingredient (a product not linked yet, a bag, a
+        // POS charge) are a different fix from a bill with no lines at all.
+        $untagged    = $this->untaggedLineTotal($businessUnitId, $month);
+        $rest        = max(0.0, round($productBought - $meatBought - $boughtIng, 2));
+        $untagged    = min($untagged, $rest);
+        $notItemised = round($rest - $untagged, 2);
+
+        // Per product: the recipe cost of what was made, against its price.
+        $prices   = [];
+        foreach ($production['products'] ?? [] as $p) {
+            $prices[(int) $p['product_id']] = (float) ($p['selling_price'] ?? 0);
+        }
+        $products = [];
+        foreach ($productCost['rows'] ?? [] as $pc) {
+            $price = $prices[(int) $pc['product_id']] ?? 0.0;
+            $products[] = [
+                'product_name'   => $pc['product_name'],
+                'made'           => $pc['made'],
+                'cost_per_pack'  => $pc['cost_per_pack'],
+                'selling_price'  => $price ?: null,
+                'share_of_price' => $price > 0 ? round($pc['cost_per_pack'] * 100 / $price, 1) : null,
+            ];
+        }
+
+        $notes = [];
+        if ($made === 0) {
+            $notes[] = 'Nothing was made this month, so there is nothing to compare.';
+        } elseif ($costed === 0) {
+            $notes[] = sprintf(
+                'None of the %d packs had a recipe when they were made, so there is no recipe cost to compare yet. '
+                . 'Packs made from now on, for products with a recipe, fill this in.', $made);
+        } elseif ($uncosted > 0) {
+            $notes[] = sprintf(
+                '%d of the %d packs had no recipe when they were made, so they are outside the recipe cost.',
+                $uncosted, $made);
+        }
+        if ($untagged > 0) {
+            $notes[] = 'Some bills do have product lines, but those products are not linked to an ingredient yet. '
+                . "Link them on the vendor's Products screen and their next bills count here.";
+        }
+        if ($notItemised > 0) {
+            $notes[] = 'Some purchases were recorded as one total with no product lines, so they cannot be matched '
+                . 'to a recipe. Switching those vendors to by-weight and entering their bills line by line brings them in.';
+        }
+        $notes[] = 'A difference is not a loss by itself: what was bought and not used is usually still on the shelf. '
+            . 'Enter a stock count for an ingredient on the Planning page to see what is actually left.';
+
+        return [
+            'has_data'  => $costed > 0 || $boughtIng > 0,
+            'packs'     => [
+                'made'     => $made,
+                'plan'     => $madeBatch,
+                'direct'   => $madeManual,
+                'costed'   => $costed,
+                'uncosted' => $uncosted,
+            ],
+            'recipe_cost'     => (float) ($productCost['totals']['cost'] ?? 0),
+            'recipe_per_pack' => (float) ($productCost['totals']['cost_per_pack'] ?? 0),
+            'purchases'       => [
+                'total'        => round($productBought, 2),
+                'meat'         => round($meatBought, 2),
+                'itemised'     => round($boughtIng, 2),
+                'untagged'     => round($untagged, 2),
+                'not_itemised' => $notItemised,
+            ],
+            'ingredients'     => [
+                'bought'     => round($boughtIng, 2),
+                'used'       => round($usedIng, 2),
+                'difference' => round($boughtIng - $usedIng, 2),
+                'rows'       => $rows,
+            ],
+            'meat'            => $meatRows,
+            'products'        => $products,
+            'notes'           => $notes,
+        ];
+    }
+
+    /** Rs on purchase lines this month that carry no ingredient. */
+    private function untaggedLineTotal(int $bu, string $month): float
+    {
+        [$start, $end] = $this->window($month);
+        try {
+            $q = DB::table('t_fin_vendor_purchase_items as i')
+                ->join('t_fin_ledger as l', 'l.id', '=', 'i.ledger_id')
+                ->where('l.business_unit_id', $bu)
+                ->where('l.transaction_type', LedgerModel::TYPE_VENDOR_PURCHASE)
+                ->whereIn('l.approval_status', [LedgerModel::STATUS_APPROVED, LedgerModel::STATUS_PENDING_L2])
+                ->whereBetween('l.transaction_date', [$start->toDateString(), $end->toDateString()])
+                ->whereNull('i.ingredient_id')
+                ->where('i.line_total', '>', 0);
+            QurbaniFinanceFilter::applyToLedgerQuery($q, 'l', QurbaniFinanceFilter::MODE_EXCLUDE);
+            return round((float) $q->sum('i.line_total'), 2);
+        } catch (\Throwable $e) {
+            \Log::warning('Frozen month: untagged lines failed', ['error' => $e->getMessage()]);
+            return 0.0;
+        }
+    }
+
+    private function kgText(float $grams): string
+    {
+        $kg = abs($grams) / 1000;
+        return ($grams < 0 ? '−' : '') . rtrim(rtrim(number_format($kg, 3), '0'), '.') . ' kg';
     }
 
     /**

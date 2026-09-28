@@ -87,6 +87,67 @@ class SupplyProductModel extends Model
     }
 
     /**
+     * ⭐ The Czerlop scale number this product's labels carry, or null.
+     *
+     * A weighed product stores it in `plu`. A SCAN product may instead have its labels
+     * printed on the scale in count mode — `2 000176 00001 7` = scale no. 176, "1 pcs" —
+     * and the person setting it up types the scale number (176) into the barcode box,
+     * because that is the only number they ever see on the scale. Sep-25-2026: that is
+     * exactly what Taimur did, and every label was refused, because a scan product
+     * compared the WHOLE 13-digit code to "176".
+     *
+     * A real printed barcode is 8, 12 or 13 digits, so a barcode of 1-6 digits can only be
+     * a scale number. Reading it here (instead of copying it into `plu`) means the product
+     * already saved that way works with no data change and no re-save — and re-saving
+     * later cannot trip the "barcode is frozen once stock exists" guard.
+     */
+    public function scalePlu(): ?int
+    {
+        if ($this->mode === self::MODE_WEIGHT) {
+            return $this->plu ? (int) $this->plu : null;
+        }
+        if ($this->mode === self::MODE_SCAN) {
+            if ($this->plu) {
+                return (int) $this->plu;
+            }
+            return self::barcodeAsScalePlu($this->barcode);
+        }
+        return null;
+    }
+
+    /** "176" / "000176" -> 176. Anything that is not 1-6 digits (a real barcode) -> null. */
+    public static function barcodeAsScalePlu(?string $barcode): ?int
+    {
+        $b = trim((string) $barcode);
+        if ($b === '' || !preg_match('/^\d{1,6}$/', $b)) {
+            return null;
+        }
+        $n = (int) $b;
+        return $n > 0 ? $n : null;
+    }
+
+    /**
+     * Does a scanned code belong to this SCAN product? The exact barcode, or — for a
+     * product whose labels come off the scale — any label carrying its scale number.
+     *
+     * ⚠ The count on the label ("1 pcs", "2 pcs") is deliberately ignored: owner ruling,
+     * one scan = one packet, whatever the packet holds.
+     *
+     * @param array|null $decoded  WeightBarcodeDecoder::decode($raw)
+     */
+    public function scanMatches(string $raw, ?array $decoded): bool
+    {
+        if ($this->mode !== self::MODE_SCAN) {
+            return false;
+        }
+        if ($this->barcode !== null && trim($raw) === (string) $this->barcode) {
+            return true;
+        }
+        $plu = $this->scalePlu();
+        return $plu !== null && $decoded && (int) $decoded['plu'] === $plu;
+    }
+
+    /**
      * Is this product's stock a POOL — a running quantity drawn down FIFO across purchases,
      * rather than a set of individually identified packets?
      *

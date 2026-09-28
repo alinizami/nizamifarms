@@ -1451,6 +1451,9 @@ Route::middleware(['auth'])->group(function () {
         Route::get('/ingredients', [\App\Http\Controllers\Khaas\RecipeController::class, 'ingredients'])->name('ingredients');
         Route::post('/ingredients', [\App\Http\Controllers\Khaas\RecipeController::class, 'saveIngredient'])->name('ingredients.save');
         Route::post('/ingredients/{id}/deactivate', [\App\Http\Controllers\Khaas\RecipeController::class, 'deactivateIngredient'])->name('ingredients.deactivate');
+        // ⭐ Sep-26: one unit per ingredient, changed everywhere at once (recipes + tagged products).
+        Route::get('/ingredients/{id}/unit-impact', [\App\Http\Controllers\Khaas\RecipeController::class, 'unitImpact'])->name('ingredients.unit-impact');
+        Route::post('/ingredients/{id}/change-unit', [\App\Http\Controllers\Khaas\RecipeController::class, 'changeUnit'])->name('ingredients.change-unit');
         Route::get('/ingredients/month', [\App\Http\Controllers\Khaas\RecipeController::class, 'ingredientMonth'])->name('ingredients.month');
         Route::post('/ingredients/opening', [\App\Http\Controllers\Khaas\RecipeController::class, 'saveOpening'])->name('ingredients.opening');
         Route::get('/recipe', [\App\Http\Controllers\Khaas\RecipeController::class, 'show'])->name('recipe.show');

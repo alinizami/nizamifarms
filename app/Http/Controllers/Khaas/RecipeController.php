@@ -8,6 +8,7 @@ use App\Models\Khaas\IngredientOpeningModel;
 use App\Services\Khaas\ConsumptionService;
 use App\Services\Khaas\FrozenCostingService;
 use App\Services\Khaas\FrozenMonthService;
+use App\Services\Khaas\IngredientPriceService;
 use App\Services\Khaas\RecipeService;
 use Illuminate\Http\Request;
 
@@ -110,6 +111,8 @@ class RecipeController extends Controller
             'kinds'       => IngredientModel::KIND_LABELS,
             'units'       => IngredientModel::DISPLAY_UNITS,
             'can_manage'  => $this->canManage(),
+            // 🔗 Sep-27: where the Planning page's "Link at…" picker can send someone.
+            'link_vendors' => $this->linkVendors($bu),
         ]);
     }
 
@@ -136,6 +139,74 @@ class RecipeController extends Controller
         } catch (\Throwable $e) {
             \Log::error('Frozen recipes: ingredient save failed', ['error' => $e->getMessage()]);
             return response()->json(['success' => false, 'message' => 'Could not save that ingredient.'], 500);
+        }
+    }
+
+    /**
+     * ⭐ What changing this ingredient's unit would touch — the confirm dialog's content.
+     *   ?to=g|ml|pcs  [&product_id=82&unit=kg — the product whose edit started it]
+     */
+    public function unitImpact(Request $request, $id)
+    {
+        if (!$this->canAccess()) {
+            return $this->deny('Frozen mode access is needed to see ingredients.');
+        }
+        $ingredient = IngredientModel::find($id);
+        if (!$ingredient) {
+            return response()->json(['success' => false, 'message' => 'That ingredient no longer exists.'], 404);
+        }
+        $to = (string) $request->query('to');
+        if (!in_array($to, IngredientModel::BASE_UNITS, true)) {
+            return response()->json(['success' => false, 'message' => 'Choose weight (g), volume (ml) or pieces (pcs).'], 422);
+        }
+        $overrides = $request->filled('product_id') && $request->filled('unit')
+            ? [(int) $request->query('product_id') => (string) $request->query('unit')] : [];
+
+        $impact = app(\App\Services\Khaas\IngredientUnitChangeService::class)->impact($ingredient, $to, $overrides);
+
+        return response()->json(['success' => true, 'can_manage' => $this->canManage()] + $impact);
+    }
+
+    /**
+     * ⭐ Change an ingredient's unit EVERYWHERE, in one transaction: the ingredient, every
+     *   recipe line (new amounts typed by the person) and every tagged vendor product.
+     *   Body: to, recipe_qty{line_id: qty}, product_sizes{product_id: pack_qty_base},
+     *         product_units{product_id: unit}
+     */
+    public function changeUnit(Request $request, $id)
+    {
+        if (!$this->canManage()) {
+            return $this->deny('Only Taimur, Shabib or Qasim can change an ingredient\'s unit. Ask one of them.');
+        }
+        $ingredient = IngredientModel::find($id);
+        if (!$ingredient) {
+            return response()->json(['success' => false, 'message' => 'That ingredient no longer exists.'], 404);
+        }
+
+        $num = fn ($arr) => collect(is_array($arr) ? $arr : [])
+            ->mapWithKeys(fn ($v, $k) => [(int) $k => (float) $v])->all();
+
+        try {
+            $result = app(\App\Services\Khaas\IngredientUnitChangeService::class)->apply(
+                $ingredient,
+                (string) $request->input('to'),
+                $num($request->input('recipe_qty')),
+                $num($request->input('product_sizes')),
+                collect((array) $request->input('product_units', []))->mapWithKeys(fn ($v, $k) => [(int) $k => (string) $v])->all(),
+                (int) auth()->id()
+            );
+
+            return response()->json([
+                'success' => true,
+                'message' => "{$result['ingredient']['name']} is now counted in "
+                    . \App\Services\FIN\VendorUnits::kindWord($result['ingredient']['base_unit'])
+                    . " everywhere — {$result['recipe_lines']} recipe line(s) and {$result['products']} product(s) updated.",
+            ] + $result);
+        } catch (\InvalidArgumentException $e) {
+            return response()->json(['success' => false, 'message' => $e->getMessage()], 422);
+        } catch (\Throwable $e) {
+            \Log::error('Frozen recipes: unit change failed', ['error' => $e->getMessage()]);
+            return response()->json(['success' => false, 'message' => 'Could not change the unit. Nothing was changed.'], 500);
         }
     }
 
@@ -180,13 +251,59 @@ class RecipeController extends Controller
             return response()->json(['success' => false, 'message' => 'Which product?'], 400);
         }
 
+        $bu     = $this->businessUnitId($request);
+        $recipe = $this->recipes->recipeFor($productId, $request->input('on_date'));
+
         return response()->json([
             'success'     => true,
-            'recipe'      => $this->recipes->recipeFor($productId, $request->input('on_date')),
-            'ingredients' => $this->recipes->ingredients($this->businessUnitId($request)),
+            'recipe'      => $recipe,
+            'ingredients' => $this->recipes->ingredients($bu),
             'history'     => $this->recipes->history($productId),
             'can_manage'  => $this->canManage(),
-        ]);
+            // 🔗 Sep-27: the vendors a recipe line can be linked through, straight from the
+            //   recipe sheet — Frozen vendors whose bills are entered line by line (a by-total
+            //   vendor's bills have no lines, so a link there would never price anything).
+            'link_vendors' => $this->linkVendors($bu),
+        ] + $this->pricedRecipe($bu, $recipe));
+    }
+
+    /** @return array<int,array{id:int,vendor_name:string}> */
+    private function linkVendors(int $bu): array
+    {
+        try {
+            return \App\Models\FIN\VendorModel::where('business_unit_id', $bu)
+                ->where('is_active', 1)
+                ->where('default_purchase_method', 'by_weight')
+                ->orderBy('vendor_name')
+                ->get(['id', 'vendor_name'])
+                ->map(fn ($v) => ['id' => (int) $v->id, 'vendor_name' => $v->vendor_name])
+                ->values()->all();
+        } catch (\Throwable $e) {
+            return [];
+        }
+    }
+
+    /**
+     * 💲 The recipe at today's prices + the unit's price book (so the editor can price a
+     * line the moment an ingredient is picked). Rupees need view_khaas_costing and are
+     * stripped HERE, on the server — the keys stay, nulled, so no client guesses.
+     * A pricing failure never takes the recipe down with it.
+     */
+    private function pricedRecipe(int $bu, array $recipe): array
+    {
+        $canCost = $this->canSeeCost();
+        try {
+            $p = (new IngredientPriceService())->forRecipe($bu, $recipe);
+        } catch (\Throwable $e) {
+            \Log::warning('Frozen recipes: pricing failed', ['error' => $e->getMessage()]);
+            return ['cost' => null, 'prices' => (object) [], 'selling_price' => null, 'can_see_cost' => $canCost];
+        }
+        if (!$canCost) {
+            $p['cost'] = $p['cost'] ? IngredientPriceService::stripRupees($p['cost']) : null;
+            $p['prices'] = (object) IngredientPriceService::stripPriceBook((array) $p['prices']);
+            $p['selling_price'] = null;
+        }
+        return $p + ['can_see_cost' => $canCost];
     }
 
     public function save(Request $request)
@@ -216,7 +333,7 @@ class RecipeController extends Controller
                 'success' => true,
                 'message' => "Saved as version {$recipe->version}.",
                 'recipe'  => $shaped,
-            ]);
+            ] + $this->pricedRecipe($this->businessUnitId($request), $shaped));
         } catch (\InvalidArgumentException $e) {
             return response()->json(['success' => false, 'message' => $e->getMessage()], 422);
         } catch (\Throwable $e) {
@@ -323,10 +440,23 @@ class RecipeController extends Controller
             ];
         }
 
+        // 💲 Sep-27: the recipe at TODAY'S prices, for every product that has one — shown
+        //    on the card even before anything is made this month.
+        try {
+            $recipeCosts = (new IngredientPriceService())->forProducts($bu);
+        } catch (\Throwable $e) {
+            \Log::warning('Frozen recipes: card pricing failed', ['error' => $e->getMessage()]);
+            $recipeCosts = [];
+        }
+        if (!$canCost) {
+            $recipeCosts = IngredientPriceService::stripProductCosts($recipeCosts);
+        }
+
         return response()->json([
             'success'      => true,
             'month'        => $month,
             'costs'        => (object) $map,
+            'recipe_costs' => (object) array_combine(array_map('strval', array_keys($recipeCosts)), array_values($recipeCosts)),
             'coverage'     => $this->recipes->coverage($bu),
             'can_see_cost' => $canCost,
         ]);

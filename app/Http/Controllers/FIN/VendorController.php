@@ -8,6 +8,8 @@ use App\Models\FIN\VendorModel;
 use App\Models\FIN\AccountModel;
 use App\Models\FIN\LedgerModel;
 use App\Models\FIN\BusinessUnitModel;
+use App\Models\FIN\VendorProductModel;
+use App\Services\FIN\VendorUnits;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Storage;
@@ -175,7 +177,7 @@ class VendorController extends Controller
             }
 
             // Parse month into date range
-            $startDate = \Carbon\Carbon::createFromFormat('Y-m', $month)->startOfMonth();
+            $startDate = \Carbon\Carbon::createFromFormat('!Y-m', $month)->startOfMonth();
             $endDate = $startDate->copy()->endOfMonth();
 
             // Get all active vendors for this BU
@@ -529,7 +531,9 @@ class VendorController extends Controller
                 'success' => true,
                 'vendor' => $vendor,
                 'grouped_transactions' => $formattedTransactions,
-                'summary' => $summary
+                'summary' => $summary,
+                // 🔀 Sep-27: the phone shows the "by weight / by total" switch only when true.
+                'can_switch_purchase_method' => $this->canSwitchPurchaseMethod($vendor),
             ]);
         }
         
@@ -980,6 +984,143 @@ class VendorController extends Controller
     }
 
     /**
+     * ⭐ Sep-26 — what every weighted-purchase line must satisfy, on create AND edit:
+     *   • it names a product on THIS vendor's list (the validator only checked the id
+     *     existed anywhere — a line could carry another Frozen vendor's tagged product
+     *     and push that ingredient's rate around);
+     *   • a counted unit (piece / dozen / pack / box) is a whole number on a Frozen
+     *     vendor. BU 1 meat keeps its 7.5 trotters (owner, Sep-26).
+     * Returns the 422 to send, or null.
+     */
+    private function purchaseLinesProblem($items, VendorModel $vendor): ?\Illuminate\Http\JsonResponse
+    {
+        $items = is_array($items) ? array_values($items) : [];
+        $ids = collect($items)->pluck('product_id')->map(fn ($v) => (int) $v)->unique()->all();
+        $products = VendorProductModel::whereIn('id', $ids)->get()->keyBy('id');
+
+        foreach ($items as $i => $item) {
+            $p = $products->get((int) ($item['product_id'] ?? 0));
+            $n = $i + 1;
+            if (!$p || (int) $p->vendor_id !== (int) $vendor->id) {
+                return response()->json([
+                    'success' => false,
+                    'code'    => 'product_not_on_vendor',
+                    'message' => "Line {$n}: that product is not on {$vendor->vendor_name}'s list. Pick one of this vendor's products.",
+                    'line'    => $i,
+                ], 422);
+            }
+            $qty = (float) ($item['quantity'] ?? 0);
+            if (VendorUnits::wholeOnly($p->unit, (int) $vendor->business_unit_id) && floor($qty) != $qty) {
+                return response()->json([
+                    'success' => false,
+                    'code'    => 'whole_number',
+                    'message' => "Line {$n}: {$p->product_name} is counted in " . VendorUnits::word($p->unit, true)
+                        . " — whole numbers only (you typed {$qty}).",
+                    'line'    => $i,
+                ], 422);
+            }
+        }
+        return null;
+    }
+
+    /** The unit a line is stored with: its catalogue product's, falling back to what was sent. */
+    private function lineUnit(array $item, $products): string
+    {
+        $p = $products->get((int) ($item['product_id'] ?? 0));
+        return $p && trim((string) $p->unit) !== '' ? (string) $p->unit : (string) ($item['unit'] ?? 'kg');
+    }
+
+    /**
+     * ⚠⚠ WHO MAY EDIT OR DELETE A VENDOR PURCHASE / PAYMENT (owner, Sep-26: "the regular
+     *    rules — keep what Qasim has"). Before this the two doors checked nothing, so any
+     *    logged-in token — a rider's included — could rewrite or delete any vendor's
+     *    money in any business unit. In fact only Taimur, Shabib and Qasim ever have
+     *    (audit log, all time), and Qasim only ever on Frozen rows.
+     *    Rule: `manage_vendor_transactions`, or Frozen mode on a Frozen row.
+     */
+    private function canChangeVendorTransaction(LedgerModel $transaction): bool
+    {
+        $user = auth()->user();
+        if (!$user) {
+            return false;
+        }
+        if ($user->hasMobilePermission('manage_vendor_transactions')) {
+            return true;
+        }
+        return (int) $transaction->business_unit_id === 2 && $user->hasMobilePermission('access_khaas_mode');
+    }
+
+    /**
+     * 🔀 Who may switch a vendor between "by total" and "by weight" (itemised).
+     * Owner, 27-Sep: Qasim and the team decide which Frozen vendors get itemised bills,
+     * so Frozen mode may switch a FROZEN vendor; everyone else needs the same key that
+     * edits vendor purchases.
+     */
+    private function canSwitchPurchaseMethod(VendorModel $vendor): bool
+    {
+        $user = auth()->user();
+        if (!$user) {
+            return false;
+        }
+        if ($user->hasMobilePermission('manage_vendor_transactions')) {
+            return true;
+        }
+        return (int) $vendor->business_unit_id === 2 && $user->hasMobilePermission('access_khaas_mode');
+    }
+
+    /**
+     * 🔀 Switch how this vendor's bills are recorded. Nothing already recorded changes:
+     * a bill keeps the lines (or the single total) it was saved with, and the product
+     * list is kept either way, so switching back loses nothing.
+     */
+    public function setPurchaseMethod(Request $request, $id)
+    {
+        $vendor = VendorModel::find($id);
+        if (!$vendor) {
+            return response()->json(['success' => false, 'message' => 'That vendor no longer exists.'], 404);
+        }
+        if (!$this->canSwitchPurchaseMethod($vendor)) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Only Frozen staff (for Frozen vendors), Taimur or Shabib can change how a vendor\'s bills are recorded.',
+            ], 403);
+        }
+
+        $method = (string) $request->input('purchase_method');
+        if (!in_array($method, ['by_weight', 'by_total'], true)) {
+            return response()->json(['success' => false, 'message' => 'Choose "by weight" or "by total".'], 422);
+        }
+
+        if ($vendor->default_purchase_method === $method) {
+            return response()->json(['success' => true, 'message' => 'No change.', 'purchase_method' => $method]);
+        }
+
+        $vendor->default_purchase_method = $method;
+        $vendor->updated_by = auth()->id();
+        $vendor->save();
+
+        Log::info('Vendor purchase method switched', [
+            'vendor_id' => $vendor->id, 'to' => $method, 'by' => auth()->id(),
+        ]);
+
+        return response()->json([
+            'success'         => true,
+            'purchase_method' => $method,
+            'message'         => $method === 'by_weight'
+                ? "Bills from {$vendor->vendor_name} are now entered line by line. Add its products on the Products screen; bills already recorded are unchanged."
+                : "Bills from {$vendor->vendor_name} are now entered as one total. Its product list is kept, and bills already recorded are unchanged.",
+        ]);
+    }
+
+    private function refuseVendorTransactionChange(): \Illuminate\Http\JsonResponse
+    {
+        return response()->json([
+            'success' => false,
+            'message' => 'You can record purchases and payments, but not change or delete them. Ask Taimur or Shabib.',
+        ], 403);
+    }
+
+    /**
      * Record weighted purchase (with line items)
      */
     public function recordWeightedPurchase(Request $request, $id)
@@ -993,8 +1134,53 @@ class VendorController extends Controller
             'items.*.quantity' => 'required|numeric|min:0.001',
             'items.*.rate' => 'required|numeric|min:0.01',
             'items.*.unit' => 'required|string|max:50',
-            'items.*.product_name' => 'required|string|max:255'
+            'items.*.product_name' => 'required|string|max:255',
+            'client_uuid' => 'nullable|string|max:36',
         ], $this->imageValidationRules('bill_image')));
+
+        // ⭐ Sep-26 — checked BEFORE the try, so each refusal reaches the person as the
+        //   sentence it is (inside, the catch-all would turn it into a bare 500).
+        // ⚠ The web "Record purchase" is a plain form POST, not fetch — a JSON refusal there
+        //   would render as a raw JSON page. The phone and the scan card get JSON.
+        $refuse = function (\Illuminate\Http\JsonResponse $j) use ($request) {
+            if ($request->expectsJson() || $request->is('api/*')) {
+                return $j;
+            }
+            return back()->withInput()->with('error', $j->getData(true)['message'] ?? 'Not recorded.');
+        };
+        $vendorForCheck = VendorModel::find($id);
+        if (!$vendorForCheck) {
+            return $refuse(response()->json(['success' => false, 'message' => 'That vendor no longer exists.'], 404));
+        }
+        if ($problem = $this->purchaseLinesProblem($request->items, $vendorForCheck)) {
+            return $refuse($problem);
+        }
+        $lineProducts = VendorProductModel::whereIn('id', collect($request->items)->pluck('product_id')->all())
+            ->get()->keyBy('id');
+
+        // ⭐⭐ ONE PRESS, ONE PURCHASE. The phone's 30 s timeout used to say "Failed" while
+        //    the server had in fact committed, and the retry booked the bill twice. A
+        //    client that sends a uuid (the new APK) gets the first answer back instead.
+        //    An old APK sends none and behaves exactly as before.
+        $idemKey = null;
+        $idemLock = null;
+        $uuid = (string) $request->input('client_uuid');
+        if (preg_match('/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i', $uuid)) {
+            $idemKey = 'wpurchase:' . auth()->id() . ':' . strtolower($uuid);
+            if ($done = \Cache::get($idemKey)) {
+                return response()->json([
+                    'success' => true, 'already' => true, 'transaction_id' => $done,
+                    'message' => 'This purchase was already recorded — nothing was booked twice.',
+                ]);
+            }
+            $idemLock = \Cache::lock($idemKey . ':lock', 60);
+            if (!$idemLock->get()) {
+                return response()->json([
+                    'success' => false, 'in_progress' => true,
+                    'message' => 'This purchase is still being saved. Wait a moment, then check the list before trying again.',
+                ], 409);
+            }
+        }
 
         try {
             DB::beginTransaction();
@@ -1016,8 +1202,9 @@ class VendorController extends Controller
             foreach ($request->items as $item) {
                 $lineTotal = $item['quantity'] * $item['rate'];
                 $itemsTotal += $lineTotal;
-                
-                $itemsSummary[] = "{$item['product_name']} ({$item['quantity']} {$item['unit']} @ Rs.{$item['rate']})";
+                $lineUnit = $this->lineUnit($item, $lineProducts);
+
+                $itemsSummary[] = "{$item['product_name']} ({$item['quantity']} {$lineUnit} @ Rs.{$item['rate']})";
             }
 
             // Apply adjustment amount (can be positive or negative)
@@ -1069,7 +1256,9 @@ class VendorController extends Controller
                     'vendor_product_id' => $item['product_id'],
                     'product_name' => $item['product_name'],
                     'quantity' => $item['quantity'],
-                    'unit' => $item['unit'],
+                    // ⭐ The PRODUCT's unit, not whatever the client sent — the line and
+                    //   the catalogue can no longer disagree (0 lines differ today).
+                    'unit' => $this->lineUnit($item, $lineProducts),
                     'rate_per_unit' => $item['rate'],
                     'line_total' => $item['quantity'] * $item['rate'],
                 ], $ingredient));
@@ -1080,6 +1269,10 @@ class VendorController extends Controller
             (new \App\Services\FIN\BalancePostingService())->apply($ledger);
 
             DB::commit();
+            if ($idemKey) {
+                \Cache::put($idemKey, $ledger->id, now()->addDays(2));
+                optional($idemLock)->release();
+            }
 
             // Return JSON for API requests
             if ($request->expectsJson() || $request->is('api/*')) {
@@ -1099,6 +1292,7 @@ class VendorController extends Controller
 
         } catch (\Exception $e) {
             DB::rollBack();
+            optional($idemLock)->release();
             Log::error("Error recording weighted purchase: " . $e->getMessage());
             
             // Return JSON for API requests
@@ -1290,6 +1484,11 @@ class VendorController extends Controller
      */
     public function deleteTransaction($transactionId)
     {
+        $guard = LedgerModel::find($transactionId);
+        if ($guard && !$this->canChangeVendorTransaction($guard)) {
+            return $this->refuseVendorTransactionChange();
+        }
+
         try {
             DB::beginTransaction();
 
@@ -1395,6 +1594,21 @@ class VendorController extends Controller
             'items.*.product_name' => 'required_with:items|string|max:255'
         ]);
 
+        $guard = LedgerModel::find($transactionId);
+        if ($guard && !$this->canChangeVendorTransaction($guard)) {
+            return $this->refuseVendorTransactionChange();
+        }
+        $lineProducts = collect();
+        if ($guard && $request->has('items') && is_array($request->items)) {
+            // Which vendor this bill belongs to: the vendor whose account it posts to.
+            $guardVendor = VendorModel::where('account_id', $guard->to_account_id)->first();
+            if ($guardVendor && ($problem = $this->purchaseLinesProblem($request->items, $guardVendor))) {
+                return $problem;
+            }
+            $lineProducts = VendorProductModel::whereIn('id', collect($request->items)->pluck('product_id')->all())
+                ->get()->keyBy('id');
+        }
+
         try {
             DB::beginTransaction();
 
@@ -1421,9 +1635,12 @@ class VendorController extends Controller
                 
                 // Calculate new total from items
                 $itemsTotal = 0;
+                $itemsSummary = [];
                 foreach ($request->items as $item) {
                     $lineTotal = $item['quantity'] * $item['rate'];
                     $itemsTotal += $lineTotal;
+                    $lineUnit = $this->lineUnit($item, $lineProducts);
+                    $itemsSummary[] = "{$item['product_name']} ({$item['quantity']} {$lineUnit} @ Rs.{$item['rate']})";
                     
                     // Create new line item
                     // ❄ Same ingredient stamp as the create path. An edit re-resolves
@@ -1439,18 +1656,22 @@ class VendorController extends Controller
                         'vendor_product_id' => $item['product_id'],
                         'product_name' => $item['product_name'],
                         'quantity' => $item['quantity'],
-                        'unit' => $item['unit'],
+                        'unit' => $this->lineUnit($item, $lineProducts),
                         'rate_per_unit' => $item['rate'],
                         'line_total' => $lineTotal,
                     ], $ingredient));
                 }
-                
+
                 // Apply adjustment amount (can be positive or negative)
                 $adjustmentAmount = floatval($request->adjustment_amount ?? 0);
                 $newAmount = $itemsTotal + $adjustmentAmount;
-                
+
                 $transaction->amount = $newAmount;
                 $transaction->adjustment_amount = $adjustmentAmount;
+                // ⭐ The one-line summary the web list shows is rebuilt from the NEW lines.
+                //   It used to keep the original text: 42 of 110 edited purchases still
+                //   read "Veal Boneless 15 kg @1670" over lines that now say otherwise.
+                $transaction->comments = implode(', ', $itemsSummary);
             } elseif ($request->filled('amount')) {
                 // Simple transaction - use provided amount.
                 // filled(), not has(): ConvertEmptyStringsToNull turns a blank amount field into

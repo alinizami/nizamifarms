@@ -1633,16 +1633,29 @@ class LedgerController extends Controller
             // Fetch line items if this is a weighted purchase
             $lineItems = [];
             if ($transaction->transaction_type === LedgerModel::TYPE_VENDOR_PURCHASE) {
-                $lineItems = \App\Models\FIN\VendorPurchaseItemModel::where('ledger_id', $transaction->id)
-                    ->get()
-                    ->map(function($item) {
+                $items = \App\Models\FIN\VendorPurchaseItemModel::where('ledger_id', $transaction->id)->get();
+                // ❄ Which lines were deliberately "not an ingredient" (a carrier bag bought
+                //   under a tagged product). An edit that does not send this back used to
+                //   re-count the bag as cheese. Additive key.
+                $taggedProducts = [];
+                try {
+                    if (\App\Models\FIN\VendorPurchaseItemModel::supportsIngredients()) {
+                        $taggedProducts = \App\Models\FIN\VendorProductModel::whereIn('id', $items->pluck('vendor_product_id')->filter()->all())
+                            ->whereNotNull('ingredient_id')->pluck('id')->flip()->all();
+                    }
+                } catch (\Throwable $e) {
+                    $taggedProducts = [];
+                }
+                $lineItems = $items
+                    ->map(function($item) use ($taggedProducts) {
                         return [
                             'vendor_product_id' => $item->vendor_product_id,
                             'product_name' => $item->product_name,
                             'quantity' => $item->quantity,
                             'unit' => $item->unit,
                             'rate_per_unit' => $item->rate_per_unit,
-                            'line_total' => $item->line_total
+                            'line_total' => $item->line_total,
+                            'not_ingredient' => isset($taggedProducts[$item->vendor_product_id]) && empty($item->ingredient_id),
                         ];
                     })
                     ->toArray();

@@ -154,126 +154,14 @@ class KhaasController extends Controller
     }
 
     /**
-     * Statuses that mean an order is DONE and no longer needs stock.
-     *
-     * This is the canonical "open orders" definition used across the app (web orders
-     * page, store-mode open orders, delivery regions). It is a copy-pasted literal in
-     * ~10 places and has no shared constant; named here so the demand figure provably
-     * matches the Open Orders board the manager already reads.
-     *
-     * ⚠ Deliberately NOT OrderStatusRuleService::quantitiesExcluded() — that is the
-     * configurable Open-Quantities set (prod currently excludes 'pending' and INCLUDES
-     * delivered), which answers a different question.
-     */
-    private const DEMAND_CLOSED_STATUSES = ['delivered', 'completed', 'cancelled', 'refunded'];
-
-    /**
-     * Line items in the Shopify APPROVAL QUEUE that still need stock.
-     *
-     * ⚠⚠ Staging line items store SHOPIFY'S OWN product/variant ids as strings
-     * (e.g. 8913415962913) — NOT local CRM ids. The only reliable link to a local
-     * product is the SKU. The variant lookup is pre-grouped so that a SKU which ever
-     * maps to two variants cannot fan out and double the SUM.
-     *
-     * ⚠ "Still pending approval" is `converted IS NULL OR converted = 0` — NOT
-     * order_status, which merely mirrors Shopify's PAYMENT status (a brand-new
-     * unapproved order usually reads 'completed' because it is paid). converted = 1
-     * means accepted into the live table (counted by the open-orders arm instead),
-     * and 2 means ignored/rejected.
-     */
-    private function stagingDemandQuery(int $khaasBuId)
-    {
-        return DB::table('t_crm_shopify_order_line_item as li')
-            ->join('t_crm_shopify_order as so', 'so.id', '=', 'li.order_id')
-            ->join(DB::raw('(SELECT sku, MIN(product_id) AS product_id
-                             FROM t_crm_prod_product_variant
-                             WHERE sku IS NOT NULL AND sku <> \'\'
-                             GROUP BY sku) as v'), 'v.sku', '=', 'li.sku')
-            ->join('t_crm_prod_product as p', 'p.id', '=', 'v.product_id')
-            ->where(function ($q) {
-                $q->whereNull('so.converted')->orWhere('so.converted', 0);
-            })
-            ->whereNotNull('li.sku')
-            ->where('li.sku', '<>', '')
-            ->where('p.business_unit_id', $khaasBuId)
-            ->where(function ($q) {
-                $q->whereNull('p.attribute_1')->orWhereRaw('LOWER(p.attribute_1) <> ?', ['qurbani']);
-            });
-    }
-
-    /**
-     * Line items on OPEN LIVE orders that have not yet consumed store stock.
-     *
-     * ⭐⭐ `inventory_deducted = 0` is the whole point (owner ruling): store stock is
-     * deducted when an item is PREPARED (or auto-prepared on out-for-delivery), so a
-     * prepared line has ALREADY come out of the Store number on the card. Counting it
-     * as outstanding demand would double-count and make the manager over-request.
-     *
-     * Matching on li.product_id joined to a BU-filtered product is the same shape the
-     * Khaas sales report uses. Verified Aug-11 against variant_id matching across the
-     * entire line-item table: identical results, zero rows disagreeing either way.
-     */
-    private function openOrderDemandQuery(int $khaasBuId)
-    {
-        return DB::table('t_crm_prod_order_line_item as li')
-            ->join('t_crm_prod_order as o', 'o.id', '=', 'li.order_id')
-            ->join('t_crm_prod_product as p', 'p.id', '=', 'li.product_id')
-            ->whereNotIn('o.order_status', self::DEMAND_CLOSED_STATUSES)
-            ->whereRaw('COALESCE(li.inventory_deducted, 0) = 0')
-            ->where('p.business_unit_id', $khaasBuId)
-            ->where(function ($q) {
-                $q->whereNull('p.attribute_1')->orWhereRaw('LOWER(p.attribute_1) <> ?', ['qurbani']);
-            });
-    }
-
-    /**
-     * Outstanding order demand per product: [product_id => [shopify, open, total]].
-     *
-     * Two sources, deliberately aggregated separately and merged in PHP — staging and
-     * live order ids OVERLAP as unrelated orders, so they must never be joined or
-     * unioned on a raw order_id.
+     * 🛒 Outstanding order demand per product — now ONE service shared with the phone
+     * (App\Services\Khaas\OpenOrderDemandService, Sep-26). Moved there unchanged, plus the
+     * accepted / pending (later day) split. [product_id => accepted, pending, total, shopify]
+     * — `total` is the open-order headline; the Shopify approval queue is separate.
      */
     private function pendingOrderDemandByProduct(int $khaasBuId): array
     {
-        $demand = [];
-
-        try {
-            // NOTE: selectRaw + get, not pluck(DB::raw(...)) — pluck cannot read a raw
-            // aggregate as a key/value pair and silently returns zeros for every row.
-            $staging = $this->stagingDemandQuery($khaasBuId)
-                ->groupBy('p.id')
-                ->selectRaw('p.id as product_id, SUM(li.quantity) as qty')
-                ->get();
-
-            foreach ($staging as $row) {
-                $demand[(int) $row->product_id]['shopify'] = (int) round((float) $row->qty);
-            }
-
-            $open = $this->openOrderDemandQuery($khaasBuId)
-                ->groupBy('p.id')
-                ->selectRaw('p.id as product_id, SUM(li.quantity) as qty')
-                ->get();
-
-            foreach ($open as $row) {
-                $demand[(int) $row->product_id]['open'] = (int) round((float) $row->qty);
-            }
-        } catch (\Throwable $e) {
-            // Demand is decoration on an inventory page — never let it blank the grid.
-            \Log::warning('Khaas pending-order demand failed', ['error' => $e->getMessage()]);
-            return [];
-        }
-
-        foreach ($demand as $productId => $row) {
-            $shopify = $row['shopify'] ?? 0;
-            $openQty = $row['open'] ?? 0;
-            $demand[$productId] = [
-                'shopify' => $shopify,
-                'open' => $openQty,
-                'total' => $shopify + $openQty,
-            ];
-        }
-
-        return $demand;
+        return app(\App\Services\Khaas\OpenOrderDemandService::class)->byProduct($khaasBuId, true);
     }
 
     /**
@@ -304,37 +192,11 @@ class KhaasController extends Controller
         }
 
         try {
-            // One row per ORDER (a product can appear on several lines of one order).
-            $shopify = $this->stagingDemandQuery($khaasBU->id)
-                ->where('p.id', $productId)
-                ->groupBy('so.id', 'so.order_number', 'so.name', 'so.order_date')
-                ->selectRaw('so.id as order_id, so.order_number, so.name as customer_name,
-                             so.order_date, SUM(li.quantity) as qty')
-                ->orderBy('so.order_date')
-                ->get()
-                ->map(fn($r) => [
-                    'order_number' => $r->order_number ?: ('#' . $r->order_id),
-                    'customer_name' => $r->customer_name ?: '—',
-                    'date' => $r->order_date ? date('M d', strtotime($r->order_date)) : '',
-                    'age_days' => $r->order_date ? (int) floor((time() - strtotime($r->order_date)) / 86400) : 0,
-                    'qty' => (int) round((float) $r->qty),
-                ]);
-
-            $open = $this->openOrderDemandQuery($khaasBU->id)
-                ->where('p.id', $productId)
-                ->groupBy('o.id', 'o.order_number', 'o.name', 'o.order_date', 'o.order_status')
-                ->selectRaw('o.id as order_id, o.order_number, o.name as customer_name,
-                             o.order_date, o.order_status, SUM(li.quantity) as qty')
-                ->orderBy('o.order_date')
-                ->get()
-                ->map(fn($r) => [
-                    'order_number' => $r->order_number ?: ('#' . $r->order_id),
-                    'customer_name' => $r->customer_name ?: '—',
-                    'status' => $r->order_status,
-                    'date' => $r->order_date ? date('M d', strtotime($r->order_date)) : '',
-                    'age_days' => $r->order_date ? (int) floor((time() - strtotime($r->order_date)) / 86400) : 0,
-                    'qty' => (int) round((float) $r->qty),
-                ]);
+            // One row per ORDER — exactly the rows the card counted (same service).
+            $rows = app(\App\Services\Khaas\OpenOrderDemandService::class)
+                ->ordersForProduct((int) $khaasBU->id, (int) $productId, true);
+            $open    = collect($rows['open']);
+            $shopify = collect($rows['shopify']);
 
             return response()->json([
                 'success' => true,
@@ -343,7 +205,11 @@ class KhaasController extends Controller
                 'open' => $open,
                 'shopify_total' => $shopify->sum('qty'),
                 'open_total' => $open->sum('qty'),
-                'total' => $shopify->sum('qty') + $open->sum('qty'),
+                'accepted_total' => $open->where('bucket', 'accepted')->sum('qty'),
+                'pending_total' => $open->where('bucket', 'pending')->sum('qty'),
+                // ⭐ Sep-26: the headline is OPEN orders (accepted + later day), the same
+                //   number the phone shows. The Shopify queue is reported beside it.
+                'total' => $open->sum('qty'),
             ]);
         } catch (\Throwable $e) {
             \Log::error('Pending orders breakdown failed', ['error' => $e->getMessage()]);
@@ -484,11 +350,24 @@ class KhaasController extends Controller
         $canSeeIngredientCost = $this->canSeeIngredientCost();
         $canManageRecipes     = $this->canManageRecipes();
 
+        // 💲 Sep-27 — the recipe at TODAY'S prices (each ingredient's newest bill), for
+        // every product that has one, shown even before anything is made this month.
+        // Same engine and same stripping as the phone's /warehouse/product-costs.
+        $recipePrices = [];
+        try {
+            $recipePrices = (new \App\Services\Khaas\IngredientPriceService())->forProducts((int) $khaasBU->id);
+            if (!$canSeeIngredientCost) {
+                $recipePrices = \App\Services\Khaas\IngredientPriceService::stripProductCosts($recipePrices);
+            }
+        } catch (\Throwable $e) {
+            \Log::warning('Khaas products: recipe price chip failed', ['error' => $e->getMessage()]);
+        }
+
         return view('khaas.products', compact(
             'khaasBU', 'products', 'warehouseInventory', 'pendingTransfers', 'pendingTransferRecords', 'categories',
             'countedByUsers', 'orderDemand', 'pendingRequestsByProduct', 'pendingRequestRecords',
             'declinedRequestRecords', 'canFulfilRequests',
-            'recipeCosts', 'recipeCoverage', 'canSeeIngredientCost', 'canManageRecipes'
+            'recipeCosts', 'recipeCoverage', 'canSeeIngredientCost', 'canManageRecipes', 'recipePrices'
         ));
     }
 
@@ -2941,6 +2820,10 @@ class KhaasController extends Controller
             ] as $k) {
                 $data['headline'][$k] = null;
             }
+            // The recipe-vs-purchases block quotes vendor spend too — same gate.
+            foreach (['total', 'meat', 'itemised', 'untagged', 'not_itemised'] as $k) {
+                $data['recipe_vs_purchases']['purchases'][$k] = null;
+            }
         }
 
         // ⭐ The ingredient panel has its OWN gate, deliberately narrower than the one
@@ -3005,6 +2888,31 @@ class KhaasController extends Controller
                     $data['product_costs']['rows'][$i]['lines'][$j]['cost'] = null;
                 }
             }
+        }
+
+        // 💲 Sep-27 recipe-vs-purchases block: every rupee out, pack counts and
+        //    quantities (bought / used / meat kg) stay.
+        if (!empty($data['recipe_vs_purchases'])) {
+            $rvp = &$data['recipe_vs_purchases'];
+            $rvp['recipe_cost'] = null;
+            $rvp['recipe_per_pack'] = null;
+            foreach (['total', 'meat', 'itemised', 'untagged', 'not_itemised'] as $k) {
+                $rvp['purchases'][$k] = null;
+            }
+            foreach (['bought', 'used', 'difference'] as $k) {
+                $rvp['ingredients'][$k] = null;
+            }
+            foreach ($rvp['ingredients']['rows'] as $i => $row) {
+                $rvp['ingredients']['rows'][$i]['diff_value'] = null;
+            }
+            foreach ($rvp['meat'] as $i => $row) {
+                $rvp['meat'][$i]['diff_value'] = null;
+            }
+            foreach ($rvp['products'] as $i => $row) {
+                $rvp['products'][$i]['cost_per_pack'] = null;
+                $rvp['products'][$i]['share_of_price'] = null;
+            }
+            unset($rvp);
         }
 
         $data['product_costs']['totals']['cost'] = null;

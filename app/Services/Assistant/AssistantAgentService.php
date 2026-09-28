@@ -167,7 +167,7 @@ class AssistantAgentService
             $text = $r->json('candidates.0.content.parts.0.text');
             return $text ? trim($text) : null;
         } catch (\Throwable $e) {
-            Log::warning('Assistant transcription error', ['error' => $e->getMessage()]);
+            Log::warning('Assistant transcription error', ['error' => self::redactKey($e->getMessage())]);
             return null;
         }
     }
@@ -205,7 +205,7 @@ class AssistantAgentService
                         ],
                     ]);
             } catch (\Throwable $e) {
-                Log::error('Assistant model call threw', ['error' => $e->getMessage()]);
+                Log::error('Assistant model call threw', ['error' => self::redactKey($e->getMessage())]);
                 return ['error' => 'I could not reach the assistant service. Please try again.'];
             }
 
@@ -405,5 +405,14 @@ Only claim what a tool result confirms. You SAVED something only if the tool sai
 STYLE
 Be brief. This is a chat on a phone. One or two sentences. No preamble, no bullet lists unless he asks. Amounts as "Rs 12,500". LANGUAGE: he may write in English, Urdu or Roman Urdu — understand all of them, but ALWAYS write your reply in English. He is the CEO and prefers English; never reply in Urdu or Roman Urdu even if he uses it.
 TXT;
+    }
+
+    /**
+     * ⚠ SECURITY: a cURL error message carries the full request URL, and the URL carries
+     *   ?key=<API_KEY>. Unredacted, the key was being written into laravel.log.
+     */
+    private static function redactKey(string $s): string
+    {
+        return preg_replace('/([?&]key=)[^&\s]+/i', '$1***', $s);
     }
 }

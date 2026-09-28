@@ -106,7 +106,9 @@ class SupplyStorageController extends Controller
         }
 
         $rows = [];
-        foreach ($this->stock->stockSummary($request->input('business_unit_id')) as $row) {
+        // A non-numeric value used to 500 on the ?int parameter; anything unusable means "all".
+        $bu = filter_var($request->input('business_unit_id'), FILTER_VALIDATE_INT) ?: null;
+        foreach ($this->stock->stockSummary($bu) as $row) {
             /** @var SupplyProductModel $p */
             $p = $row['product'];
             $rows[] = [
@@ -243,7 +245,8 @@ class SupplyStorageController extends Controller
 
         $rows = SupplyLogModel::query()
             ->when($request->input('product_id'), fn ($q, $id) => $q->where('product_id', $id))
-            ->orderByDesc('id')->limit((int) $request->input('limit', 100))->get();
+            // Clamped: limit(-1) is ignored by Laravel and returned the WHOLE log (Sep-26 review).
+            ->orderByDesc('id')->limit(min(max((int) $request->input('limit', 100), 1), 500))->get();
 
         $names = DB::table('t_sys_user')->whereIn('id', $rows->pluck('created_by')->filter()->unique())
             ->pluck('fullname', 'id');
@@ -330,6 +333,12 @@ class SupplyStorageController extends Controller
     {
         if (!auth()->check()) {
             return response()->json(['success' => false], 401);
+        }
+
+        // Only people who work Storage or approve its take-outs see the count. Anyone else
+        // gets an honest zero (not a 403) so a banner that polls for every user stays quiet.
+        if (!$this->hasAccess() && !$this->holds('receive_supply_alerts')) {
+            return response()->json(['success' => true, 'takeouts_pending' => 0, 'latest_id' => null]);
         }
 
         $pending = SupplyTakeoutModel::where('status', SupplyTakeoutModel::STATUS_PENDING)->count();
@@ -455,6 +464,27 @@ class SupplyStorageController extends Controller
             ], 422);
         }
 
+        // ⭐ The same SCALE NUMBER is the same code, whichever box it was typed into. A
+        // packet product given "176" as its barcode answers every scale label numbered 176
+        // (see SupplyProductModel::scalePlu), so a weighed product on PLU 176 would make
+        // that label ambiguous. The column checks above cannot see it — one is `plu`, the
+        // other is `barcode` — so compare the scale numbers themselves.
+        $newScalePlu = $mode === 'weight'
+            ? ($plu ? (int) $plu : null)
+            : ($mode === 'scan' ? SupplyProductModel::barcodeAsScalePlu($barcode) : null);
+        if ($newScalePlu) {
+            $scaleClash = SupplyProductModel::when($id, fn ($q) => $q->where('id', '!=', $id))
+                ->whereIn('mode', [SupplyProductModel::MODE_WEIGHT, SupplyProductModel::MODE_SCAN])
+                ->get()
+                ->first(fn (SupplyProductModel $p) => $p->scalePlu() === $newScalePlu);
+            if ($scaleClash) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Scale number ' . $newScalePlu . ' is already used by "' . $scaleClash->name . '".',
+                ], 422);
+            }
+        }
+
         // ─────────────────────────────────────────────────────────────────────────
         // ⭐⭐ ONCE A PRODUCT HAS STOCK, HOW IT IS COUNTED IS FROZEN.
         //
@@ -541,9 +571,19 @@ class SupplyStorageController extends Controller
         // A warning, not a block: the two scanners look at different tables, so a shared
         // PLU cannot mis-resolve — but it will confuse whoever programmed the scale.
         $warning = null;
-        if ($plu && DB::table('t_crm_prod_product')->where('czerlop_product_id', $plu)->exists()) {
-            $warning = 'Note: PLU ' . $plu . ' is also used by a shop product on the scale. '
-                . 'Storage still reads it correctly, but pick a free PLU if you can.';
+        if ($newScalePlu && DB::table('t_crm_prod_product')->where('czerlop_product_id', $newScalePlu)->exists()) {
+            $warning = 'Note: scale number ' . $newScalePlu . ' is also used by a shop product on the scale. '
+                . 'Storage still reads it correctly, but pick a free number if you can.';
+        }
+
+        // A whole scale label pasted into the barcode box works only for labels printing
+        // exactly that count — "2 pcs" is a different 13 digits. Say how to make it work
+        // for every label, but do not refuse: a vendor EAN can look like a scale label too.
+        if ($mode === 'scan' && $barcode && ($asLabel = $this->decoder->decode($barcode))) {
+            $warning = trim(($warning ? $warning . "\n\n" : '')
+                . 'That barcode looks like a scale label (scale number ' . $asLabel['plu'] . '). '
+                . 'If these labels are printed on the scale, change the barcode to just '
+                . $asLabel['plu'] . ' — then every label with that number counts as one packet.');
         }
 
         return response()->json(['success' => true, 'product' => $product, 'warning' => $warning]);
@@ -593,6 +633,9 @@ class SupplyStorageController extends Controller
             'packets.*.barcode' => 'nullable|string|max:20',
             'packets.*.source' => 'nullable|in:scan,manual',
             'pieces_qty' => 'nullable|numeric|min:1|max:999999',
+            // A packet product is booked in by COUNT — "10 packets, Rs X" — because every
+            // label on it is the same and scanning ten identical labels proves nothing.
+            'packet_count' => 'nullable|integer|min:1|max:200',
             'attachment_image' => 'nullable|image|max:5120',
         ]);
 
@@ -642,8 +685,17 @@ class SupplyStorageController extends Controller
         // packet rows MEAN (intake audit, not stock) but not that intake records them.
         if ($product->booksPackets()) {
             $incoming = $validated['packets'] ?? [];
+            if (empty($incoming) && $product->mode === SupplyProductModel::MODE_SCAN
+                && !empty($validated['packet_count'])) {
+                $incoming = array_fill(0, (int) $validated['packet_count'], ['qty' => 1, 'source' => 'manual']);
+            }
             if (empty($incoming)) {
-                return response()->json(['success' => false, 'message' => 'Scan at least one packet.'], 422);
+                return response()->json([
+                    'success' => false,
+                    'message' => $product->mode === SupplyProductModel::MODE_SCAN
+                        ? 'How many packets are you adding?'
+                        : 'Scan at least one packet.',
+                ], 422);
             }
 
             foreach ($incoming as $i => $p) {
@@ -891,8 +943,12 @@ class SupplyStorageController extends Controller
             }
         }
 
+        // A scale label: find whichever product carries that SCALE NUMBER — a weighed
+        // product's `plu`, or a packet product whose labels are printed on the scale and
+        // whose barcode was set to the bare scale number (Sep-25: "176"). saveProduct keeps
+        // scale numbers unique across both, so at most one product answers.
         if (!$product && $decoded) {
-            $product = SupplyProductModel::where('plu', $decoded['plu'])->where('is_active', 1)->first();
+            $product = $this->productForScaleNumber((int) $decoded['plu']);
         }
 
         if (!$product) {
@@ -917,34 +973,36 @@ class SupplyStorageController extends Controller
             return $this->resolvePooledScan($product, $raw, $decoded, $nominal);
         }
 
-        // Look the packet up by the code its rows actually carry: a scan product's packets
-        // store the fixed barcode exactly as it was typed or scanned into the product form.
-        $lookup = $raw;
+        return $this->packetQuote($product, $raw);
+    }
 
-        $packet = $product->usesPackets() ? $this->stock->findPacketForBarcode($product, $lookup) : null;
+    /**
+     * The next packet of a SCAN product, for the confirm card — "1 packet, Rs X, N on the
+     * shelf". Used by a scan and by a manager's take-out-without-scanning alike.
+     *
+     * ⭐ ONE SCAN = THE OLDEST PACKET ON THE SHELF. Every packet of a scan product is the
+     * same thing under the same label, so which row goes is purely FIFO — oldest purchase
+     * first, which is also what makes the rupee figure the one actually paid. This used to
+     * look the packet up by the scanned string, which only worked while the label was
+     * byte-for-byte the product barcode; a scale-printed label never is, and the "pick the
+     * packet you have" fallback it fell into was a take-out WITHOUT a scan, open to anyone.
+     */
+    private function packetQuote(SupplyProductModel $product, ?string $raw)
+    {
+        $available = $this->stock->availablePackets($product);
+        $packet = $available->first();
 
-        // No exact label match — offer what IS on the shelf (covers typed-in packets
-        // and re-printed labels) instead of a dead end.
-        if ($product->usesPackets() && !$packet) {
-            $available = $this->stock->availablePackets($product);
-
+        if (!$packet) {
             return response()->json([
                 'success' => false,
-                'code' => $available->isEmpty() ? 'empty' : 'pick_one',
-                'message' => $available->isEmpty()
-                    ? 'No ' . $product->name . ' left in Storage — ask Taimur or Shabib to book the new stock.'
-                    : 'That exact label is not in Storage. Pick the packet you have.',
+                'code' => 'empty',
+                'message' => 'No ' . $product->name . ' left in Storage — ask Taimur or Shabib to book the new stock.',
                 'product' => ['id' => $product->id, 'name' => $product->name, 'mode' => $product->mode],
-                'packets' => $available->map(fn ($p) => [
-                    'id' => $p->id,
-                    'qty' => (float) $p->qty,
-                    'qty_label' => $this->stock->quantityPhrase((float) $p->qty, $product),
-                    'cost' => (float) $p->cost,
-                ]),
             ], 409);
         }
 
-        $batch = $packet ? SupplyBatchModel::find($packet->batch_id) : null;
+        $batch = SupplyBatchModel::find($packet->batch_id);
+        $onShelf = $available->count();
 
         return response()->json([
             'success' => true,
@@ -954,15 +1012,145 @@ class SupplyStorageController extends Controller
                 'mode' => $product->mode,
                 'expense_category' => $product->expense_category_name,
             ],
-            'packet' => $packet ? [
+            'packet' => [
                 'id' => $packet->id,
                 'qty' => (float) $packet->qty,
                 'qty_label' => $this->stock->quantityPhrase((float) $packet->qty, $product),
                 'cost' => (float) $packet->cost,
                 'batch_date' => optional($batch?->purchase_date)->format('d-M'),
                 'free' => $batch && $batch->status === SupplyBatchModel::STATUS_STOCK_ONLY,
-            ] : null,
+            ],
+            // What is on the shelf BEFORE this one goes — the card says "of 10 packets".
+            'on_shelf' => $onShelf,
+            'on_shelf_label' => $this->stock->quantityPhrase($onShelf, $product),
+            // Echoed back so the take-out can prove it was scanned (null = not scanned).
+            'scanned_barcode' => $raw,
         ]);
+    }
+
+    /**
+     * The active product that carries this Czerlop scale number, if any: a weighed
+     * product's PLU, or a packet product whose barcode is the bare scale number.
+     * The product list is a handful of rows, so this is read whole and matched in PHP
+     * rather than teaching SQL what a "scale number in the barcode column" is.
+     */
+    private function productForScaleNumber(int $plu): ?SupplyProductModel
+    {
+        return SupplyProductModel::where('is_active', 1)
+            ->whereIn('mode', [SupplyProductModel::MODE_WEIGHT, SupplyProductModel::MODE_SCAN])
+            ->orderBy('id')
+            ->get()
+            ->first(fn (SupplyProductModel $p) => $p->scalePlu() === $plu);
+    }
+
+    /**
+     * Did this code come off THIS product's label? A packet product: its barcode or any
+     * scale label carrying its scale number. Weighed: its scale PLU, or its inner-packet
+     * vendor code. Pieces have no label and never get here.
+     *
+     * Case-insensitive, because the lookup in resolveScan is (the column collation is
+     * `_ci`) — a code that resolved must not then be called "not this product" (Sep-26).
+     */
+    private function codeBelongsTo(SupplyProductModel $product, string $raw): bool
+    {
+        $raw = trim($raw);
+        $decoded = $this->decoder->decode($raw);
+        if ($product->mode === SupplyProductModel::MODE_SCAN) {
+            if ($product->barcode !== null && strcasecmp($raw, (string) $product->barcode) === 0) {
+                return true;
+            }
+            return $product->scanMatches($raw, $decoded);
+        }
+        if ($product->mode === SupplyProductModel::MODE_WEIGHT) {
+            if ($product->packet_barcode && strcasecmp($raw, (string) $product->packet_barcode) === 0) {
+                return true;
+            }
+            return $decoded !== null && (int) $decoded['plu'] === (int) $product->plu;
+        }
+        return false;
+    }
+
+    /**
+     * The weight a scanned code on a WEIGHED product actually carries — the label's own kg,
+     * or the stated weight of one inner packet for a vendor code. Null if it carries none.
+     */
+    private function weightOnLabel(SupplyProductModel $product, string $raw): ?float
+    {
+        $raw = trim($raw);
+        if ($product->hasNominalPacket() && strcasecmp($raw, (string) $product->packet_barcode) === 0) {
+            return (float) $product->packet_kg;
+        }
+        $decoded = $this->decoder->decode($raw);
+        if ($decoded && (int) $decoded['plu'] === (int) $product->plu) {
+            return (float) $decoded['weight_kg'];
+        }
+        return null;
+    }
+
+    /**
+     * Every rule about HOW a take-out was entered, in one place. Returns a refusal response,
+     * or null when it may go ahead.
+     *
+     *  1. A code that was scanned must belong to THIS product — for everyone. The phone used
+     *     to take a Small-bag label out of the Large-bag pool when the Large scanner was open
+     *     (Sep-26 review); the web page already refused it.
+     *  2. ⭐⭐ OWNER RULING Sep-25/26: PACKET products (one scan = one packet — the vacuum
+     *     bags) are taken out BY SCANNING by the store team. Only Taimur and Shabib
+     *     (manage_supplies_storage) may take one out without a scan.
+     *     Weighed products are deliberately NOT under this rule — "exactly as before": anyone
+     *     may still type a weight, and pieces have no label at all.
+     *     ⚠ An APK from before this round posts a packet take-out with no code at all even
+     *     though the person scanned it, and the only unscanned door that APK had (the "pick
+     *     the packet" list) no longer exists — so a packet take-out with no code and no
+     *     `manual` flag is accepted. Nobody on an old phone is left unable to work.
+     *     A packet product whose barcode is a bare scale number ("176") must be scanned as
+     *     the full scale label: typing "176" into the web scan box is not a scan.
+     */
+    private function refuseBadSource(SupplyProductModel $product, ?string $source, ?string $scanned)
+    {
+        $scanned = trim((string) $scanned);
+
+        if ($scanned !== '' && !$this->codeBelongsTo($product, $scanned)) {
+            return response()->json([
+                'success' => false,
+                'code' => 'wrong_label',
+                'message' => 'That label is not ' . $product->name . ' — scan it from the ' . $product->name . ' screen instead.',
+            ], 422);
+        }
+
+        if ($product->mode !== SupplyProductModel::MODE_SCAN || $this->canManage()) {
+            return null;
+        }
+
+        $scanRequired = response()->json([
+            'success' => false,
+            'code' => 'scan_required',
+            'message' => 'Scan the label to take ' . $product->name . ' out. '
+                . 'If the label will not scan, ask Taimur or Shabib — only they can take it out without scanning.',
+        ], 403);
+
+        if ($source === 'manual') {
+            return $scanRequired;
+        }
+        if ($scanned !== '' && $product->plu === null
+            && SupplyProductModel::barcodeAsScalePlu($product->barcode) !== null
+            && !$this->decoder->decode($scanned)) {
+            return $scanRequired;
+        }
+
+        return null;
+    }
+
+    /** Pieces are whole things: 0.4 of a cup is costed but shows as "0 pcs" (Sep-26 review). */
+    private function refuseFractionalPieces(SupplyProductModel $product, float $qty)
+    {
+        if ($product->mode === SupplyProductModel::MODE_PIECES && abs($qty - round($qty)) > 0.0001) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Pieces are counted whole — enter a whole number.',
+            ], 422);
+        }
+        return null;
     }
 
     /**
@@ -1167,8 +1355,30 @@ class SupplyStorageController extends Controller
         // that nobody looked at — and with the approval switch off this lands in expenses
         // immediately, so this is the last check there is.
         $product = SupplyProductModel::findOrFail($validated['product_id']);
+
+        // The code must belong to this product; packet products are scanned by the store team.
+        if ($refusal = $this->refuseBadSource($product, $validated['source'] ?? null, $validated['scanned_barcode'] ?? null)) {
+            return $refusal;
+        }
+        if ($refusal = $this->refuseFractionalPieces($product, (float) ($validated['qty'] ?? 0))) {
+            return $refusal;
+        }
+
         if ($product->isPooled()) {
             $qty = round((float) ($validated['qty'] ?? 0), 3);
+
+            // ⚠ Sep-26 review: when a label WAS scanned, the weight is the LABEL's, not
+            // whatever the client sent. The quote a client shows may legitimately differ a
+            // little (the residue sweep, the last-packet cap — both ≤ 0.3 kg), so a figure
+            // within that of the label is kept exactly as sent — every real scan behaves as
+            // before. Anything further off is replaced by the label's own weight.
+            if (!empty($validated['scanned_barcode']) && $product->mode === SupplyProductModel::MODE_WEIGHT) {
+                $onLabel = $this->weightOnLabel($product, $validated['scanned_barcode']);
+                if ($onLabel !== null && abs($qty - $onLabel) > 0.3005) {
+                    $qty = round($onLabel, 3);
+                }
+                $validated['qty'] = $qty;
+            }
             $confirmed = $validated['confirmed_warnings'] ?? [];
             $warnings = $this->poolWarnings(
                 $product, $qty,
@@ -1243,18 +1453,44 @@ class SupplyStorageController extends Controller
             ], 422);
         }
 
-        DB::transaction(function () use ($takeout) {
-            if ($takeout->request_id) {
-                $req = \App\Models\Request\RequestModel::find($takeout->request_id);
-                if ($req && $req->status === \App\Models\Request\RequestModel::STATUS_PENDING) {
-                    $req->status = \App\Models\Request\RequestModel::STATUS_CANCELLED;
-                    $req->rejection_reason = 'Undone by the person who took it out.';
-                    $req->updated_by = auth()->id();
-                    $req->save();
+        // ⚠ Sep-26 review: the request is LOCKED and must still be pending. An approval landing
+        // at the same moment (or one whose follow-up sync failed) left the take-out reading
+        // "pending" while its expense was already posted — undoing it then put the stock back
+        // AND kept the expense. And the reply now says what really happened.
+        try {
+            $restored = DB::transaction(function () use ($takeout) {
+                if ($takeout->request_id) {
+                    $req = \App\Models\Request\RequestModel::where('id', $takeout->request_id)->lockForUpdate()->first();
+                    if ($req && $req->status !== \App\Models\Request\RequestModel::STATUS_PENDING) {
+                        return false;
+                    }
+                    if ($req) {
+                        $req->status = \App\Models\Request\RequestModel::STATUS_CANCELLED;
+                        $req->rejection_reason = 'Undone by the person who took it out.';
+                        $req->updated_by = auth()->id();
+                        $req->save();
+                    }
                 }
+                // Nothing went back (it was settled in between) → roll the cancel back too.
+                if (!$this->stock->restore($takeout, SupplyTakeoutModel::STATUS_UNDONE, 'Undone by the scanner')) {
+                    throw new \RuntimeException('not_undone');
+                }
+                return true;
+            });
+        } catch (\RuntimeException $e) {
+            if ($e->getMessage() !== 'not_undone') {
+                throw $e;
             }
-            $this->stock->restore($takeout, SupplyTakeoutModel::STATUS_UNDONE, 'Undone by the scanner');
-        });
+            $restored = false;
+        }
+
+        if (!$restored) {
+            return response()->json([
+                'success' => false,
+                'message' => 'That take-out was decided a moment ago, so it could not be undone. '
+                    . 'Pull down to refresh — if it was approved, Taimur or Shabib can delete it from the Storage page.',
+            ], 409);
+        }
 
         return response()->json(['success' => true, 'message' => 'Undone — it is back in Storage.']);
     }
@@ -1274,14 +1510,31 @@ class SupplyStorageController extends Controller
 
         $validated = $request->validate([
             'product_id' => 'required|integer|exists:t_fin_supply_product,id',
-            'qty' => 'required|numeric|min:0.001',
+            'qty' => 'nullable|numeric|min:0.001',
         ]);
 
         $product = SupplyProductModel::findOrFail($validated['product_id']);
-        if (!$product->isPooled()) {
+
+        // A quote with no label is the first half of a take-out without a scan — the same
+        // rule applies (packet products only), so the phone can say so before anything else.
+        if ($refusal = $this->refuseBadSource($product, 'manual', null)) {
+            return $refusal;
+        }
+        if (!empty($validated['qty']) && ($refusal = $this->refuseFractionalPieces($product, (float) $validated['qty']))) {
+            return $refusal;
+        }
+
+        // A packet product has nothing to type: the next packet is the oldest one.
+        if ($product->usesPackets()) {
+            return $this->packetQuote($product, null);
+        }
+
+        if (empty($validated['qty'])) {
             return response()->json([
                 'success' => false,
-                'message' => 'That product is taken out by scanning a packet, not by typing a quantity.',
+                'message' => $product->mode === SupplyProductModel::MODE_WEIGHT
+                    ? 'How much are you taking out?'
+                    : 'How many are you taking out?',
             ], 422);
         }
 
@@ -1333,6 +1586,18 @@ class SupplyStorageController extends Controller
         $takeout = SupplyTakeoutModel::findOrFail($takeoutId);
         $product = SupplyProductModel::findOrFail($takeout->product_id);
 
+        // Same refusals the edit itself makes, so the preview never quotes an edit that
+        // cannot happen (Sep-26 review).
+        if (in_array($takeout->status, SupplyTakeoutModel::RESTORED_STATUSES, true)) {
+            return response()->json(['success' => false, 'message' => 'That take-out was already reversed — there is nothing to edit.'], 422);
+        }
+        if (!$product->isPooled()) {
+            return response()->json(['success' => false, 'message' => 'A packet take-out cannot be edited — delete it instead.'], 422);
+        }
+        if ($refusal = $this->refuseFractionalPieces($product, (float) $validated['qty'])) {
+            return $refusal;
+        }
+
         $preview = $this->stock->previewTakeoutEdit($takeout, round((float) $validated['qty'], 3));
 
         if (!$preview['ok']) {
@@ -1369,6 +1634,9 @@ class SupplyStorageController extends Controller
 
         $takeout = SupplyTakeoutModel::findOrFail($takeoutId);
         $product = SupplyProductModel::findOrFail($takeout->product_id);
+        if ($refusal = $this->refuseFractionalPieces($product, (float) $validated['qty'])) {
+            return $refusal;
+        }
 
         try {
             $result = $this->stock->editTakeoutWeight(
@@ -1403,6 +1671,7 @@ class SupplyStorageController extends Controller
             return $this->deny('Storage stock');
         }
 
+        $request->validate(['required' => 'required|boolean']);
         $on = $request->boolean('required');
         ConfigModel::set(
             SupplyStockService::APPROVAL_SWITCH_KEY,
