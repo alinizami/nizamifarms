@@ -3188,11 +3188,15 @@ function flKmSummary(r) {
 
     // Each off-duty stretch: meter-out at home → next morning's meter-in.
     let offList = '';
+    // ⭐ Sep-30: the engine's list (same as Attendance → Off-duty km). `source` says where the
+    //   morning reading was taken; older payloads simply lack it and the line reads as before.
+    const offSrc = { home: 'meter at home', checkin: 'typed at the office', manager: 'entered by a manager', log: 'manager log' };
     (r.off_nights || []).forEach(n => {
         offList += '<div class="fl-offrow"><span>' + flDate(n.date) +
             (n.since ? ' <span style="color:#9ca3af;">(since ' + flDate(n.since) + ')</span>' : '') +
-            ' &nbsp;' + (n.from !== null ? flNum(n.from) + ' → ' + flNum(n.to) : '') +
-            (n.vehicle_label ? ' <span style="color:#9ca3af;">on ' + flEsc(n.vehicle_label) + '</span>' : '') +
+            ' &nbsp;' + (n.from != null && n.to != null ? flNum(n.from) + ' → ' + flNum(n.to) : '') +
+            (n.vehicle_label ? ' <span style="color:#9ca3af;">on ' + (n.vtype === 'van' ? '🚚 ' : '') + flEsc(n.vehicle_label) + '</span>' : '') +
+            (offSrc[n.source] ? ' <span style="color:#9ca3af;">· ' + offSrc[n.source] + '</span>' : '') +
             '</span><span>' + flNum(n.km) + ' km</span></div>';
     });
     if (offList) {

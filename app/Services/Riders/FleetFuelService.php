@@ -184,6 +184,32 @@ class FleetFuelService
             $totalKm = $m['work_km'] + $m['offduty_km'] + ($m['unattributed_km'] ?? 0)
                      + $sharedKm + $transferKm;
 
+            // ⭐⭐ Sep-30 — OFF-DUTY AND FUELLED KM FOLLOW THE MACHINE, NOT TODAY'S BIKE.
+            //   The row used to add off-duty across every machine he touched and show it
+            //   whenever the machine he holds TODAY is a company one: Asim's 432 km on his
+            //   OWN bike (before BCN-5755 on 28-Sep) read as company off-duty and inflated
+            //   his fuelled km; Rajab's van km were hidden because he is on his own bike now.
+            //   Where the engine knows him: off-duty = company machines only, and fuelled km
+            //   = every km on a company machine + shift km on an own one (the Jul-28 ruling,
+            //   applied per machine the way the header pools already do).
+            // ⚠ Riders the engine does not know keep exactly the old answer.
+            $showOff = $isCompany === true;
+            $offShown = $m['offduty_km'];
+            $fuelledKm = $isCompany === true ? $totalKm : $m['work_km'];
+            if ($e) {
+                // A past month follows what he actually rode; only the CURRENT month also
+                // counts the company machine he holds today (received, not yet ridden → 0).
+                $showOff = !empty($e['had_company'])
+                    || ($isCompany === true && $month === Carbon::today()->format('Y-m'));
+                $offShown = (int) ($e['company_offduty_km'] ?? $m['offduty_km']);
+                $fuelledKm = 0;
+                foreach ($e['machines'] ?? [] as $mm) {
+                    $fuelledKm += !empty($mm['is_company'])
+                        ? (int) ($mm['km_with_him'] ?? 0) : (int) ($mm['work_km'] ?? 0);
+                }
+                $totalKm = $fuelledKm;
+            }
+
             // ⭐ COST PER PRODUCTIVE KILOMETRE — always SHIFT km, both bike types.
             //
             // It is tempting to divide a company bike's cost by every kilometre it
@@ -248,14 +274,14 @@ class FleetFuelService
                 'chain_ok'      => $e['reconciles'] ?? true,
                 'days'          => $m['days'],
                 'work_km'       => $m['work_km'],
-                'offduty_km'    => $isCompany === true ? $m['offduty_km'] : null,
-                'total_km'      => $isCompany === true ? $totalKm : null,
+                'offduty_km'    => $showOff ? $offShown : null,
+                'total_km'      => $showOff ? $totalKm : null,
                 // ⚠⚠ COMPATIBILITY CONTRACT — `unattributed_km` keeps its ORIGINAL
                 //   meaning, "kilometres this rider is not credited with", so an old
                 //   APK that renders it as one number stays correct. The engine's
                 //   three separate reasons live in their own keys beside it; only
                 //   surfaces that understand them should use those.
-                'unattributed_km' => $isCompany === true
+                'unattributed_km' => $showOff
                     ? ($m['unattributed_km'] ?? 0) + $sharedKm + $transferKm : null,
                 // Km on a day this machine changed hands: real, measured, and
                 // unsplittable — so it is named on BOTH riders and charged to neither.
@@ -264,7 +290,7 @@ class FleetFuelService
                 'transfer_km'   => $transferKm ?: null,
                 // Stretches spanning a day he worked and left unread. The only one of
                 // the three that is really "we cannot tell".
-                'unaccounted_km' => $isCompany === true ? ($m['unattributed_km'] ?? 0) : null,
+                'unaccounted_km' => $showOff ? ($m['unattributed_km'] ?? 0) : null,
                 // Past days he checked in and never checked out. Left as
                 // "in progress" by owner ruling — the team must go and close them —
                 // but surfaced here so they are visible instead of invisible.
@@ -280,12 +306,12 @@ class FleetFuelService
                 //    denominator — see rs_per_fuelled_km below.
                 //    Includes unattributed km: not knowing whether a kilometre was
                 //    work or commute does not make the petrol free.
-                'fuelled_km'    => $isCompany === true ? $totalKm : $m['work_km'],
+                'fuelled_km'    => $fuelledKm,
                 // Context only, never a denominator for the comparison: what the
                 // fuel worked out to across every kilometre the bike actually
                 // moved. Near real pump economics (~7 Rs/km) means the claims are
                 // roughly honest; far above it means over-claiming.
-                'fuel_per_all_km' => ($isCompany === true && $totalKm > 0)
+                'fuel_per_all_km' => ($showOff && $totalKm > 0)
                     ? round($c['fuel_rs'] / $totalKm, 2) : null,
                 'no_meter_days' => $m['no_meter_days'],
                 /**
@@ -328,15 +354,19 @@ class FleetFuelService
                 // (rs_per_km). Both are shown; only rs_per_km may be compared
                 // across bike types, because an own-bike rider's commute is his
                 // own expense and never enters his denominator.
-                'rs_per_fuelled_km' => ($isCompany === true && $totalKm > 0)
-                    ? round($c['fuel_rs'] / $totalKm, 2)
-                    : ($basisKm > 0 ? round($c['fuel_rs'] / $basisKm, 2) : null),
+                'rs_per_fuelled_km' => $e
+                    ? ($fuelledKm > 0 ? round($c['fuel_rs'] / $fuelledKm, 2) : null)
+                    : (($isCompany === true && $totalKm > 0)
+                        ? round($c['fuel_rs'] / $totalKm, 2)
+                        : ($basisKm > 0 ? round($c['fuel_rs'] / $basisKm, 2) : null)),
                 // All-in on the SAME denominator as the fuel rate beside it. Showing
                 // fuel ÷ ridden km next to all-in ÷ productive km put two different
                 // denominators side by side in one row, which reads as an error.
-                'rs_per_fuelled_km_all' => ($isCompany === true && $totalKm > 0)
-                    ? round(($c['fuel_rs'] + $c['maint_rs']) / $totalKm, 2)
-                    : ($basisKm > 0 ? round(($c['fuel_rs'] + $c['maint_rs']) / $basisKm, 2) : null),
+                'rs_per_fuelled_km_all' => $e
+                    ? ($fuelledKm > 0 ? round(($c['fuel_rs'] + $c['maint_rs']) / $fuelledKm, 2) : null)
+                    : (($isCompany === true && $totalKm > 0)
+                        ? round(($c['fuel_rs'] + $c['maint_rs']) / $totalKm, 2)
+                        : ($basisKm > 0 ? round(($c['fuel_rs'] + $c['maint_rs']) / $basisKm, 2) : null)),
                 'km_per_litre'  => $c['litres'] > 0 && $basisKm > 0 ? round($basisKm / $c['litres'], 1) : null,
                 'dupe_flags'    => $c['dupe_flags'],
                 'early_service_count' => $c['early_service_count'] ?? 0,
@@ -431,6 +461,11 @@ class FleetFuelService
                     'holds_now'       => $holdsNow,
                     'work_km'         => $r['work_km'],
                     'offduty_km'      => $r['offduty_km'],
+                    // ⭐ Sep-30: the off-duty that COUNTS — company machines only, ≤1 km
+                    //   rounding excluded. Equals the sum of his night list.
+                    'company_offduty_km' => $r['company_offduty_km'] ?? $r['offduty_km'],
+                    'had_company'     => !empty($r['had_company']),
+                    'jitter_km'       => $r['jitter_km'] ?? 0,
                     'shared_km'       => $r['shared_km'],
                     'transfer_km'     => $r['transfer_km'],
                     'unattributed_km' => $r['unattributed_km'],
@@ -559,16 +594,21 @@ class FleetFuelService
                 $days[$date]['shared_with']     = null;
                 $days[$date]['transfer_km']     = null;
                 $days[$date]['handover']        = false;
-                if ($isCompany === true) {
-                    $days[$date]['offduty_km']      = null;
-                    $days[$date]['unattributed_km'] = null;
-                }
+                // ⭐ Sep-30: the engine speaks for every day of a rider it knows, whatever he
+                //   rides today — so the rider-keyed day figures are always cleared here and
+                //   refilled below from COMPANY-machine legs only (an own bike has no off-duty).
+                $days[$date]['offduty_km']      = null;
+                $days[$date]['unattributed_km'] = null;
             }
 
+            $jitter = MachineAttribution::jitterKm();
             foreach ($legs as $date => $list) {
                 if (!isset($days[$date])) continue;
                 foreach ($list as $l) {
                     if ($l['kind'] === 'on_duty') continue;      // already in work_km
+                    if (in_array($l['kind'], ['off_duty', 'unaccounted'], true)
+                        && empty($l['vehicle_is_company'])) continue;   // own bike: none of ours
+                    if ($l['kind'] === 'off_duty' && $l['user_id'] === $userId && $l['km'] <= $jitter) continue;
                     if ($l['kind'] === 'off_duty' && $l['user_id'] === $userId) {
                         $days[$date]['offduty_km'] = ($days[$date]['offduty_km'] ?? 0) + $l['km'];
                         $days[$date]['offduty_since'] = $l['since'] ?? ($days[$date]['offduty_since'] ?? null);
@@ -604,7 +644,8 @@ class FleetFuelService
                 $days[$dt]['machines_today'] = $list;
             }
             ksort($days);
-            return ['days' => $days, 'machines' => $this->shapeMachines($rider['machines'])];
+            return ['days' => $days, 'machines' => $this->shapeMachines($rider['machines']),
+                    'engine' => true];
         } catch (\Throwable $e) {
             Log::warning('overlayRiderDays failed', ['user' => $userId, 'error' => $e->getMessage()]);
             return $blank;
@@ -640,8 +681,9 @@ class FleetFuelService
     {
         $out = [];
         foreach ($machines as $m) {
+            // jitter_km (≤1 km rounding) is still distance the machine moved under him.
             $withHim = $m['work_km'] + $m['offduty_km'] + $m['shared_km']
-                     + $m['transfer_km'] + $m['unattributed_km'];
+                     + $m['transfer_km'] + $m['unattributed_km'] + ($m['jitter_km'] ?? 0);
             $out[] = array_merge($m, [
                 'km_with_him' => $withHim,
                 // His own running cost ON THIS BIKE. Fuel he filed ÷ every kilometre
@@ -1657,7 +1699,17 @@ class FleetFuelService
         // morning's meter-in. This is the ONLY distance outside the shift, so
         // it is the one a manager will want to open and read night by night.
         $offNights = [];
-        if ($isCompany === true) {
+        if (!empty($machineDays['engine'])) {
+            // ⭐ Sep-30: straight from the engine — the SAME list the Attendance page and the
+            //   rider's phone read. Company machines only, custody-checked, ≤1 km dropped; each
+            //   line carries both readings, the plate and where the morning meter was taken.
+            //   Keys `date/since/km/from/to/vehicle_label` are unchanged for the installed APK.
+            try {
+                $offNights = (new MachineAttribution())->offDutyNights($userId, $month);
+            } catch (\Throwable $e) {
+                $offNights = [];
+            }
+        } elseif ($isCompany === true) {
             foreach ($days as $d) {
                 if (($d['offduty_km'] ?? 0) > 0) {
                     $offNights[] = [

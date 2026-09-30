@@ -101,6 +101,84 @@ class WorkJourneyService
      * The sentence shown when a morning reading is too far from the baseline.
      * One copy, so the three gates that ask cannot drift apart in wording.
      */
+    /**
+     * ⭐⭐ Sep-30 — THE MORNING PROMPT, IN ROMAN URDU, AND IT SAYS WHAT THE GAP MEANS.
+     *
+     * Both meter doors (the home-start card and "Meter & Check In") answer `needs_confirm`
+     * with this text; every installed APK prints the server's `message` verbatim under its own
+     * "Reading theek karein / Sahi hai — confirm karein" buttons, so no APK is needed.
+     *
+     * The off-duty sentence appears ONLY when the gap would really be charged to him — the
+     * engine's own rules: a COMPANY machine, the previous reading was HIS, the machine was his
+     * on every day in between, not a handover day, and more than the rounding threshold. After
+     * a handover the previous reading is the other rider's, so he is only asked to re-check.
+     * Anything that cannot be answered falls back to the plain re-check wording — never to an
+     * accusation.
+     */
+    public function continuityPrompt(int $userId, array $base, int $gapKm, string $today): string
+    {
+        $label = !empty($base['label']) ? $base['label'] . ' ka pichla meter' : 'Pichla meter';
+        $head  = $label . ' ' . number_format((int) $base['value']) . ' tha — ';
+
+        if ($gapKm < 0) {
+            return $head . 'aap ki reading is se KAM hai, jo mumkin nahi. '
+                . 'Dobara dekhein; sahi hai to confirm karein, manager ko bhej di jayegi.';
+        }
+
+        $recheck = $head . 'aap ki reading ' . number_format($gapKm) . ' km zyada hai. '
+            . 'Reading dobara dekhein, sahi hai to confirm karein.';
+
+        try {
+            $ctx = $this->offDutyContext($userId, $base, $today);
+            if (!$ctx || $gapKm <= MachineAttribution::jitterKm()) return $recheck;
+
+            $what = $ctx['vtype'] === 'van' ? 'gaari' : 'bike';
+            $msg = $head . 'aap ki reading ' . number_format($gapKm) . ' km zyada hai. '
+                . 'Agar reading ghalat hai to theek karein. '
+                . 'Agar sahi hai to yeh ' . number_format($gapKm) . ' km OFF-DUTY ginay jayenge — '
+                . 'duty ke baad ' . $what . ' chalai hai aap nay.';
+            if ($ctx['month_km'] !== null) {
+                $msg .= ' Is ke saath is mahine ka off-duty: '
+                    . number_format($ctx['month_km'] + $gapKm) . ' km.';
+            }
+            return $msg;
+        } catch (\Throwable $e) {
+            return $recheck;
+        }
+    }
+
+    /**
+     * Would a gap measured from `$base` be HIS off-duty? Null = no (or cannot tell).
+     * @return null|array{vtype:string, month_km:?int}
+     */
+    private function offDutyContext(int $userId, array $base, string $today): ?array
+    {
+        if (($base['source'] ?? null) !== 'vehicle') return null;   // rider-chain fallback: unsure
+        $resolver = new VehicleResolver();
+        $vid = $resolver->currentVehicleFor($userId, $today);
+        if (!$vid) return null;
+        $veh = $resolver->vehicle($vid);
+        if (!$veh || (int) ($veh->is_company ?? 0) !== 1) return null;   // own bike: never off-duty
+        if ($resolver->isTransferDay($vid, $today)) return null;       // handover morning
+
+        $eng = new MachineAttribution();
+        $owner = $eng->readingOwner($vid, (int) $base['value'], $today);
+        if (!$owner || $owner['user_id'] !== $userId) return null;    // someone else's reading
+        if (!$eng->heldThroughout($userId, $vid, $owner['date'], $today)) return null;
+
+        // Month so far. ⚠ A cold engine build costs a few seconds; it runs only on a morning
+        //   that already has a real gap on his own machine (rare), and is then cached for
+        //   everyone. A failure just leaves the total out of the sentence.
+        $monthKm = null;
+        try {
+            $monthKm = array_sum(array_column($eng->offDutyNights($userId, substr($today, 0, 7)), 'km'));
+        } catch (\Throwable $e) {
+            $monthKm = null;
+        }
+        return ['vtype' => ((string) ($veh->vtype ?? '')) === 'van' ? 'van' : 'bike',
+                'month_km' => $monthKm];
+    }
+
     public static function continuityMessage(array $base, int $gapKm): string
     {
         $whose = !empty($base['label'])

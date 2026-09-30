@@ -585,12 +585,13 @@
             <th class="px-4 py-3 text-center text-xs font-semibold text-emerald-600 uppercase">OT (mo)</th>
             <th class="px-4 py-3 text-center text-xs font-semibold text-amber-700 uppercase" title="Day-flags this month — 🌅 morning (late ride-in / no home start / meter gap) · 🌙 evening (home late / meter locked / unlocked) · 🏢 delivered but checked out at the office. Click any chip for the days.">Flags</th>
             <th class="px-4 py-3 text-center text-xs font-semibold text-orange-700 uppercase" title="Finished working days with a missing meter reading (start and/or closing). Absent days, leave, today's running shift and future days are never counted.">Meter</th>
+            <th class="px-4 py-3 text-center text-xs font-semibold uppercase" style="color:#B45309;" title="Kilometres a COMPANY bike or van moved between his evening reading and his next morning reading — the same number as Bikes → Riders. Own bikes never count; 1 km or less is meter rounding. Click for each night.">Off-duty km</th>
             <th class="px-4 py-3 text-center text-xs font-semibold text-purple-500 uppercase">Leave (bal)</th>
             <th class="px-4 py-3 text-center text-xs font-semibold text-red-500 uppercase">Absent (yr)</th>
           </tr>
         </thead>
         <tbody id="monthBody" class="bg-white divide-y divide-gray-100">
-          <tr><td colspan="10" class="px-4 py-8 text-center text-gray-400 text-sm">Loading…</td></tr>
+          <tr><td colspan="11" class="px-4 py-8 text-center text-gray-400 text-sm">Loading…</td></tr>
         </tbody>
       </table>
     </div>
@@ -1987,7 +1988,7 @@ async function loadMonthTab() {
     monthData = json.success ? (json.data || []) : [];
     renderMonthBody(monthData);
   } catch (e) {
-    body.innerHTML = '<tr><td colspan="10" class="px-4 py-8 text-center text-red-500 text-sm">Failed to load</td></tr>';
+    body.innerHTML = '<tr><td colspan="11" class="px-4 py-8 text-center text-red-500 text-sm">Failed to load</td></tr>';
   }
   // Awaited so a caller that reloads the month (after deciding an action) can rely on the
   // banner data being fresh; it runs after the table is already on screen either way.
@@ -2142,7 +2143,7 @@ function renderMonthBody(data) {
     const c0 = data[0] || {};
     lbl.textContent = (c0.cycle_start && c0.cycle_end) ? '(' + fmtCycleShort(c0.cycle_start) + ' → ' + fmtCycleShort(c0.cycle_end) + ')' : '';
   }
-  if (!data.length) { body.innerHTML = '<tr><td colspan="10" class="px-4 py-8 text-center text-gray-400 text-sm">No data for this month</td></tr>'; return; }
+  if (!data.length) { body.innerHTML = '<tr><td colspan="11" class="px-4 py-8 text-center text-gray-400 text-sm">No data for this month</td></tr>'; return; }
   const sorted = [...data].sort((a, b) => String(a.fullname || '').localeCompare(String(b.fullname || '')));
   // A clickable count → opens the exact-dates drill-down. Zero shows a muted dash so the
   // eye skips it. stopPropagation keeps the row's own "open 30-day detail" from also firing.
@@ -2213,6 +2214,7 @@ function renderMonthBody(data) {
       : `<td class="px-4 py-3 text-sm" style="text-align:center;color:#D1D5DB;">–</td>`;
     const flagsTd = flagsCell(u, uid, nm);
     const meterTd = meterCell(u, uid, nm);
+    const offTd = offDutyCell(u, uid, nm);
     return `<tr class="hover:bg-gray-50 cursor-pointer" onclick="openMonthDetail(${uid}, '${nm}')">
       <td class="px-4 py-3 text-sm" style="font-weight:600;color:#1F2937;">${u.fullname || ''}</td>
       ${filterCell(u.present_days, '#374151', uid, nm, 'present')}
@@ -2224,6 +2226,7 @@ function renderMonthBody(data) {
       ${otCell}
       ${flagsTd}
       ${meterTd}
+      ${offTd}
       ${leaveBalCell(u, uid, nm)}
       ${numCell(u.absent_days_year, '#B91C1C', uid, nm, 'year_absent')}
     </tr>`;
@@ -2267,6 +2270,48 @@ function meterCell(u, uid, nm) {
   </td>`;
 }
 
+// ⭐ Sep-30 — "Off-duty km": the Bikes page's own number (server: MachineAttribution), so the
+// two screens cannot disagree. null = no company machine this month → "–". 0 is shown as 0:
+// he had a company machine and it did not move off duty, which is worth seeing.
+function offDutyCell(u, uid, nm) {
+  if (u.offduty_km == null) return `<td class="px-4 py-3 text-sm" style="text-align:center;color:#D1D5DB;">–</td>`;
+  const km = Number(u.offduty_km) || 0;
+  const nights = (u.offduty_nights || []).length;
+  if (km <= 0) return `<td class="px-4 py-3 text-sm" style="text-align:center;color:#9CA3AF;">0</td>`;
+  return `<td class="px-4 py-3 text-sm" style="text-align:center;">
+    <button type="button" onclick="event.stopPropagation(); showOffDutyNights(${uid}, '${nm}')"
+      title="${nights} night${nights === 1 ? '' : 's'} — click for each one"
+      style="background:none;border:none;cursor:pointer;font-weight:700;color:#B45309;text-decoration:underline;text-decoration-style:dotted;text-underline-offset:2px;font-size:13px;">${km.toLocaleString()}</button>
+  </td>`;
+}
+
+// Where the morning reading that ended the stretch was taken.
+const OFFDUTY_SOURCE = { home: 'meter at home', checkin: 'typed at the office', manager: 'entered by a manager', log: 'manager log' };
+
+// One off-duty night as a line: "03 Sep · EGL-682 · 17,734 → 17,755 · meter at home · 21 km"
+const offEsc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+function offDutyNightLine(n) {
+  const fmt = v => (v == null ? '?' : Number(v).toLocaleString());
+  const since = n.since ? ` <span style="color:#9CA3AF;">(since ${offEsc(n.since)})</span>` : '';
+  const src = OFFDUTY_SOURCE[n.source] ? ` · ${OFFDUTY_SOURCE[n.source]}` : '';
+  return `<div style="display:flex;gap:10px;align-items:baseline;padding:8px 4px;border-bottom:1px solid #F1F5F9;">
+    <span style="font-size:13px;font-weight:700;color:#111827;min-width:92px;">${offEsc(n.date)}</span>
+    <span style="flex:1;font-size:12.5px;color:#6B7280;">${n.vtype === 'van' ? '🚚' : '🏍'} ${offEsc(n.vehicle_label || '')} · ${fmt(n.from)} → ${fmt(n.to)}${src}${since}</span>
+    <span style="font-size:13px;font-weight:700;color:#B45309;white-space:nowrap;">${Number(n.km).toLocaleString()} km</span>
+  </div>`;
+}
+
+function showOffDutyNights(uid, name) {
+  const u = monthData.find(x => String(x.user_id) === String(uid)) || {};
+  const nights = u.offduty_nights || [];
+  document.getElementById('bdTitle').textContent = `🌙 Off-duty km — ${name} · ${Number(u.offduty_km || 0).toLocaleString()} km`;
+  document.getElementById('bdSub').textContent = 'company bike / van · his evening reading → his next morning reading · same list as Bikes → Riders';
+  document.getElementById('bdBody').innerHTML = nights.length
+    ? nights.map(offDutyNightLine).join('')
+    : '<div style="padding:24px;text-align:center;color:#9CA3AF;font-size:13px;">No off-duty nights this month.</div>';
+  document.getElementById('dateBreakdownModal').style.display = 'flex';
+}
+
 // Human labels for the violation codes coming from the server detail maps.
 const VIOLATION_LABELS = {
   late_vs_eta: '⏱ arrived after the ride-in deadline',
@@ -2288,11 +2333,18 @@ function showViolationDetail(uid, name, kind) {
     : 'company bike · evening: ride home + closing meter';
   const entries = Object.entries(detail).sort((a, b) => a[0].localeCompare(b[0]));
   const bodyEl = document.getElementById('bdBody');
+  // ⭐ Sep-30: on a morning the machine moved overnight, say by how much and on which plate —
+  //   from the same off-duty list as the Off-duty km column (so "meter gap" has a number).
+  const nightOn = {};
+  if (kind === 'in') (u.offduty_nights || []).forEach(n => { (nightOn[n.date] = nightOn[n.date] || []).push(n); });
+  const kmNote = (date) => (nightOn[date] || []).map(n =>
+    ` · <b style="color:#B45309;">+${Number(n.km).toLocaleString()} km</b> ${offEsc(n.vehicle_label || '')}`
+    + (n.from != null && n.to != null ? ` <span style="color:#9CA3AF;">(${Number(n.from).toLocaleString()} → ${Number(n.to).toLocaleString()})</span>` : '')).join('');
   bodyEl.innerHTML = entries.length
     ? entries.map(([date, issues]) =>
         `<div style="display:flex;gap:10px;align-items:baseline;padding:8px 4px;border-bottom:1px solid #F1F5F9;">
           <span style="font-size:13px;font-weight:700;color:#111827;min-width:92px;">${date}</span>
-          <span style="font-size:12.5px;color:#6B7280;">${(issues || []).map(i => VIOLATION_LABELS[i] || i).join(' · ')}</span>
+          <span style="font-size:12.5px;color:#6B7280;">${(issues || []).map(i => VIOLATION_LABELS[i] || i).join(' · ')}${kmNote(date)}</span>
         </div>`).join('')
     : '<div style="padding:24px;text-align:center;color:#9CA3AF;font-size:13px;">No detail available.</div>';
   modal.style.display = 'flex';
@@ -2709,9 +2761,9 @@ function exportMonthCsv() {
   // where they read better as one group of chips.
   // ⚠ "Late minutes" is NET of anything a manager waived, so the waiver and the raw figure
   // travel beside it — otherwise the sheet holds a number its own day rows do not add up to.
-  let csv = 'Employee,Present,Absent (month),Leave (month),Late minutes,Late waived,Late before waiver,Morning flags,Evening flags,Office checkouts,Missed meter,Leave (year),Absent (year)\n';
+  let csv = 'Employee,Present,Absent (month),Leave (month),Late minutes,Late waived,Late before waiver,Morning flags,Evening flags,Office checkouts,Missed meter,Off-duty km,Leave (year),Absent (year)\n';
   [...monthData].sort((a, b) => String(a.fullname || '').localeCompare(String(b.fullname || ''))).forEach(u => {
-    csv += `"${(u.fullname || '').replace(/"/g, '""')}",${u.present_days || 0},${u.absent_days || 0},${u.leave_days || 0},${u.total_late_minutes || 0},${u.late_waived_minutes || 0},${u.late_raw_minutes || u.total_late_minutes || 0},${u.checkin_violation_days || 0},${u.checkout_violation_days || 0},${u.office_checkout_days || 0},${u.meter_missed_days || 0},${u.leaves_taken_year || 0},${u.absent_days_year || 0}\n`;
+    csv += `"${(u.fullname || '').replace(/"/g, '""')}",${u.present_days || 0},${u.absent_days || 0},${u.leave_days || 0},${u.total_late_minutes || 0},${u.late_waived_minutes || 0},${u.late_raw_minutes || u.total_late_minutes || 0},${u.checkin_violation_days || 0},${u.checkout_violation_days || 0},${u.office_checkout_days || 0},${u.meter_missed_days || 0},${u.offduty_km == null ? "" : u.offduty_km},${u.leaves_taken_year || 0},${u.absent_days_year || 0}\n`;
   });
   const blob = new Blob([csv], { type: 'text/csv' });
   const a = document.createElement('a'); a.href = URL.createObjectURL(blob);

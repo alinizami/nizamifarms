@@ -6403,7 +6403,43 @@ class RiderController extends Controller
     }
 
     /**
+     * ⭐ Sep-30 — the rider's "Company bike this month" block, from MachineAttribution: shift km
+     * and off-duty km on COMPANY machines only, plus his night list. Returns:
+     *   array — the block (keys the installed APK already reads + `nights`)
+     *   null  — he had no company machine this month: no block
+     *   false — the engine cannot speak for him: caller keeps the old rider-keyed sum
+     */
+    private function engineBikeUsage(int $userId, string $month)
+    {
+        try {
+            $cfg = DB::table('t_fin_config')->where('config_key', 'MACHINE_ATTRIBUTION')->value('config_value');
+            if ($cfg !== null && $cfg !== '' && strtoupper((string) $cfg) !== 'Y') return false;
+
+            $cm = (new \App\Services\Riders\MachineAttribution())->companyMonth($userId, $month);
+            if ($cm === null) return false;
+            if (!$cm['had_company']) return null;
+
+            $work = (int) $cm['work_km'];
+            $off  = (int) $cm['offduty_km'];
+            return [
+                'days'        => (int) $cm['days'],
+                'work_km'     => $work,
+                'offduty_km'  => $off,
+                'total_km'    => $work + $off,
+                'offduty_pct' => ($work + $off) > 0 ? (int) round($off * 100 / ($work + $off)) : 0,
+                // additive — one line per night: date, plate, from → to, km, where read
+                'nights'      => $cm['nights'],
+                'source'      => 'engine',
+            ];
+        } catch (\Throwable $e) {
+            Log::warning('engineBikeUsage failed', ['user' => $userId, 'error' => $e->getMessage()]);
+            return false;
+        }
+    }
+
+    /**
      * A company-bike rider's own month: shift km vs off-duty km.
+     * ⚠ Sep-30: now only the FALLBACK for a rider the engine cannot speak for.
      *
      * Uses the SAME plausibility bounds as the Fleet tab (readings under 1000 are
      * dropped-digit typos; a day over 500 km or an overnight gap over 500 km is a
@@ -8237,7 +8273,8 @@ class RiderController extends Controller
                                         'gap_km' => $gapKm,
                                         'prev_value' => $prevM['value'],
                                         'prev_date' => $prevM['date'],
-                                        'message' => \App\Services\Riders\WorkJourneyService::continuityMessage($prevM, $gapKm),
+                                        // ⭐ Sep-30: Roman Urdu, and says when it counts as off-duty.
+                                        'message' => $wjU->continuityPrompt((int) $user->id, $prevM, (int) $gapKm, $today),
                                     ]);
                                 }
                             }
@@ -9234,7 +9271,8 @@ class RiderController extends Controller
                         'gap_km' => $gap,
                         'prev_value' => $prev['value'],
                         'prev_date' => $prev['date'],
-                        'message' => \App\Services\Riders\WorkJourneyService::continuityMessage($prev, $gap),
+                        // ⭐ Sep-30: Roman Urdu, and says when it counts as off-duty.
+                        'message' => $wj->continuityPrompt((int) $user->id, $prev, (int) $gap, $today),
                     ]);
                 }
             }
@@ -13907,9 +13945,18 @@ class RiderController extends Controller
             // is company-funded fuel, so the rider seeing his own number is the
             // cheapest form of accountability. Own-bike riders get nothing extra —
             // their off-shift riding is their own business.
-            $bikeUsage = null;
-            if ($this->ridesCompanyBike($user->id)) {
-                $bikeUsage = $this->monthBikeUsage($user->id, $startDate, $endDate);
+            // ⭐⭐ Sep-30 — THE ENGINE'S NUMBER, not a second sum. This block used to chain his
+            //   own readings inside the month (`monthBikeUsage`), which missed the first night
+            //   of every month, threw away a two-machine day, and showed OWN-bike km as company
+            //   off-duty (Danish 360 vs the office's 379; Asim 305 on his own bike). Same keys
+            //   (days/work_km/offduty_km/total_km/offduty_pct), so the INSTALLED APK draws the
+            //   corrected figures with no update; `nights` is additive for the next APK.
+            //   Shown when he had a company machine THIS MONTH, not by what he holds today.
+            // ⚠ The engine has no opinion on him (or is off) ⇒ the old path, exactly as before.
+            $bikeUsage = $this->engineBikeUsage($user->id, substr($startDate, 0, 7));
+            if ($bikeUsage === false) {
+                $bikeUsage = $this->ridesCompanyBike($user->id)
+                    ? $this->monthBikeUsage($user->id, $startDate, $endDate) : null;
             }
 
             return response()->json([
@@ -22462,6 +22509,15 @@ class RiderController extends Controller
                 $meterMissMap = (new \App\Services\Riders\DayChecksService())
                     ->meterMissDays($allUserIds, $startDate, $effectiveEndDate);
             } catch (\Throwable $e) { $meterMissMap = []; }
+            // Off-duty km per company-machine rider, from the ONE engine (web Month tab parity).
+            $offDutyByUser = [];
+            try {
+                $odEng = new \App\Services\Riders\MachineAttribution();
+                foreach (array_keys($odEng->month(substr($startDate, 0, 7))['riders'] ?? []) as $odUid) {
+                    $cm = $odEng->companyMonth((int) $odUid, substr($startDate, 0, 7));
+                    if ($cm && $cm['had_company']) $offDutyByUser[(int) $odUid] = $cm;
+                }
+            } catch (\Throwable $e) { $offDutyByUser = []; }
 
             foreach ($users as $user) {
                 // Resolve shift using ShiftResolutionService (same as web) for accurate shift times
@@ -22595,6 +22651,10 @@ class RiderController extends Controller
                     'checkin_flag_days'  => (int) ($inFlagMap[$user->user_id]['days'] ?? 0),
                     'checkout_flag_days' => (int) ($outFlagMap[$user->user_id]['days'] ?? 0),
                     'meter_missed_days'  => (int) ($meterMissMap[$user->user_id]['days'] ?? 0),
+                    // ⭐ Sep-30 — the web Month tab's "Off-duty km" (same engine). Additive: the
+                    //   installed APK ignores both keys; the next APK renders them.
+                    'offduty_km'     => $offDutyByUser[$user->user_id]['offduty_km'] ?? null,
+                    'offduty_nights' => $offDutyByUser[$user->user_id]['nights'] ?? [],
                     'total_hours' => round($totalHours, 1),
                     'working_days' => $workingDays,
                     'attendance_percentage' => $workingDays > 0 ? round(($presentDays / $workingDays) * 100, 1) : 0,

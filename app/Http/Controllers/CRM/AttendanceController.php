@@ -3030,8 +3030,28 @@ class AttendanceController extends Controller
             $meterMissMap = (new \App\Services\Riders\DayChecksService())
                 ->meterMissDays(array_keys($byUser), $startDate, $effectiveEndDate);
         } catch (\Throwable $e) { $meterMissMap = []; }
+        // ⭐ Sep-30 — OFF-DUTY KM, from the ONE engine the Bikes page reads (MachineAttribution):
+        //   company machines only, custody-checked, ≤1 km rounding dropped. The number and the
+        //   night list are the Bikes page's own, so the two screens cannot disagree.
+        //   null = no company machine this month (the cell prints "–"). Guarded / non-fatal.
+        $offDutyEngine = null;
+        try {
+            $offDutyEngine = new \App\Services\Riders\MachineAttribution();
+            $offDutyEngine->month(substr($startDate, 0, 7));   // warm the one cached build
+        } catch (\Throwable $e) { $offDutyEngine = null; }
         // Also add absent day records to the daily array for easier tracking
         foreach ($byUser as $userId => &$userData) {
+            $userData['offduty_km'] = null;
+            $userData['offduty_nights'] = [];
+            if ($offDutyEngine) {
+                try {
+                    $cm = $offDutyEngine->companyMonth((int) $userId, substr($startDate, 0, 7));
+                    if ($cm && $cm['had_company']) {
+                        $userData['offduty_km'] = $cm['offduty_km'];
+                        $userData['offduty_nights'] = $cm['nights'];
+                    }
+                } catch (\Throwable $e) { /* the column stays "–" */ }
+            }
             // Full leave dates count 1; half-days count 0.5 (matches the yearly counter).
             $userData['leave_days'] = count($userData['leave_dates']) + 0.5 * count($userData['half_dates']);
             $userData['half_days'] = count($userData['half_dates']);

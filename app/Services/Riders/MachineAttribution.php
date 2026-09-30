@@ -80,6 +80,23 @@ class MachineAttribution
     private const TTL = 120;
 
     /**
+     * ⭐ Bumped with the Sep-30 off-duty rules: the cached array gained keys (jitter_km,
+     *   company_offduty_km, from_meter …). A new key means a page loaded in the two minutes
+     *   after an upload can never read an old-shape array that lacks them.
+     */
+    private const CACHE_KEY = 'machine_attr:v2:';
+
+    /** How far back to look for the rider who made a machine's month-opening reading. */
+    private const OPENING_LOOKBACK_DAYS = 60;
+
+    /** [vehicle_id][user_id] => list of [from, to|null] assignment windows, loaded once. */
+    private static ?array $windows = null;
+
+    /** Memo of `jitterKm()` / `custodyOn()` per process. */
+    private static ?float $jitterMemo = null;
+    private static ?bool $custodyMemo = null;
+
+    /**
      * Everything, for one month, cached. Shape:
      *
      *   vehicles[vid] = ['legs'=>[], 'days'=>[], 'totals'=>[], 'span'=>?int,
@@ -89,7 +106,7 @@ class MachineAttribution
      */
     public function month(string $month, bool $fresh = false): array
     {
-        $key = 'machine_attr:' . $month;
+        $key = self::CACHE_KEY . $month;
         if ($fresh) Cache::forget($key);
 
         return Cache::remember($key, self::TTL, function () use ($month) {
@@ -130,7 +147,8 @@ class MachineAttribution
                 $mine = $l['user_id'] === $userId
                      || $l['from_user'] === $userId || $l['to_user'] === $userId;
                 if (!$mine) continue;
-                $out[$l['date']][] = $l + ['vehicle_label' => $v['label']];
+                $out[$l['date']][] = $l + ['vehicle_label' => $v['label'],
+                                           'vehicle_is_company' => !empty($v['is_company'])];
             }
         }
         ksort($out);
@@ -139,7 +157,268 @@ class MachineAttribution
 
     public function flush(string $month): void
     {
-        Cache::forget('machine_attr:' . $month);
+        Cache::forget(self::CACHE_KEY . $month);
+        Cache::forget('machine_attr:' . $month);   // the pre-v2 key, in case it is still warm
+        self::$windows = null;
+    }
+
+    // =================================================================
+    // ⭐⭐ OFF-DUTY — THE ONE ANSWER EVERY SCREEN PRINTS (Sep-30 2026)
+    // =================================================================
+    //
+    // Owner rulings of 30-Sep:
+    //   1. Only a COMPANY machine (bike or van) produces off-duty km. An own bike never does.
+    //   2. A stretch is his only if he made both readings AND the machine was his on every
+    //      day in between (see `heldThroughout`). A handover day counts as his for BOTH men,
+    //      so a bike received mid-day, closed that night and opened next morning is his.
+    //   3. A stretch of METER_CONTINUITY_KM or less (1 km) is odometer rounding, not riding.
+    //
+    // The Bikes table, its night list, Attendance (web + phone) and the rider's own phone
+    // block all read `offDutyNights()` / the rider roll-up below, so they cannot disagree.
+
+    /**
+     * Every off-duty night this rider is charged with this month, newest first.
+     * The sum of `km` here IS his `company_offduty_km`.
+     *
+     * @return array<int, array{date:string, since:?string, km:int, from:?int, to:?int,
+     *   vehicle_id:int, vehicle_label:string, vtype:string, source:?string, home:bool, tail:bool}>
+     */
+    public function offDutyNights(int $userId, string $month, bool $fresh = false): array
+    {
+        $out = [];
+        foreach ($this->month($month, $fresh)['vehicles'] ?? [] as $vid => $v) {
+            if (empty($v['is_company'])) continue;
+            foreach ($v['legs'] as $l) {
+                if (!self::isChargedOffDuty($l, $userId)) continue;
+                // `since` only when the stretch spans MORE than one night (a day off between),
+                // so an ordinary night never reads "(since yesterday)". `from_date` is exact.
+                $since = $l['since'] ?? null;
+                $multi = $since !== null
+                    && Carbon::parse($since)->diffInDays(Carbon::parse($l['date'])) > 1;
+                $out[] = [
+                    'date'          => $l['date'],
+                    'since'         => $multi ? $since : null,
+                    'from_date'     => $since,
+                    'km'            => (int) $l['km'],
+                    'from'          => $l['from_meter'] ?? null,
+                    'to'            => $l['to_meter'] ?? null,
+                    'vehicle_id'    => (int) $vid,
+                    'vehicle_label' => $v['label'],
+                    'vtype'         => $v['vtype'] ?? 'bike',
+                    // where the reading that ENDED the stretch was taken:
+                    // home | checkin | manager | log | null
+                    'source'        => $l['to_source'] ?? null,
+                    'home'          => !empty($l['home']),
+                    'tail'          => !empty($l['tail']),
+                ];
+            }
+        }
+        usort($out, fn ($a, $b) => [$b['date'], $b['vehicle_id']] <=> [$a['date'], $a['vehicle_id']]);
+        return $out;
+    }
+
+    /**
+     * His month on COMPANY machines only — what the rider's own "Company bike this month"
+     * block and the Attendance column show. Null when the engine has nothing on him.
+     */
+    public function companyMonth(int $userId, string $month, bool $fresh = false): ?array
+    {
+        $r = $this->forRider($userId, $month, $fresh);
+        if (!$r) return null;
+        $work = 0; $days = 0;
+        foreach ($r['machines'] as $m) {
+            if (empty($m['is_company'])) continue;
+            $work += (int) $m['work_km'];
+            $days += (int) $m['days'];
+        }
+        $nights = $this->offDutyNights($userId, $month);
+        $off = array_sum(array_column($nights, 'km'));
+        return [
+            'had_company' => !empty($r['had_company']),
+            'work_km'     => $work,
+            'offduty_km'  => $off,
+            'days'        => $days,
+            'nights'      => $nights,
+        ];
+    }
+
+    /** One leg: is it off-duty charged to this rider, above the rounding threshold? */
+    private static function isChargedOffDuty(array $l, int $userId): bool
+    {
+        return $l['kind'] === 'off_duty' && $l['user_id'] === $userId
+            && $l['km'] > self::jitterKm();
+    }
+
+    /** Stretches this short are meter rounding. Same config as the morning check. */
+    public static function jitterKm(): float
+    {
+        if (self::$jitterMemo !== null) return self::$jitterMemo;
+        try {
+            $v = (new WorkJourneyService())->continuityKm();
+        } catch (\Throwable $e) {
+            $v = 1.0;
+        }
+        return self::$jitterMemo = max(0.0, (float) $v);
+    }
+
+    /**
+     * Rollback valve for the custody rule: `OFFDUTY_CUSTODY = 'N'` in t_fin_config puts
+     * every stretch back to "same rider both ends = his", without an upload.
+     */
+    private static function custodyOn(): bool
+    {
+        if (self::$custodyMemo !== null) return self::$custodyMemo;
+        try {
+            $v = DB::table('t_fin_config')->where('config_key', 'OFFDUTY_CUSTODY')->value('config_value');
+            return self::$custodyMemo = strtoupper(trim((string) ($v ?? 'Y'))) !== 'N';
+        } catch (\Throwable $e) {
+            return self::$custodyMemo = true;
+        }
+    }
+
+    /**
+     * ⭐⭐ WAS THE MACHINE HIS ON EVERY DAY STRICTLY BETWEEN TWO OF HIS READINGS?
+     *
+     * The two end days need no check: he took a reading on this machine on each, which is
+     * evidence of custody in itself (that is also why a handover day is "his" for both men).
+     * Only the reading-less days in between are asked, and a day is his when an assignment
+     * window of THIS machine covers it (release day and assign day inclusive) or the
+     * resolver — day override, open assignment, usual machine — says he was on it.
+     *
+     * Real case this exists for: the van, 4 → 9 Sep. Rajab held it 3–5 Sep and again from
+     * the 9th; on 6–8 Sep it was assigned to nobody, so those 41 km are not his.
+     *
+     * ⚠ Fails OPEN (true) on any error: an unanswerable question must never move kilometres.
+     */
+    public function heldThroughout(int $userId, int $vehicleId, ?string $fromDate, string $toDate): bool
+    {
+        if ($fromDate === null || !self::custodyOn()) return true;
+        try {
+            $c = Carbon::parse($fromDate)->addDay();
+            $end = Carbon::parse($toDate);
+            if ($c->gte($end)) return true;
+
+            $wins = self::windowsFor($vehicleId, $userId);
+            $overrides = null;
+            while ($c->lt($end)) {
+                $d = $c->format('Y-m-d');
+                $held = false;
+                foreach ($wins as [$wf, $wt]) {
+                    if ($wf <= $d && ($wt === null || $wt >= $d)) { $held = true; break; }
+                }
+                if (!$held) {
+                    // The manager's explicit day override also puts him on it.
+                    // ⚠ NOT the profile's "usual machine": it is a convenience mirror that can
+                    //   go stale, and it would hand him a van for a day nobody gave it to him.
+                    $overrides = $overrides ?? self::overrideDays($userId, $vehicleId);
+                    $held = isset($overrides[$d]);
+                }
+                if (!$held) return false;
+                $c->addDay();
+            }
+            return true;
+        } catch (\Throwable $e) {
+            Log::warning('heldThroughout failed', ['user' => $userId, 'vehicle' => $vehicleId, 'error' => $e->getMessage()]);
+            return true;
+        }
+    }
+
+    /** Days a manager put this rider on this machine by day-override, as a date set. */
+    private static function overrideDays(int $userId, int $vehicleId): array
+    {
+        static $memo = [];
+        $k = $userId . '|' . $vehicleId;
+        if (isset($memo[$k])) return $memo[$k];
+        try {
+            $dates = DB::table('t_ops_attendance')
+                ->where('user_id', $userId)->where('vehicle_id', $vehicleId)
+                ->pluck('attendance_date')->all();
+        } catch (\Throwable $e) {
+            $dates = [];
+        }
+        $set = [];
+        foreach ($dates as $d) $set[substr((string) $d, 0, 10)] = true;
+        return $memo[$k] = $set;
+    }
+
+    /** Assignment windows of one machine for one rider (all loaded in ONE query). */
+    private static function windowsFor(int $vehicleId, int $userId): array
+    {
+        if (self::$windows === null) {
+            self::$windows = [];
+            try {
+                foreach (DB::table(VehicleService::T_ASSIGN)
+                            ->get(['vehicle_id', 'user_id', 'assigned_on', 'released_on']) as $a) {
+                    self::$windows[(int) $a->vehicle_id][(int) $a->user_id][] = [
+                        substr((string) $a->assigned_on, 0, 10),
+                        $a->released_on ? substr((string) $a->released_on, 0, 10) : null,
+                    ];
+                }
+            } catch (\Throwable $e) {
+                self::$windows = [];
+            }
+        }
+        return self::$windows[$vehicleId][$userId] ?? [];
+    }
+
+    /**
+     * WHO WROTE DOWN THIS MACHINE'S READING `$value`, the last time before `$beforeDate`?
+     *
+     * Used for the stretch that opens a month (the walk starts from a bare number) and for
+     * the rider's morning prompt (is "last night's meter" his own, or the previous keeper's?).
+     * Looks at attendance readings — a stamped reading must name this machine, an unstamped
+     * one must fall on a day the resolver puts him on it — then at manager meter logs.
+     *
+     * @return null|array{user_id:int, date:string}  null = cannot tell (callers keep the old answer)
+     */
+    public function readingOwner(int $vehicleId, int $value, string $beforeDate): ?array
+    {
+        try {
+            $before = Carbon::parse($beforeDate)->subDay()->format('Y-m-d');
+            $lo = Carbon::parse($beforeDate)->subDays(self::OPENING_LOOKBACK_DAYS)->format('Y-m-d');
+            $stamped = VehicleService::stampsAvailable();
+            $cols = ['meter_start', 'meter_end', 'meter_home'];
+
+            $rows = DB::table('t_ops_attendance')
+                ->whereBetween('attendance_date', [$lo, $before])
+                ->where(function ($q) use ($value) {
+                    $q->where('meter_start', $value)->orWhere('meter_end', $value)->orWhere('meter_home', $value);
+                })
+                ->orderByDesc('attendance_date')
+                ->get(array_merge(['user_id', 'attendance_date'], $cols,
+                    $stamped ? ['meter_start_vehicle_id', 'meter_end_vehicle_id', 'meter_home_vehicle_id'] : []));
+
+            $resolver = new VehicleResolver();
+            foreach ($rows as $r) {
+                $d = substr((string) $r->attendance_date, 0, 10);
+                foreach ($cols as $col) {
+                    if ((int) $r->$col !== $value) continue;
+                    $stamp = $stamped ? ($r->{$col . '_vehicle_id'} ?? null) : null;
+                    $mine = $stamp !== null
+                        ? (int) $stamp === $vehicleId
+                        : $resolver->vehicleForDay((int) $r->user_id, $d) === $vehicleId;
+                    if ($mine) return ['user_id' => (int) $r->user_id, 'date' => $d];
+                }
+            }
+
+            if (\Illuminate\Support\Facades\Schema::hasTable('t_ops_vehicle_meter_log')) {
+                $log = DB::table('t_ops_vehicle_meter_log')
+                    ->where('vehicle_id', $vehicleId)
+                    ->whereBetween('log_date', [$lo, $before])
+                    ->whereNotNull('driver_user_id')
+                    ->where(function ($q) use ($value) {
+                        $q->where('meter_end', $value)->orWhere('meter_start', $value);
+                    })
+                    ->orderByDesc('log_date')
+                    ->first(['driver_user_id', 'log_date']);
+                if ($log) {
+                    return ['user_id' => (int) $log->driver_user_id, 'date' => substr((string) $log->log_date, 0, 10)];
+                }
+            }
+        } catch (\Throwable $e) {
+            Log::warning('readingOwner failed', ['vehicle' => $vehicleId, 'error' => $e->getMessage()]);
+        }
+        return null;
     }
 
     // =================================================================
@@ -331,6 +610,15 @@ class MachineAttribution
         $prev = $win['floor'] ?? null;
         $prevOwner = null;
         $prevDate  = null;
+        // ⭐ Sep-30: the month opens on a bare number, so the first stretch used to belong to
+        //   whoever read the machine first this month — even when last month's closing reading
+        //   was somebody else's. Name who wrote it (and when) so the first stretch gets the same
+        //   same-rider / handover / custody questions as every other stretch.
+        //   Unknown ⇒ both stay null ⇒ exactly the old behaviour.
+        if ($prev !== null && $isCompany && self::custodyOn()) {
+            $opener = $this->readingOwner($vehicleId, (int) $prev, $from);
+            if ($opener) { $prevOwner = $opener['user_id']; $prevDate = $opener['date']; }
+        }
         $dirty = false;
         $days  = [];
         $legs  = [];
@@ -511,7 +799,12 @@ class MachineAttribution
                     } elseif ($gap > 0) {
                         $made = $this->classifyGap(
                             $gap, $prev, $pt, $prevOwner, $prevDate, $d,
-                            $dirty, $isBoundary, $handoverByDate[$d] ?? null, $vehicleId);
+                            $dirty, $isBoundary, $handoverByDate[$d] ?? null, $vehicleId, $isCompany);
+                        // Where the reading that ENDED the stretch was taken — the night list
+                        // says "meter at home" / "typed at the office" from this.
+                        foreach ($made as $mi => $mLeg) {
+                            $made[$mi]['to_source'] = $dayOut[$pt['idx']]['start_source'] ?? null;
+                        }
                         $legs = array_merge($legs, $made);
 
                         // Stamp the stretch onto the row it arrived at, so the
@@ -524,6 +817,8 @@ class MachineAttribution
                         $dayOut[$pt['idx']]['gap_from_user'] = $lead['from_user'] ?? null;
                         $dayOut[$pt['idx']]['gap_to_user']   = $lead['to_user'] ?? null;
                         $dayOut[$pt['idx']]['gap_user_id']   = $lead['user_id'] ?? null;
+                        // A stretch across days the machine was not his: charged to nobody.
+                        $dayOut[$pt['idx']]['gap_unheld']    = !empty($lead['unheld']);
                     }
                 }
 
@@ -533,7 +828,12 @@ class MachineAttribution
                     $totals['days_counted']++;
                 }
                 if ($pt['home']) {
-                    $legs[] = $this->leg('off_duty', $pt['home'], $d, $vehicleId, $pt['user_id'], ['home' => true]);
+                    $hTo = $pt['closes'] ?? null;
+                    $legs[] = $this->leg('off_duty', $pt['home'], $d, $vehicleId, $pt['user_id'], [
+                        'home' => true,
+                        'from_meter' => $hTo !== null ? $hTo - $pt['home'] : null,
+                        'to_meter' => $hTo, 'to_source' => 'home',
+                    ]);
                 }
 
                 $close = $pt['closes'] ?? $pt['v'];
@@ -566,7 +866,8 @@ class MachineAttribution
         if ($prev !== null && $closesOn !== null && $closesOn > $prev
             && ($closesOn - $prev) <= self::MAX_GAP_KM) {
             $legs[] = $this->leg($dirty ? 'unaccounted' : 'off_duty', $closesOn - $prev,
-                $to, $vehicleId, $dirty ? null : $prevOwner, ['tail' => true]);
+                $to, $vehicleId, $dirty ? null : $prevOwner,
+                ['tail' => true, 'from_meter' => $prev, 'to_meter' => $closesOn]);
             $prev = $closesOn;
         }
 
@@ -725,8 +1026,12 @@ class MachineAttribution
                 $lines[] = ['pos' => -1, 'rank' => 0, 'type' => 'gap',
                             'kind' => $r['gap_kind'], 'km' => $r['gap_km'],
                             'since' => $r['gap_since'] ?? null,
-                            'who' => $r['gap_kind'] === 'off_duty' || $r['gap_kind'] === 'unaccounted'
+                            // ⚠ An `unheld` stretch crossed days the machine was not his, so it
+                            //   is nobody's — naming him on it would be the accusation removed.
+                            'who' => ($r['gap_kind'] === 'off_duty' || $r['gap_kind'] === 'unaccounted')
+                                     && empty($r['gap_unheld'])
                                 ? $r['keeper'] : null,
+                            'unheld' => !empty($r['gap_unheld']),
                             'from' => $this->nameFor($r['gap_from_user'] ?? null, $rows, $events),
                             'to' => $this->nameFor($r['gap_to_user'] ?? null, $rows, $events)];
             }
@@ -902,13 +1207,24 @@ class MachineAttribution
      */
     private function classifyGap(int $gap, int $prev, array $pt, ?int $prevOwner,
                                  ?string $prevDate, string $date, bool $dirty,
-                                 bool $isBoundary, ?int $handoverMeter, int $vehicleId): array
+                                 bool $isBoundary, ?int $handoverMeter, int $vehicleId,
+                                 bool $isCompany = true): array
     {
         $owner = $pt['user_id'];
-        $meta  = ['since' => ($prevDate !== null && $prevDate !== $date) ? $prevDate : null];
+        $meta  = ['since' => ($prevDate !== null && $prevDate !== $date) ? $prevDate : null,
+                  // the two readings the stretch runs between — the night list prints them
+                  'from_meter' => $prev, 'to_meter' => (int) $pt['v']];
 
-        // Same man both ends — it is simply his.
+        // Same man both ends — his, PROVIDED the machine was his on the days in between
+        // (Sep-30 owner ruling). Across days it was not assigned to him the kilometres are
+        // real but belong to nobody: 'unaccounted' with no owner, marked `unheld`.
         if ($prevOwner !== null && $owner !== null && $prevOwner === $owner) {
+            // ⚠ Company machines only: an own bike is its owner's whatever the registry says,
+            //   and it never carries an off-duty figure anyway.
+            if (!$dirty && $isCompany && !$this->heldThroughout($owner, $vehicleId, $prevDate, $date)) {
+                return [$this->leg('unaccounted', $gap, $date, $vehicleId, null,
+                    $meta + ['unheld' => true, 'unheld_user' => $owner])];
+            }
             return [$this->leg($dirty ? 'unaccounted' : 'off_duty', $gap, $date,
                 $vehicleId, $dirty ? null : $owner, $meta)];
         }
@@ -918,9 +1234,9 @@ class MachineAttribution
             && $prevOwner !== null && $owner !== null) {
             return [
                 $this->leg('on_duty', $handoverMeter - $prev, $date, $vehicleId, $prevOwner,
-                    $meta + ['from_handover' => true]),
+                    array_merge($meta, ['from_handover' => true, 'to_meter' => $handoverMeter])),
                 $this->leg('on_duty', $pt['v'] - $handoverMeter, $date, $vehicleId, $owner,
-                    $meta + ['from_handover' => true]),
+                    array_merge($meta, ['from_handover' => true, 'from_meter' => $handoverMeter])),
             ];
         }
 
@@ -936,7 +1252,20 @@ class MachineAttribution
                 $meta + ['from_user' => $prevOwner, 'to_user' => $owner])];
         }
 
-        // One end unknown (a claim-only day, the opening anchor): treat as before.
+        // ⭐ Sep-30 owner ruling: a stretch is his only when BOTH readings are his. On a company
+        //   machine, a stretch that STARTS on a reading nobody is named on (a manager log with
+        //   no driver, a claim filed by nobody) is therefore nobody's. The van, 17 → 19 Aug:
+        //   148 km from a driverless log reading, charged to Rajab until now.
+        // ⚠ Only when that earlier reading is known to exist this month ($prevDate). The
+        //   month-opening anchor whose writer could not be found keeps the old answer, so a
+        //   failed lookup can never empty someone's month.
+        if ($isCompany && $prevOwner === null && $prevDate !== null && $owner !== null
+            && self::custodyOn()) {
+            return [$this->leg('unaccounted', $gap, $date, $vehicleId, null,
+                $meta + ['unheld' => true, 'unheld_user' => $owner, 'unknown_start' => true])];
+        }
+
+        // One end unknown (the opening anchor): treat as before.
         return [$this->leg($dirty ? 'unaccounted' : 'off_duty', $gap, $date,
             $vehicleId, $dirty ? null : $owner, $meta)];
     }
@@ -948,6 +1277,7 @@ class MachineAttribution
             'kind' => $kind, 'km' => $km, 'date' => $date,
             'vehicle_id' => $vehicleId, 'user_id' => $userId,
             'from_user' => null, 'to_user' => null, 'since' => null,
+            'from_meter' => null, 'to_meter' => null, 'to_source' => null,
         ], $meta);
     }
 
@@ -997,6 +1327,9 @@ class MachineAttribution
                     'user_id' => $uid, 'name' => $names[$uid] ?? null,
                     'work_km' => 0, 'offduty_km' => 0, 'shared_km' => 0,
                     'transfer_km' => 0, 'unattributed_km' => 0, 'no_meter_days' => 0,
+                    // ⭐ Sep-30: meter rounding (≤ jitterKm) kept apart from off-duty, and the
+                    //   off-duty that counts — company machines only.
+                    'jitter_km' => 0, 'company_offduty_km' => 0, 'had_company' => false,
                     'machines' => [], 'days' => [],
                 ];
             }
@@ -1008,6 +1341,7 @@ class MachineAttribution
                     'vtype' => $vtype === 'van' ? 'van' : 'bike',
                     'work_km' => 0, 'offduty_km' => 0, 'shared_km' => 0,
                     'transfer_km' => 0, 'unattributed_km' => 0, 'days' => 0,
+                    'jitter_km' => 0,
                     'fuel_rs' => 0.0, 'maint_rs' => 0.0,
                     'fuel_pending_rs' => 0.0, 'maint_pending_rs' => 0.0,
                     // ⚠ false = this machine's odometer chain has a hole this month
@@ -1030,8 +1364,15 @@ class MachineAttribution
                 if (isset($map[$l['kind']]) && $l['user_id'] !== null) {
                     $uid = $l['user_id'];
                     $touch($riders, $uid, $vid, $v['label'], $v['is_company'], $v['vtype'] ?? 'bike');
-                    $riders[$uid][$map[$l['kind']]] += $l['km'];
-                    $riders[$uid]['machines'][$vid][$map[$l['kind']]] += $l['km'];
+                    $field = $map[$l['kind']];
+                    // ⭐ ≤ 1 km between two of his readings is odometer rounding (owner, 30-Sep).
+                    //   Kept in its own bucket so the machine still adds up to its odometer.
+                    if ($field === 'offduty_km' && $l['km'] <= self::jitterKm()) $field = 'jitter_km';
+                    $riders[$uid][$field] += $l['km'];
+                    $riders[$uid]['machines'][$vid][$field] += $l['km'];
+                    if ($field === 'offduty_km' && !empty($v['is_company'])) {
+                        $riders[$uid]['company_offduty_km'] += $l['km'];
+                    }
                     continue;
                 }
                 // Shared and transfer name BOTH men and are charged to neither.
@@ -1081,6 +1422,8 @@ class MachineAttribution
             $r['reconciles'] = true;
             foreach ($r['machines'] as $m) {
                 if (!$m['reconciles']) $r['reconciles'] = false;
+                // He had a company machine this month — so he HAS an off-duty figure (maybe 0).
+                if (!empty($m['is_company'])) $r['had_company'] = true;
             }
             $r['machines'] = array_values($r['machines']);
             // The bike he did most of his riding on reads as his main one.
