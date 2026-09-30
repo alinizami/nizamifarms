@@ -2413,6 +2413,73 @@ function rrMidRunText(c){
     if(c.avg_shift_min != null && c.avg_shift_min !== 0) parts.push('~'+rrSigned(c.avg_shift_min)+' min');
     return parts.join(' · ');
 }
+// The store re-dispatched a route the rider HAD dispatched himself (Sep-2026) —
+// told once per rider instead of "dispatch by X" on every order, which read as
+// "the rider never pressed". c = one entry of r.store_redispatches.
+function rrStoreText(c){
+    const who = c.by_name || 'Store';
+    const verb = c.kind === 'retime' ? ' re-timed ' : (c.kind === 'next' ? ' sent the next wave ' : ' changed the route ');
+    const parts = ['↻ '+who+verb+rrHhmm(c.at)];
+    if(c.kind === 'retime'){
+        parts.push('same route');
+    } else if(c.kind === 'next'){
+        // new orders only — nothing was re-timed
+    } else {
+        const bits = [];
+        if(rrNum(c.added)) bits.push(c.added+' added');
+        if(rrNum(c.removed)) bits.push(c.removed+' removed');
+        if(c.reordered) bits.push('re-ordered');
+        if(bits.length) parts.push(bits.join(', '));
+    }
+    parts.push(c.order_count+' order'+(c.order_count===1?'':'s'));
+    if(c.shift_min != null && c.shift_min !== 0) parts.push(rrSigned(c.shift_min)+' min');
+    if(c.prior_at) parts.push((c.prior_by_self ? 'rider had dispatched ' : 'after '+(c.prior_by_name || 'store')+"'s ")+rrHhmm(c.prior_at)+(c.prior_by_self ? '' : ' dispatch'));
+    const where = rrOriginText(c);
+    if(where) parts.push(where);
+    return parts.join(' · ');
+}
+// Where the times were measured from and where he was (only on presses logged
+// after eta_log_origin_sep2026.sql): "timed from office — he was 13.4 km out".
+function rrOriginText(c){
+    const src = c.origin_source || '';
+    if(!src) return '';
+    const d = rrNum(c.rider_distance_m);
+    const out = d != null && d > 300 ? ' — he was '+rrDist(d)+' out' : (d != null ? ' — he was at the office' : '');
+    const fromOffice = /^(store|office)/.test(src);
+    return (fromOffice ? 'timed from office' : 'timed from his location') + (fromOffice ? out : '');
+}
+// How that wave's deliveries did against the RIDER's own times (the ones the
+// store replaced). {late, max, min, rated}
+function rrStoreOwnLate(c, r){
+    const s = {late:0, min:null, max:null, rated:0};
+    if(c.kind !== 'retime') return s;   // a re-route is a new plan — judged on it alone
+    (r.orders||[]).forEach(o => {
+        if(o.wave !== c.batch_ts) return;
+        const own = rrNum(o.own_late_minutes);
+        if(own == null) return;
+        s.rated++;
+        if(own > rrCfg.late_manager_minutes){
+            s.late++;
+            s.min = s.min == null ? own : Math.min(s.min, own);
+            s.max = s.max == null ? own : Math.max(s.max, own);
+        }
+    });
+    return s;
+}
+function rrStoreOwnText(s){
+    if(!s.rated) return '';
+    if(!s.late) return 'on time vs his own times too';
+    return 'vs his own times: '+s.late+' late ('+(s.min===s.max ? s.min : s.min+'–'+s.max)+' min)';
+}
+// Timing always visible next to other flags (a "dispatch by" chip used to hide it).
+// Empty when there is no ETA, or when lateness is already flagged as its own chip.
+function rrTimingChip(o){
+    const l = rrNum(o.late_minutes);
+    if(l == null || l > rrCfg.late_manager_minutes) return '';
+    // ✓ only inside the report's on-time band; a few minutes past it is shown
+    // plainly (it is below the manager's "late" flag, but it is not on time).
+    return l <= (rrCfg.late_card_minutes ?? 10) ? rrChip('✓ '+rrLate(o), 'good') : rrChip(rrLate(o), 'dim');
+}
 
 function rrInit(){
     if(!rrCurrentDate) rrCurrentDate = new Date().toISOString().split('T')[0];
@@ -2449,7 +2516,20 @@ function rrOrderIssues(o){
     const gpsOk = rrNum(o.gps_ok) === 1;
     const dist = rrNum(o.pin_distance_m);
     if(rrNum(o.was_dispatched) === 0) out.push({sev:'warn', text:'dispatch not pressed'});
-    if(rrNum(o.dispatched_by_other) === 1) out.push({sev:'warn', text:'dispatch by '+(o.dispatched_by_name || 'someone else')});
+    // Store pressed dispatch. Only a problem when the rider had NEVER dispatched
+    // these orders himself ('first', or pre-log rows with no kind). A store
+    // re-time / re-route of a route he HAD dispatched is told once at rider
+    // level (rrStoreText); here the order only carries "vs his own time".
+    const sk = o.store_kind;
+    if(rrNum(o.dispatched_by_other) === 1 && sk !== 'retime' && sk !== 'reroute' && sk !== 'next'){
+        out.push({sev:'warn', text:'dispatch by '+(o.dispatched_by_name || 'someone else')+(sk==='first'?' (rider didn\'t press)':'')});
+    }
+    // Only for a pure re-time: after a genuine route change his old times belong
+    // to a different plan, so comparing against them would blame him for it.
+    const own = rrNum(o.own_late_minutes);
+    if(sk === 'retime' && own != null && o.eta_pre_store){
+        out.push({sev:'info', text:'his own time '+rrHhmm(o.eta_pre_store)+': '+(own>0 ? own+' min late' : (own===0?'on time':(-own)+' min early'))});
+    }
     if(late != null && late > rrCfg.late_manager_minutes) out.push({sev:'warn', text: late+' min late'});
     // The delivery time moved AFTER it was promised. "X min late" above is measured
     // against the PROMISE, so without this a manager sees "42 min late" on an order
@@ -2489,8 +2569,12 @@ function rrRiderIssueItems(r){
     // on-route stops (orders waiting) always show; idle stops only when long (≥15 min)
     const stopItems = (r.stops||[]).filter(s =>
         rrNum(s.on_board) > 0 || s.context==='on_route' || rrNum(s.min) >= 15);
+    // Store re-times/re-routes/next waves: listed for a rider who is shown, as
+    // context. Owner ruling (28-Sep): lateness is judged against the store's new
+    // times, so "vs his own times" is information and never by itself an issue.
+    const storeRows = (r.store_redispatches||[]).map(c => ({c, own: rrStoreOwnLate(c, r)}));
     return {items, stopItems, oddRoutes:(r.odd_routes||[]), missed:(r.missed_dispatch||null),
-            midRuns:(r.mid_run_changes||[])};
+            midRuns:(r.mid_run_changes||[]), storeRows};
 }
 function rrHasIssues(r){
     const {items, stopItems, oddRoutes, missed, midRuns} = rrRiderIssueItems(r);
@@ -2539,7 +2623,7 @@ function rrRenderIssues(){
     flagged.sort((a,b)=> rrSeverityRank(b) - rrSeverityRank(a));
 
     box.innerHTML = flagged.map(r => {
-        const {items, stopItems, oddRoutes, missed, midRuns} = rrRiderIssueItems(r);
+        const {items, stopItems, oddRoutes, missed, midRuns, storeRows} = rrRiderIssueItems(r);
         const missedHtml = missed ? `<div style="display:flex;gap:8px;align-items:baseline;flex-wrap:wrap;font-size:13px;padding:2px 0;">
                     <span style="min-width:130px;color:#6b7280;">dispatch</span>${rrMissedChips(missed)}
                 </div>` : '';
@@ -2548,9 +2632,17 @@ function rrRenderIssues(){
                     ${rrChip(rrMidRunText(c),'warn')}
                     <span style="font-family:monospace;font-size:12px;color:#6b7280;">${rrHhmm(c.at)}</span>
                 </div>`).join('');
+        const storeHtml = storeRows.map(({c, own}) => {
+            const ownTxt = rrStoreOwnText(own);
+            return `<div style="display:flex;gap:8px;align-items:baseline;flex-wrap:wrap;font-size:13px;padding:2px 0;">
+                    <span style="min-width:130px;color:#6b7280;">re-dispatch</span>
+                    ${rrChip(rrEsc(rrStoreText(c)),'info')}
+                    ${ownTxt ? rrChip(ownTxt, own.late ? 'dim' : 'good') : ''}
+                </div>`;
+        }).join('');
         const rowsHtml = items.map(it => {
             const o = it.order;
-            const chips = it.issues.map(x => rrChip(x.text, x.sev) + (x.map ? ` <a href="#" onclick="rrOpenMap(${o.order_id});return false;" style="font-size:12px;color:#2E64A6;text-decoration:none;">🗺️ verified vs pressed</a>` : '')).join(' ');
+            const chips = rrTimingChip(o) + ' ' + it.issues.map(x => rrChip(x.text, x.sev) + (x.map ? ` <a href="#" onclick="rrOpenMap(${o.order_id});return false;" style="font-size:12px;color:#2E64A6;text-decoration:none;">🗺️ verified vs pressed</a>` : '')).join(' ');
             return `<div style="display:flex;gap:8px;align-items:baseline;flex-wrap:wrap;font-size:13px;padding:2px 0;">
                         <b style="min-width:130px;">${rrEsc(o.customer_name||'—')}</b>
                         <span style="font-family:monospace;font-size:11.5px;color:#2E64A6;min-width:70px;">${rrEsc(o.order_number||'')}</span>
@@ -2637,7 +2729,7 @@ function rrRenderIssues(){
                             <a href="#" onclick="openDispatchDetail(${r.user_id});return false;" style="font-size:12px;color:#2E64A6;text-decoration:none;border:1px solid #C4D3E2;border-radius:4px;padding:1px 8px;background:#EEF4FA;">🚀 dispatch detail</a>
                         </span>
                     </div>
-                    <div style="margin-top:5px;">${missedHtml}${midRunHtml}${rowsHtml}${stopsHtml}${oddHtml}${checkoutHtml}${bikeGraceHtml}${officeCheckoutHtml}${homeHtml}</div>
+                    <div style="margin-top:5px;">${missedHtml}${midRunHtml}${storeHtml}${rowsHtml}${stopsHtml}${oddHtml}${checkoutHtml}${bikeGraceHtml}${officeCheckoutHtml}${homeHtml}</div>
                 </div>`;
     }).join('');
 
@@ -2678,7 +2770,7 @@ function rrRenderCards(){
         const rows = (r.orders||[]).map(o => {
             const iss = rrOrderIssues(o);
             const real = iss.filter(x=>x.sev!=='info'), info = iss.filter(x=>x.sev==='info');
-            const chips = (real.length ? real.map(x=>rrChip(x.text,x.sev)).join(' ') : rrChip('✓ '+(rrLate(o)||'ok'),'good')) + ' ' + info.map(x=>rrChip(x.text,x.sev)).join(' ');
+            const chips = (real.length ? rrTimingChip(o)+' '+real.map(x=>rrChip(x.text,x.sev)).join(' ') : (rrTimingChip(o) || rrChip('✓ ok','good'))) + ' ' + info.map(x=>rrChip(x.text,x.sev)).join(' ');
             return `<div style="display:flex;gap:8px;align-items:baseline;flex-wrap:wrap;font-size:13px;padding:4px 0;border-bottom:1px solid #f3f4f6;">
                         <span style="font-family:monospace;font-size:11.5px;color:#2E64A6;min-width:74px;">${rrEsc(o.order_number)}</span>
                         <b style="min-width:130px;">${rrEsc(o.customer_name||'—')}</b>
@@ -2750,10 +2842,9 @@ function rrRenderTimeline(events){
         if(e.kind==='delivery'){
             const o=e.order, iss=rrOrderIssues(o);
             const real=iss.filter(x=>x.sev!=='info'), info=iss.filter(x=>x.sev==='info');
-            chips = (real.length ? real.map(x=>rrChip(x.text,x.sev)+(x.map?` <a href="#" onclick="rrOpenMap(${o.order_id});return false;" style="font-size:11px;color:#2E64A6;text-decoration:none;">🗺️</a>`:'')).join(' ')
-                                 : rrChip('✓ '+(rrLate(o)||'ok'),'good')) + ' ' + info.map(x=>rrChip(x.text,x.sev)).join(' ');
-            color = real.length ? (real.some(x=>x.sev==='crit')?'#B3362B':'#A8730F') : '#2E7D4F';
-            title = `<b>${rrEsc(o.customer_name||'—')}</b> <span style="font-family:monospace;font-size:11px;color:#2E64A6;">${rrEsc(o.order_number)}</span>`;
+            chips = (real.length ? rrTimingChip(o)+' '+real.map(x=>rrChip(x.text,x.sev)+(x.map?` <a href="#" onclick="rrOpenMap(${o.order_id});return false;" style="font-size:11px;color:#2E64A6;text-decoration:none;">🗺️</a>`:'')).join(' ')
+                                 : (rrTimingChip(o) || rrChip('✓ ok','good'))) + ' ' + info.map(x=>rrChip(x.text,x.sev)).join(' ');
+            color = real.length ? (real.some(x=>x.sev==='crit')?'#B3362B':'#A8730F') : '#2E7D4F';            title = `<b>${rrEsc(o.customer_name||'—')}</b> <span style="font-family:monospace;font-size:11px;color:#2E64A6;">${rrEsc(o.order_number)}</span>`;
         } else if(e.kind==='stop'){
             const known = rrNum(e.is_unknown)!==1;
             const onRoute = e.context==='on_route' || rrNum(e.on_board)>0;
@@ -2767,6 +2858,42 @@ function rrRenderTimeline(events){
             chips = e.remote ? rrChip('remote'+(e.dist_m?' · '+rrDist(e.dist_m)+' from base':''),'warn') : rrChip('at base','dim');
         } else if(e.kind==='checkout'){
             color='#B3362B'; title='Check-out'; chips='';
+        } else if(e.kind==='dispatch'){
+            // Who pressed, and what it was — so a store re-time never reads as
+            // the rider forgetting (Sep-2026).
+            const n = e.order_count+' order'+(e.order_count===1?'':'s');
+            const who = rrEsc(e.by_name || 'store');
+            color = '#2E64A6';
+            if(e.by_self){
+                title = '🚀 Dispatched — '+n;
+                chips = rrChip('pressed by the rider','dim');
+            } else {
+                const sk = e.dispatch_kind;
+                if(sk==='retime'){
+                    title = '↻ '+who+' re-timed the route — '+n;
+                    chips = rrChip('same route','info') + (e.shift_min ? ' '+rrChip(rrSigned(e.shift_min)+' min','info') : '');
+                } else if(sk==='next'){
+                    title = '↻ '+who+' sent the next wave — '+n;
+                    chips = rrChip('new orders, rider had dispatched his own wave','dim');
+                } else if(sk==='reroute'){
+                    title = '↻ '+who+' changed the route — '+n;
+                    const bits = [];
+                    if(rrNum(e.added)) bits.push(e.added+' added');
+                    if(rrNum(e.removed)) bits.push(e.removed+' removed');
+                    if(e.reordered) bits.push('re-ordered');
+                    chips = bits.length ? rrChip(bits.join(', '),'info') : '';
+                } else {
+                    title = '🚀 Dispatched by '+who+' — '+n;
+                    chips = rrChip("rider didn't press",'warn');
+                }
+                if(e.after_cancel) chips += ' '+rrChip('cleared & re-dispatched','dim');
+            }
+            const where = rrOriginText(e);
+            if(where) chips += ' '+rrChip(rrEsc(where),'dim');
+        } else if(e.kind==='cancel'){
+            color = '#6b7280';
+            title = '✖ Times cleared'+(e.by_self ? ' by the rider' : ' by '+rrEsc(e.by_name || 'store'))+' — '+e.order_count+' order'+(e.order_count===1?'':'s');
+            chips = '';
         }
         return `<div style="position:relative; padding:7px 0 7px 24px;">
             <span style="position:absolute; left:-7px; top:10px; width:11px; height:11px; border-radius:50%; background:${color}; border:2px solid #fff;"></span>

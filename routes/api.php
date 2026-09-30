@@ -892,6 +892,7 @@ Route::middleware('auth:sanctum')->group(function () {
         // ⭐ Calculate delivery ETAs for rider's out_for_delivery orders (manual trigger)
         Route::post('/{riderId}/calculate-delivery-etas', [\App\Http\Controllers\API\RiderController::class, 'calculateDeliveryEtas']);
         Route::post('/{riderId}/cancel-dispatch', [\App\Http\Controllers\API\RiderController::class, 'cancelDispatch']); // ⭐ Clear ETAs to merge dispatch waves
+        Route::get('/{riderId}/dispatch-preview', [\App\Http\Controllers\API\RiderController::class, 'dispatchPreview']); // 🧭 Sep-2026: where is he + ping age, before the store dispatches
         Route::post('/{riderId}/optimize-route', [\App\Http\Controllers\API\RiderController::class, 'optimizeRoute']);
         Route::get('/{riderId}/route-lock', [\App\Http\Controllers\API\RiderController::class, 'getRouteLock']); // ⭐ Read-only: who set this route (rider info prompt)
         Route::post('/{riderId}/route-lock', [\App\Http\Controllers\API\RiderController::class, 'lockRoute']);

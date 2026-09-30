@@ -456,14 +456,25 @@ class VehicleService
                 $types = [];
             }
 
+            // ⭐ A bill that pays for several jobs of one visit reads as all of them
+            //   (29-Sep-2026) — the same label every claim list prints.
+            $combined = [];
+            try {
+                $combined = app(ServiceRecordService::class)->jobLabelsForClaims(
+                    $rows->filter(fn ($r) => $r->expense_category === 'Maintenance')
+                         ->map(fn ($r) => (int) $r->id)->values()->all());
+            } catch (\Throwable $e) {
+                $combined = [];
+            }
+
             return $rows
                 ->sortByDesc(fn ($r) => [substr((string) ($r->expense_date ?: $r->created_at), 0, 10), $r->id])
                 ->values()
-                ->map(function ($r) use ($types, $hasVehicleCol) {
+                ->map(function ($r) use ($types, $hasVehicleCol, $combined) {
                     $kind = $r->expense_category === 'Petrol' ? '⛽ Fuel' : '🔧 Maintenance';
                     if ($r->expense_category === 'Maintenance') {
-                        $named = isset($r->maintenance_type_id) && $r->maintenance_type_id
-                            ? ($types[$r->maintenance_type_id] ?? null) : null;
+                        $named = $combined[(int) $r->id] ?? (isset($r->maintenance_type_id) && $r->maintenance_type_id
+                            ? ($types[$r->maintenance_type_id] ?? null) : null);
                         if ($named) $kind = '🔧 ' . $named;
                     }
                     return [
@@ -1405,7 +1416,9 @@ class VehicleService
         // Cached across requests on the same terms as the schedule (same version key,
         // meter in the key) — this is what keeps MyVehicle brief mode a cheap read.
         // Keeper is in the key because the legacy fallback consults his profile.
-        $overKey = 'svc_over_' . $vehicleId . '|' . ($currentMeter ?? '-') . '|'
+        // ⚠ `svc_over2_` (29-Sep-2026): the chip's rule changed (every scheduled job, not only
+        //   oil services), so a chip cached under the old rule must not outlive the upload.
+        $overKey = 'svc_over2_' . $vehicleId . '|' . ($currentMeter ?? '-') . '|'
             . ($keeperUserId ?? '-') . '|' . self::evidenceVersion($vehicleId);
         try {
             $cached = Cache::get($overKey);
@@ -1452,7 +1465,21 @@ class VehicleService
         $rank  = ['overdue' => 0, 'due_soon' => 1, 'ok' => 2];
         if ($currentMeter !== null) {
             foreach ($this->serviceScheduleFor($vehicleId, $currentMeter) as $t) {
-                if (empty($t['resets_clock'])) continue;
+                /**
+                 * ⭐⭐ EVERY SCHEDULED JOB SPEAKS FOR THE CHIP (owner, 29-Sep-2026: "what's the
+                 *    overall clock, since the bikes get alerts for individual services?").
+                 *
+                 * ⚠⚠ This used to consider only `resets_clock` jobs — a leftover from the
+                 *    one-clock era. With per-job countdowns it made the summary chip and the
+                 *    alerts disagree: bike "Oil Change" (12-Sep, un-ticked) alerted as overdue
+                 *    while the chip beside it read "641 km left". The chip is now the most urgent
+                 *    of exactly the jobs `BikeServiceAlerts` raises — same schedule rows, same
+                 *    worst-state-first ranking — so the two can never disagree. A brake job can
+                 *    never hide an overdue oil change: overdue always outranks due-soon.
+                 * ⚠ `resets_service_clock` keeps ONE meaning, "oil service": a bigger oil service
+                 *   covers a smaller one (the covers rule), and the old-era fallback below.
+                 */
+                if (empty($t['has_schedule'])) continue;
                 $isTime = ($t['basis'] ?? 'km') === MaintenanceTypeModel::BASIS_TIME;
                 $left   = $isTime ? ($t['due_in_days'] ?? null) : ($t['due_in_km'] ?? null);
                 if ($left === null) continue;
@@ -3870,8 +3897,15 @@ class VehicleService
     public static function rowNeedsAmount(array $row): bool
     {
         if (empty($row['manual']))                     return false;   // a claim is already money
-        if (!empty($row['bill_id']))                   return false;   // a live bill exists
-        if ((float) ($row['amount'] ?? 0) > 0)         return false;   // it has a figure
+        /**
+         * ⚠⚠ ONLY A LIVE BILL SETTLES IT (pre-deploy C1, 29-Sep-2026). `bill_id` stays on the row
+         *    whatever the claim's fate, so a REJECTED or CANCELLED bill used to switch the nag off
+         *    — and its Rs figure (which never cleared) counted as "it has a figure". `bill_live`
+         *    is the one live-status rule; a row built without it keeps the old reading.
+         */
+        $live = array_key_exists('bill_live', $row) ? !empty($row['bill_live']) : !empty($row['bill_id']);
+        if ($live)                                     return false;   // a live bill exists
+        if (empty($row['bill_id']) && (float) ($row['amount'] ?? 0) > 0) return false;   // it has a figure
         $d = substr((string) ($row['date'] ?? ''), 0, 10);
         return $d !== '' && $d >= self::AMOUNT_NAG_FROM;
     }
@@ -3934,6 +3968,9 @@ class VehicleService
                  *   reach. `log_id` vs `req_id` is what tells the UI which door to open.
                  */
                 'req_id'   => isset($c['id']) ? (int) $c['id'] : null,
+                // ⭐ C1 (29-Sep-2026): the row IS a bill — does it still stand? Same rule as a
+                //   job row's `bill_live`, so a visit total can leave rejected money out.
+                'bill_live' => in_array((string) ($c['status'] ?? ''), ServiceRecordService::LIVE_BILL_STATUSES, true),
                 /**
                  * ⭐ WHICH KIND OF SPEND THIS IS (owner ask, 3-Sep) — so the page can separate
                  *   scheduled upkeep from things breaking, and the filter chips have something
@@ -3943,6 +3980,11 @@ class VehicleService
                  *   rows genuinely say nothing about which kind of work they paid for.
                  */
                 'bucket'   => self::bucketOfClaim($c, $bucketMap),
+                // ⭐ The visit this bill belongs to (29-Sep-2026) — same machine, day and
+                //   odometer — so separately-billed jobs of one trip sit under one header.
+                'visit_key' => $c['meter'] !== null
+                    ? 'v' . $vehicleId . '|' . $c['date'] . '|' . (int) $c['meter']
+                    : 'c' . (int) ($c['id'] ?? 0),
             ], $rows);
 
             /**
@@ -4036,6 +4078,15 @@ class VehicleService
                         'req_id'  => null,
                         // ⭐ Its bill, if one was filed with it — what makes the pair one row.
                         'bill_id' => isset($m->request_id) && $m->request_id ? (int) $m->request_id : null,
+                        /**
+                         * ⭐ …and whether that bill still STANDS (pre-deploy C1, 29-Sep-2026).
+                         *   `bill_id` is kept as it was for every installed APK, but it survives
+                         *   a rejected or cancelled claim, so it cannot answer "is this paid for?".
+                         *   This can — the ONE live-status rule (`LIVE_BILL_STATUSES`) — and the
+                         *   screens offer "Add the bill" again and nag for the amount when false.
+                         */
+                        'bill_live' => isset($m->request_id) && $m->request_id
+                            && in_array((string) ($m->bill_status ?? ''), ServiceRecordService::LIVE_BILL_STATUSES, true),
                         // ⚠ WHOSE service this is. A bill belongs to a requester, so "Add the
                         //   bill" cannot open the form without it — and the machine's keeper
                         //   today may not be the man the work was recorded against.
@@ -4044,6 +4095,11 @@ class VehicleService
                         // says otherwise — same map, so the chips agree with the cost tiles.
                         'bucket'  => $m->maintenance_type_id && isset($bucketMap[$m->maintenance_type_id])
                                         ? $bucketMap[$m->maintenance_type_id] : 'regular',
+                        // ⭐ ONE VISIT = same machine, day and odometer (29-Sep-2026) — the key
+                        //   `ServiceRecordService::visitKeyOf` derives, so screens group jobs the
+                        //   way the engine does and a correction knows what it moves together.
+                        'visit_key' => 'v' . $vehicleId . '|' . $d . '|' . (int) $m->meter,
+                        'bill_amount' => isset($m->bill_amount) ? (float) $m->bill_amount : null,
                     ];
                 }
             }
@@ -4057,7 +4113,63 @@ class VehicleService
             foreach ($out as &$row) { $row['needs_amount'] = self::rowNeedsAmount($row); }
             unset($row);
 
-            usort($out, fn ($a, $b) => strcmp((string) $b['date'], (string) $a['date']));
+            /**
+             * 🧾 A JOB WHOSE VISIT ALREADY HAS A LIVE BILL IS NOT NAGGED (owner ask, 29-Sep-2026).
+             *    "+ Add a job" after the bill went in (Chain Set beside Oil + Tuning, one receipt)
+             *    left the new job reading "amount needed" for ever, although the visit's money was
+             *    on file. It now says which bill the visit has instead (`visit_bill_id`); "Add the
+             *    bill" stays on the visit for the rare job that really had its own receipt.
+             * ⚠ Only a LIVE bill (pending/approved) — a rejected one settles nothing, so its
+             *   visit keeps nagging. A claim row is itself a bill, so it counts too.
+             */
+            $visitBill = [];
+            foreach ($out as $r) {
+                if (empty($r['visit_key']) || empty($r['bill_live'])) continue;
+                $bid = !empty($r['manual']) ? ($r['bill_id'] ?? null) : ($r['req_id'] ?? null);
+                if ($bid && !isset($visitBill[$r['visit_key']])) $visitBill[$r['visit_key']] = (int) $bid;
+            }
+            foreach ($out as &$row) {
+                $row['visit_bill_id'] = null;
+                if (!empty($row['needs_amount']) && !empty($row['visit_key']) && isset($visitBill[$row['visit_key']])) {
+                    $row['needs_amount']  = false;
+                    $row['visit_bill_id'] = $visitBill[$row['visit_key']];
+                }
+            }
+            unset($row);
+
+            /**
+             * ⭐⭐ ONE BILL, SEVERAL JOBS — THE MONEY IS SHOWN ONCE (29-Sep-2026). A receipt that
+             *    paid for a whole visit is linked from every job it covers, and the join above
+             *    hands each of them the full amount. Left alone, a Rs 5,200 visit would read as
+             *    Rs 15,600 on the page. The first job keeps `amount`; the others carry the same
+             *    `bill_id` (so none is ever nagged for a figure) with amount 0, and every row
+             *    says how many jobs its bill covers.
+             */
+            $billJobs = [];
+            foreach ($out as $r) {
+                if (!empty($r['log_id']) && !empty($r['bill_id'])) $billJobs[(int) $r['bill_id']][] = (int) $r['log_id'];
+            }
+            foreach ($out as &$row) {
+                $row['visit_key']   = $row['visit_key'] ?? null;
+                $row['bill_covers'] = 1;
+                if (!empty($row['log_id']) && !empty($row['bill_id']) && count($billJobs[(int) $row['bill_id']]) > 1) {
+                    $ids = $billJobs[(int) $row['bill_id']];
+                    $row['bill_covers'] = count($ids);
+                    if ((int) $row['log_id'] !== min($ids)) $row['amount'] = 0.0;
+                }
+            }
+            unset($row);
+
+            // Newest first; the jobs of one visit stay together (same key), oldest record first.
+            usort($out, function ($a, $b) {
+                $c = strcmp((string) $b['date'], (string) $a['date']);
+                if ($c !== 0) return $c;
+                $c = ((int) ($b['meter'] ?? 0)) <=> ((int) ($a['meter'] ?? 0));
+                if ($c !== 0) return $c;
+                $c = strcmp((string) ($a['visit_key'] ?? ''), (string) ($b['visit_key'] ?? ''));
+                if ($c !== 0) return $c;
+                return ((int) ($a['log_id'] ?? $a['req_id'] ?? 0)) <=> ((int) ($b['log_id'] ?? $b['req_id'] ?? 0));
+            });
 
             return array_slice($out, 0, $limit);
         } catch (\Throwable $e) {
@@ -4379,12 +4491,12 @@ class VehicleService
     }
 
     /**
-     * @param  ?int $ignoreServiceLogId  ⭐ A service record being CORRECTED must not bound
+     * @param  int|int[]|null $ignoreServiceLogId  ⭐ A service record being CORRECTED must not bound
      *         itself (Sep-20 2026). Re-dating log #28 from 15-Sep to 19-Sep would otherwise be
      *         judged against a floor that log #28's own old row had set. Only the service-log
      *         source honours it — nothing else in this window is a service record.
      */
-    public function meterWindowFor(int $vehicleId, string $date, ?int $ignoreServiceLogId = null): ?array
+    public function meterWindowFor(int $vehicleId, string $date, $ignoreServiceLogId = null): ?array
     {
         if (!$this->available()) return null;
 
@@ -4398,7 +4510,7 @@ class VehicleService
         //   evidence-derived, so a reading saved mid-request must invalidate it.
         // ⚠ The ignored row is part of the key: the same (machine, date) with and
         //   without it are two different answers.
-        $memoKey = $vehicleId . '|' . substr($date, 0, 10) . ($ignoreServiceLogId ? '|!' . $ignoreServiceLogId : '');
+        $memoKey = $vehicleId . '|' . substr($date, 0, 10) . (ServiceRecordService::normaliseIds($ignoreServiceLogId) ? '|!' . implode(',', ServiceRecordService::normaliseIds($ignoreServiceLogId)) : '');
         if (array_key_exists($memoKey, self::$windowMemo)) {
             return self::$windowMemo[$memoKey];
         }
@@ -4555,7 +4667,7 @@ class VehicleService
                     $svcBefore = 0; $svcAfter = null;
                     foreach (DB::table('t_fleet_service_log')
                                 ->whereNotNull('meter')->where('meter', '>', self::MIN_METER)
-                                ->when($ignoreServiceLogId, fn ($q) => $q->where('id', '<>', $ignoreServiceLogId))
+                                ->when(ServiceRecordService::normaliseIds($ignoreServiceLogId), fn ($q, $ids) => $q->whereNotIn('id', $ids))
                                 ->orderByDesc('meter')->limit(120)
                                 ->get(array_merge(['id', 'user_id', 'meter', 'service_date'],
                                                   ServiceRecordService::logVehicleCols())) as $sl) {

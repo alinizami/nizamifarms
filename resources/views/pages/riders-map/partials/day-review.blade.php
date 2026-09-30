@@ -486,8 +486,8 @@ function drRenderOrders() {
             });
             if (!idxs.length) return;
             html += '<div class="dr-wave"><b>' +
-                (w.dispatched_at ? '🚀 Dispatched ' + drHm(w.dispatched_at) : '📋 Never dispatched') +
-                '</b><span>' + w.orders + ' order' + (w.orders === 1 ? '' : 's') +
+                (w.dispatched_at ? '🚀 Dispatched ' + drHm(w.dispatched_at) + drWaveWho(w) : '📋 Never dispatched') +
+                '</b><span>' + drWaveStory(w) + w.orders + ' order' + (w.orders === 1 ? '' : 's') +
                 (w.late ? ' · ' + w.late + ' late' : '') +
                 (w.seq_checked
                     ? ' · sequence followed ' + w.seq_followed + '/' + w.seq_checked +
@@ -506,12 +506,43 @@ function drRenderOrders() {
     list.innerHTML = hasRows ? html : (html + '<div class="dr-empty">Nothing matches that filter.</div>');
 }
 
+// Who pressed this wave (Sep-2026): nothing when the rider did, " by Taimur" when
+// the store did.
+function drWaveWho(w) {
+    if (w.by_self !== false || !w.by_name) return '';
+    return ' by ' + drEsc(w.by_name);
+}
+// What a store press WAS — a re-time/re-route of a route the rider had already
+// dispatched, or a first dispatch he never pressed. Ends with ' · ' when non-empty.
+function drWaveStory(w) {
+    if (w.by_self !== false) return '';
+    let s = '';
+    if (w.kind === 'retime') {
+        s = 're-time of ' + (w.prior_by_self ? "the rider's " : 'the ') + drHm(w.prior_at) + ' dispatch (same route' +
+            (w.shift_min ? ', ' + (w.shift_min > 0 ? '+' : '') + w.shift_min + ' min' : '') + ')';
+    } else if (w.kind === 'reroute') {
+        s = 'changed the ' + drHm(w.prior_at) + ' route';
+    } else if (w.kind === 'next') {
+        s = 'next wave, sent by the store';
+    } else if (w.kind === 'first') {
+        s = "rider didn't press";
+    }
+    if (s && w.after_cancel) s += ', cleared & re-dispatched';
+    return s ? drEsc(s) + ' · ' : '';
+}
+
+// The first time is the OUT-FOR-DELIVERY status stamp, not the dispatch press
+// (that is the wave header) — labelled as such so the two never look contradictory.
 function drTimeLine(o) {
     const d = o.dispatched_at ? drHm(o.dispatched_at) : null;
     const e = o.eta_at ? drHm(o.eta_at) : null;
     let s = '';
-    s += d ? 'dispatched ' + d : 'dispatch not pressed';
+    // No out-for-delivery stamp is not the same as "not dispatched" — trust was_dispatched.
+    s += d ? 'out for delivery ' + d : (o.was_dispatched ? 'dispatched' : 'dispatch not pressed');
     s += ' → ' + (e ? 'promised ' + e : 'no promise');
+    if (o.eta_pre_store && o.store_kind === 'retime') {
+        s += " (rider's own " + drHm(o.eta_pre_store) + ')';
+    }
     s += ' → delivered ' + drHm(o.delivered_at);
     return s;
 }
@@ -521,7 +552,7 @@ function drOutLine(f) {
     // would read as "dispatched this morning" — say the date when it isn't today.
     const d = f.dispatched_at ? drWhen(f.dispatched_at) : null;
     const e = f.eta_at ? drWhen(f.eta_at) : null;
-    let s = d ? 'dispatched ' + d : 'dispatch not pressed';
+    let s = d ? 'out for delivery ' + d : (f.was_dispatched ? 'dispatched' : 'dispatch not pressed');
     s += ' → ' + (e ? 'promised ' + e : 'no promise') + ' → still out';
     return s;
 }
@@ -596,14 +627,26 @@ function drRenderDrawer() {
                  (o.was_dispatched ? '' : ', because dispatch was never pressed') + '.';
     } else if (o.late_minutes > 0) {
         timing = 'Delivered <b>' + drHm(o.delivered_at) + '</b> — ' + o.late_minutes +
-                 ' min after the ' + promised + ' promise' + (disp ? ' (dispatched ' + disp + ')' : '') + '.';
+                 ' min after the ' + promised + ' promise' + (disp ? ' (out for delivery ' + disp + ')' : '') + '.';
     } else {
         timing = 'Delivered <b>' + drHm(o.delivered_at) + '</b> — ' +
                  (o.late_minutes === 0 ? 'exactly on the' : Math.abs(o.late_minutes) + ' min before the') +
-                 ' ' + promised + ' promise' + (disp ? ' (dispatched ' + disp + ')' : '') + '.';
+                 ' ' + promised + ' promise' + (disp ? ' (out for delivery ' + disp + ')' : '') + '.';
     }
-    v += drVerdict('🕒', timing, o.eta_retimed ? 'The promise was re-timed during the run' +
-        (o.eta_retimed_by_rider ? ' by the rider himself — judged against the original.' : ' by the store, so the yardstick moved.') : '');
+    let timingWhy = o.eta_retimed ? 'The promise was re-timed during the run' +
+        (o.eta_retimed_by_rider ? ' by the rider himself — judged against the original.' : ' by the store, so the yardstick moved.') : '';
+    // The store re-dispatched a route the rider had dispatched himself: say who,
+    // and how it went against the rider's OWN time (Sep-2026).
+    const storeWho = o.dispatched_by_name ? drEsc(o.dispatched_by_name) : 'The store';
+    if (o.store_kind === 'retime' && o.eta_pre_store && o.own_late_minutes !== null) {
+        const om = o.own_late_minutes;
+        timingWhy = storeWho + ' re-timed this route (same stops, same order) after the rider had dispatched it. ' +
+            "Against the rider's own " + drHm(o.eta_pre_store) + ' time it was ' +
+            (om > 0 ? om + ' min late' : (om === 0 ? 'on time' : Math.abs(om) + ' min early')) + '.';
+    } else if (o.store_kind === 'reroute') {
+        timingWhy = storeWho + ' changed this route after the rider had dispatched it, so it is judged against the new plan.';
+    }
+    v += drVerdict('🕒', timing, timingWhy);
 
     if (drCanForensics) {
         // 2 — did he reach the customer's pin?

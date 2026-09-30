@@ -220,7 +220,7 @@
                         @endif
                         <input type="number" name="meter_at_fill" id="meter_at_fill" class="kt-input" placeholder="Odometer at the service (km)" min="0" max="9999999" step="1" style="display: none;">
                         <p class="text-xs text-gray-500 mt-1" id="bike-service-hint" style="display: none;">
-                            A <b>Regular service</b> with the odometer resets the bike's service-due clock on approval. A Repair never does.
+                            A <b>Regular service</b> with the odometer resets that job's own countdown on approval. A Repair never does.
                         </p>
                     </div>
 
@@ -575,8 +575,8 @@ function updateBikeServiceFields() {
         if (mf) mf.style.display = show ? 'block' : 'none';
         if (hint) {
             hint.style.display = show ? 'block' : 'none';
-            hint.innerHTML = 'A <b>Regular service</b> with the odometer resets the '
-                + "bike's service-due clock on approval. A Repair never does.";
+            hint.innerHTML = 'A <b>Regular service</b> with the odometer resets that '
+                + "job's own countdown on approval. A Repair never does.";
         }
     } else {
         if (st) st.value = '';

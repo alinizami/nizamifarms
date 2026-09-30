@@ -128,6 +128,22 @@ class RiderDayReportService
         //    dispatch log (no cron, no detection gap); empty before the log exists.
         $midRunChanges = EtaPromiseService::midRunChanges($userId, $date);
 
+        // ⭐ Who pressed what (Sep-2026): the store re-timing or re-routing a route
+        //    the rider HAD dispatched is not "the rider didn't press". Each order
+        //    carries its wave's kind; the whole log feeds the Timeline.
+        $dispatchLog = EtaPromiseService::dayDispatchLog($userId, $date, $tz);
+        $kindByBatch = [];
+        foreach ($dispatchLog as $a) {
+            if ($a['type'] === 'dispatch') $kindByBatch[$a['batch_ts']] = $a['kind'];
+        }
+        foreach ($orders as &$o) {
+            $o['store_kind'] = ($o['dispatched_by_other'] && $o['_wave'] !== null)
+                ? ($kindByBatch[(string) $o['_wave']] ?? null) : null;
+        }
+        unset($o);
+        $storeRedispatches = array_values(array_filter($dispatchLog,
+            fn ($a) => $a['type'] === 'dispatch' && in_array($a['kind'], ['retime', 'reroute', 'next'], true)));
+
         $day = $this->aggregateDay($userId, $riderName, $date, $orders, $stops, $gaps, $oddRoutes, $midRunChanges);
 
         // Checkout audit: did he check out AT his last delivery point, when that point
@@ -137,7 +153,8 @@ class RiderDayReportService
         // shape order rows for storage
         $orderRows = array_map(fn ($o) => $this->orderRow($o), $orders);
 
-        return ['day' => $day, 'orders' => $orderRows, 'stops' => $stops, 'gaps' => $gaps, 'odd_routes' => $oddRoutes, 'checkout' => $checkout, 'mid_run_changes' => $midRunChanges];
+        return ['day' => $day, 'orders' => $orderRows, 'stops' => $stops, 'gaps' => $gaps, 'odd_routes' => $oddRoutes, 'checkout' => $checkout, 'mid_run_changes' => $midRunChanges,
+                'dispatch_log' => $dispatchLog, 'store_redispatches' => $storeRedispatches];
     }
 
     /**
@@ -298,6 +315,9 @@ class RiderDayReportService
                 'eta_retimed'      => $promise['retimed'] ?? false,
                 'eta_retimed_by_rider' => $promise['retimed_by_rider'] ?? false,
                 'eta_promise_is_store' => $promise['promise_is_store'] ?? null,
+                // What the rider's OWN dispatch had promised before the store
+                // re-dispatched (null when the store never stepped in).
+                'eta_pre_store' => $promise['pre_store_promised_at'] ?? null,
                 '_wave'         => $r->wave,                      // dispatch wave key (eta_calculated_at)
                 // who pressed dispatch: self, or someone else did it for them
                 'dispatched_by_other' => ($r->wave !== null && (int) $r->dispatched_by_id !== $userId) ? 1 : 0,
@@ -378,6 +398,11 @@ class RiderDayReportService
             $o['late_minutes'] = null;
             $o['on_time'] = null;
         }
+        // Against the rider's own times, when the store re-timed him — shown
+        // alongside, never used for on_time/late_minutes.
+        $o['own_late_minutes'] = !empty($o['eta_pre_store'])
+            ? (int) round(($o['_del_ts'] - strtotime($o['eta_pre_store'])) / 60)
+            : null;
 
         // pin vs verified — VerifiedPinRule is the ONE implementation of this verdict; the
         // store's Delivered Orders screen and the dispatch tracker now ask the same class, so
@@ -689,6 +714,12 @@ class RiderDayReportService
             // did it for them because the rider forgot).
             'dispatched_by_other' => $o['dispatched_by_other'],
             'dispatched_by_name'  => $o['dispatched_by_name'],
+            // Sep-2026: WHAT the store's press was — 'first' (rider never pressed),
+            // 'retime' (same route, new times), 'reroute' (route changed); null when
+            // the rider pressed himself or the order predates the dispatch log.
+            'store_kind'       => $o['store_kind'] ?? null,
+            'eta_pre_store'    => $o['eta_pre_store'] ?? null,
+            'own_late_minutes' => $o['own_late_minutes'] ?? null,
             'flags_json'    => json_encode([]),
             'order_id'      => $o['order_id'],
         ];

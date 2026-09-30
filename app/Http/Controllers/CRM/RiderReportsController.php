@@ -96,7 +96,7 @@ class RiderReportsController extends Controller
         if (!$user || !$user->hasPermission(self::PERMISSION)) {
             return response()->json(['success' => false, 'message' => 'Not authorised'], 403);
         }
-        return $this->buildTimeline($request, $svc);
+        return $this->buildTimeline($request, $svc, true);
     }
 
     /** Mobile entry — gated by the mobile permission. */
@@ -106,11 +106,13 @@ class RiderReportsController extends Controller
         if (!$user || !$user->hasMobilePermission(self::PERMISSION)) {
             return response()->json(['success' => false, 'message' => 'Not authorised'], 403);
         }
-        return $this->buildTimeline($request, $svc);
+        // Dispatch rows only when the app asks: an APK that predates them draws an
+        // unknown event kind as an empty row.
+        return $this->buildTimeline($request, $svc, $request->boolean('with_dispatch'));
     }
 
     /** Merge a rider's day into one time-sorted event list. */
-    private function buildTimeline(Request $request, RiderDayReportService $svc)
+    private function buildTimeline(Request $request, RiderDayReportService $svc, bool $withDispatch = false)
     {
         try {
             $window = (int) config('rider_reports.live_window_days', 7);
@@ -175,6 +177,22 @@ class RiderReportsController extends Controller
                     'map_url' => $s['map_url'] ?? null, '_sort' => $s['_from_ts'] ?? strtotime("$date {$s['from']}"),
                 ];
             }
+            // dispatch presses + cancels (who, what kind) — the Sep-2026 dispatch story.
+            // A cancel the same person immediately re-dispatched is folded into
+            // that dispatch row ("cleared and re-dispatched"), not shown twice.
+            $dispatchLog = !$withDispatch ? [] : ($rep['dispatch_log']
+                ?? \App\Services\Riders\EtaPromiseService::dayDispatchLog($rid, $date, $tz));
+            foreach ($dispatchLog as $a) {
+                if ($a['type'] === 'cancel' && !empty($a['merged'])) continue;
+                // the log's own 'kind' (self/first/retime/reroute) moves to
+                // dispatch_kind — 'kind' is the timeline's event type.
+                $events[] = array_merge($a, [
+                    'dispatch_kind' => $a['kind'] ?? null,
+                    'kind' => $a['type'] === 'dispatch' ? 'dispatch' : 'cancel',
+                    'time' => date('H:i', strtotime($a['at'])),
+                    '_sort' => strtotime($a['at']),
+                ]);
+            }
             // GPS gaps
             foreach ($rep['gaps'] as $g) {
                 $events[] = [
@@ -237,6 +255,9 @@ class RiderReportsController extends Controller
                 // had already been promised them. First-class (not just inside
                 // day.flags_json) so clients don't have to parse that blob.
                 'mid_run_changes' => $rep['mid_run_changes'] ?? [],
+                // The store re-timed / re-routed a route he HAD dispatched (Sep-2026).
+                // One rider-level line instead of "dispatch by X" on every order.
+                'store_redispatches' => $rep['store_redispatches'] ?? [],
                 'missed_dispatch' => null,
             ];
         }
@@ -614,11 +635,40 @@ class RiderReportsController extends Controller
                 ->select('m.*', 'u.fullname')
                 ->get();
 
+            // C8: once per call, not per row (information_schema read).
+            $etaLogOk = \Illuminate\Support\Facades\Schema::hasTable('t_ops_eta_log');
+            $dayFrom = date('Y-m-d', strtotime($date)) . ' 00:00:00';
+            $dayTo   = date('Y-m-d', strtotime($date . ' +1 day')) . ' 00:00:00';
+
             $out = [];
             foreach ($rows as $r) {
                 $ids = json_decode($r->undispatched_order_ids ?: '[]', true) ?: [];
                 $resolution = ['state' => 'unknown'];
-                if (!empty($ids)) {
+                // ⭐ Sep-2026: the FIRST press after he left, from the dispatch log. The
+                //    order rows only hold the LATEST dispatch — after a cancel and
+                //    re-dispatch they read "dispatched at 12:00" for a route first
+                //    pressed at 11:53 (device walk, 29-Sep). Falls back to the order
+                //    rows below for days before the log existed.
+                $firstPress = null;
+                if (!empty($ids) && $etaLogOk) {
+                    $firstPress = DB::table('t_ops_eta_log as l')
+                        ->leftJoin('t_sys_user as du', 'du.id', '=', 'l.calculated_by')
+                        ->whereIn('l.order_id', $ids)
+                        ->where('l.event', 'dispatch')
+                        ->where('l.created_at', '>=', $r->left_at ?: $r->created_at)
+                        ->where('l.created_at', '>=', $dayFrom)   // C8: range, same rows
+                        ->where('l.created_at', '<', $dayTo)
+                        ->orderBy('l.created_at')->orderBy('l.id')
+                        ->first(['l.created_at', 'l.calculated_by', 'du.fullname as by_name']);
+                }
+                if ($firstPress) {
+                    $resolution = [
+                        'state'   => 'dispatched',
+                        'at'      => date('H:i', strtotime($firstPress->created_at)),
+                        'by_name' => $firstPress->by_name,
+                        'by_self' => (int) $firstPress->calculated_by === (int) $r->rider_id,
+                    ];
+                } elseif (!empty($ids)) {
                     $orders = DB::table('t_crm_prod_order as o')
                         ->leftJoin('t_sys_user as du', 'du.id', '=', 'o.eta_calculated_by')
                         ->whereIn('o.id', $ids)

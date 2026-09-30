@@ -29,7 +29,39 @@ use Illuminate\Support\Facades\Storage;
  */
 class ReceiptExtractionService
 {
-    public const VERSION = 'receipt@v2';
+    public const VERSION = 'receipt@v3';
+
+    /**
+     * 🤖 Sep-27 (owner): "for unmatched items use the AI to suggest which of OUR products it
+     * is". The vendor's product list — and, for a Frozen vendor, the recipe ingredients —
+     * ride along IN THE SAME CALL that reads the slip (no second call, no extra credits
+     * beyond a few hundred input tokens), and the model answers per line with one of OUR
+     * codes or "NONE".
+     *
+     * ⚠⚠ The answer is an ENUM of the codes we sent: it cannot invent a product, and a
+     *    short code cannot fall into the digit loop that NUMBER fields did. The server
+     *    checks every code against the list again anyway (cleanLines), and a person taps
+     *    to confirm every suggestion — nothing here is ever applied on its own.
+     */
+    private const MAX_HINT_PRODUCTS    = 150;
+    private const MAX_HINT_INGREDIENTS = 120;
+
+    /** @var array{products: array<int,array{id:int,name:string,unit:?string}>, ingredients: array<int,array{id:int,name:string}>}|null */
+    private ?array $hints = null;
+
+    /**
+     * What this vendor sells (and, for Frozen, what the kitchen cooks with) — sent with the
+     * next extract() so the reader can say which of OUR products each printed line is.
+     * A separate call rather than an extract() argument so a test's fake reader, which
+     * overrides extract(string $path), keeps working untouched.
+     */
+    public function withHints(?array $hints): static
+    {
+        $products = array_slice(array_values($hints['products'] ?? []), 0, self::MAX_HINT_PRODUCTS);
+        $ings     = array_slice(array_values($hints['ingredients'] ?? []), 0, self::MAX_HINT_INGREDIENTS);
+        $this->hints = ($products || $ings) ? ['products' => $products, 'ingredients' => $ings] : null;
+        return $this;
+    }
 
     // Why a read failed — the controller turns each into an honest sentence for the
     // person holding the phone. Before this there was ONE sentence ("better light") for
@@ -105,6 +137,7 @@ class ReceiptExtractionService
         $response = null;
         $parsed   = null;
         $text     = null;
+        $rejected = false;   // the previous try was refused outright (C15) — nothing was generated
 
         while ($attempt < self::MAX_ATTEMPTS) {
             $attempt++;
@@ -112,14 +145,15 @@ class ReceiptExtractionService
             $payload = [
                 'contents' => [[
                     'parts' => [
-                        ['text' => $this->prompt()],
+                        ['text' => $this->prompt() . $this->hintsPrompt()],
                         ['inline_data' => ['mime_type' => $mime, 'data' => base64_encode($bytes)]],
                     ],
                 ]],
                 'generationConfig' => [
                     // A retry nudges the temperature: the digit loop is a decoding rut, and
-                    // an identical request at 0 is the likeliest way back into it.
-                    'temperature'      => $attempt === 1 ? 0 : 0.2,
+                    // an identical request at 0 is the likeliest way back into it. A retry after
+                    // a refused (400) request generated nothing, so there is no rut: it stays at 0.
+                    'temperature'      => ($attempt === 1 || $rejected) ? 0 : 0.2,
                     'maxOutputTokens'  => self::MAX_OUTPUT_TOKENS,
                     'responseMimeType' => 'application/json',
                     'responseSchema'   => $this->responseSchema(),
@@ -152,6 +186,14 @@ class ReceiptExtractionService
                 if ($reason === self::FAIL_BUSY) {
                     continue;
                 }
+                // 🤖 C15: a 400 on a read that carried our lists is most likely the lists (an
+                //    enum the API would not take). The one retry reads the slip WITHOUT them —
+                //    the bill still reads, it just has no suggestions. A plain read's 400 is
+                //    still final, exactly as before.
+                if ($status === 400 && $this->dropHintsForRetry($attempt, 'HTTP 400')) {
+                    $rejected = true;
+                    continue;
+                }
                 return null; // no credit / refused: asking again changes nothing
             }
 
@@ -164,6 +206,9 @@ class ReceiptExtractionService
                     'tail'    => mb_substr((string) $text, -60),
                 ]);
                 $this->lastFailure = $this->failure(self::FAIL_LOOPED, 'output cap reached', 200, $started, $attempt);
+                // 🤖 C15: a long bill plus our lists can run out of room; the retry (which
+                //    happened anyway) now goes without the lists. Same cap, same count.
+                $this->dropHintsForRetry($attempt, 'MAX_TOKENS');
                 continue;
             }
 
@@ -205,6 +250,10 @@ class ReceiptExtractionService
             'model'          => $model,
             'tokens_in'      => (int) ($usage['promptTokenCount'] ?? 0),
             'tokens_out'     => (int) ($usage['candidatesTokenCount'] ?? 0),
+            // 🤖 whether the reader was shown our lists — so "no match" can be told apart
+            //    from "never asked"
+            'hinted_products'    => (bool) ($this->hints['products'] ?? false),
+            'hinted_ingredients' => (bool) ($this->hints['ingredients'] ?? false),
         ];
     }
 
@@ -287,10 +336,82 @@ TXT;
     }
 
     /**
+     * 🤖 The list the reader matches against, in the buyer's own names. Empty when there
+     * are no hints, so a vendor with no products reads exactly as before.
+     */
+    private function hintsPrompt(): string
+    {
+        if (!$this->hints) {
+            return '';
+        }
+        $name = fn ($s) => mb_substr(trim(preg_replace('/\s+/u', ' ', (string) $s)), 0, 60);
+
+        $out = '';
+        if ($this->hints['products']) {
+            $out .= "\n\nTHIS VENDOR'S PRODUCT LIST — the buyer's own names for what they buy here. "
+                . "They rarely match the printed name word for word:\n";
+            foreach ($this->hints['products'] as $p) {
+                $out .= 'P' . (int) $p['id'] . ': ' . $name($p['name'])
+                    . (!empty($p['unit']) ? ' (bought per ' . $name($p['unit']) . ')' : '') . "\n";
+            }
+            $out .= <<<'TXT'
+For EVERY line also return "match": the code of the product on this list that the line is
+the SAME ITEM as — allowing for brand names ("MAGGI CHICKEN CUBES" is chicken cubes), Urdu
+or Roman-Urdu names ("NAMAK" is salt, "CHEENI" is sugar, "ANDAY" are eggs), abbreviations
+("CHKN", "CRM CHES") and pack sizes. Return "NONE" when no product on the list is the same
+item. Never pick a product that is only related: chicken stock powder is not chicken cubes,
+whole chilli is not chilli powder, a carrier bag or a charge is NONE. When unsure, return
+"NONE" — a person picks it by hand, and a wrong guess costs more than a blank.
+TXT;
+        }
+        if ($this->hints['ingredients']) {
+            $out .= "\n\nRECIPE INGREDIENTS — what the kitchen cooks with:\n";
+            foreach ($this->hints['ingredients'] as $i) {
+                $out .= 'I' . (int) $i['id'] . ': ' . $name($i['name']) . "\n";
+            }
+            $out .= <<<'TXT'
+For EVERY line also return "ingredient": the code of the ingredient the item IS, by the
+same rule — the same thing, not something related — or "NONE" for anything else
+(a bag, a charge, a cleaning product, or anything not on the list).
+TXT;
+        }
+        return $out;
+    }
+
+    /** The codes the reader may answer with — exactly the ones sent, plus NONE. */
+    private function hintCodes(string $kind): array
+    {
+        if (!$this->hints) {
+            return [];
+        }
+        $list = $kind === 'P' ? $this->hints['products'] : $this->hints['ingredients'];
+        if (!$list) {
+            return [];
+        }
+        return array_merge(array_map(fn ($x) => $kind . (int) $x['id'], $list), ['NONE']);
+    }
+
+    /**
      * ⚠⚠ Every amount is a STRING on purpose — see MAX_OUTPUT_TOKENS. `NUMBER` is what
      *    let the model loop on digits. toAmount() reads the strings back.
      */
     private function responseSchema(): array
+    {
+        $schema = $this->baseSchema();
+        // 🤖 Only when there is a list to match against: an enum of OUR codes, so the
+        //    answer can be nothing else.
+        foreach (['match' => 'P', 'ingredient' => 'I'] as $field => $kind) {
+            $codes = $this->hintCodes($kind);
+            if ($codes) {
+                $schema['properties']['lines']['items']['properties'][$field] = [
+                    'type' => 'STRING', 'format' => 'enum', 'enum' => $codes,
+                ];
+            }
+        }
+        return $schema;
+    }
+
+    private function baseSchema(): array
     {
         return [
             'type'       => 'OBJECT',
@@ -350,10 +471,23 @@ TXT;
                     ? $l['sold_by'] : 'unknown',
                 'pack_size_value' => $this->toAmount($l['pack_size_value'] ?? null),
                 'pack_size_unit'  => $this->cleanPackUnit($l['pack_size_unit'] ?? null),
+                // 🤖 our product / ingredient id, or null — ONLY a code we sent counts
+                'ai_match'        => $this->hintId($l['match'] ?? null, 'P'),
+                'ai_ingredient'   => $this->hintId($l['ingredient'] ?? null, 'I'),
             ];
         }
 
         return $out;
+    }
+
+    /** "P82" → 82 when P82 is one of the codes we sent; anything else → null. */
+    private function hintId($code, string $kind): ?int
+    {
+        $code = strtoupper(trim((string) $code));
+        if ($code === '' || $code === 'NONE' || !in_array($code, $this->hintCodes($kind), true)) {
+            return null;
+        }
+        return (int) substr($code, 1);
     }
 
     /** Normalise the handful of size units a Pakistani receipt actually prints. */
@@ -421,6 +555,21 @@ TXT;
             return round((float) $m[0], 3);
         }
         return null;
+    }
+
+    /**
+     * 🤖 C15 (Sep-29): forget the product/ingredient lists for the rest of this read, when
+     * there are lists and a retry is still left. True when the next attempt will go without
+     * them. The attempt count is unchanged (MAX_ATTEMPTS), and so is the output cap.
+     */
+    private function dropHintsForRetry(int $attempt, string $why): bool
+    {
+        if (!$this->hints || $attempt >= self::MAX_ATTEMPTS) {
+            return false;
+        }
+        Log::warning('ReceiptExtraction: retrying without the product list', ['attempt' => $attempt, 'why' => $why]);
+        $this->hints = null;
+        return true;
     }
 
     private function reasonForStatus(int $status, string $body): string

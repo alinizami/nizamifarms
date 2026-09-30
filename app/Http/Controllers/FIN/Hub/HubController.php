@@ -821,20 +821,31 @@ class HubController extends Controller
         }
     }
 
-    /** The drawer's contents — last N entries on my tills that were not my own hand. */
+    /**
+     * The drawer's contents — one 7-day block of entries on my tills that were not my own
+     * hand. `?before=Y-m-d` (the previous page's `next_before`) = "Show earlier days", with
+     * `?since=` (the first page's `seen_since`) for its unread dots.
+     */
     public function watchList(Request $request)
     {
         $userId = (int) (auth()->id() ?? 0);
         if ($userId <= 0) {
-            return response()->json(['success' => true, 'items' => [], 'unread' => 0]);
+            return response()->json(['success' => true, 'items' => [], 'unread' => 0, 'next_before' => null]);
         }
 
-        $limit = max(1, min((int) $request->get('limit', \App\Services\FIN\LedgerWatchService::LIST_LIMIT), 50));
+        // Anything that is not a plain date is treated as "the first page", never an error.
+        $before = (string) $request->get('before', '');
+        $before = preg_match('/^\d{4}-\d{2}-\d{2}$/', $before) && strtotime($before) !== false ? $before : null;
+        // `?since=` = the first page's `seen_since`, so earlier pages keep their unread dots
+        // after the open moved the watermark (C11). Display only; the service ignores a value
+        // above the real watermark. Anything but digits → the current watermark, as before.
+        $since = (string) $request->get('since', '');
+        $since = preg_match('/^\d{1,12}$/', $since) ? (int) $since : null;
         try {
-            return response()->json(['success' => true] + app(\App\Services\FIN\LedgerWatchService::class)->recent($userId, $limit));
+            return response()->json(['success' => true] + app(\App\Services\FIN\LedgerWatchService::class)->recent($userId, $before, $since));
         } catch (\Throwable $e) {
             \Log::warning('cash pill list unavailable (SQL not run yet?)', ['error' => $e->getMessage()]);
-            return response()->json(['success' => true, 'items' => [], 'unread' => 0, 'latest_id' => 0, 'watching' => 0]);
+            return response()->json(['success' => true, 'items' => [], 'unread' => 0, 'latest_id' => 0, 'watching' => 0, 'next_before' => null]);
         }
     }
 

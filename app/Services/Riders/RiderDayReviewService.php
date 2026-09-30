@@ -156,7 +156,7 @@ class RiderDayReviewService
             : 'NULL';
 
         $rows = DB::select(
-            "SELECT o.assigned_rider_user_id AS uid,
+            "SELECT o.assigned_rider_user_id AS uid, o.id AS order_id,
                     o.estimated_delivery_at AS eta,
                     h.changed_at AS delivered_raw,
                     h.delivery_latitude AS pin_lat, h.delivery_longitude AS pin_lng,
@@ -175,9 +175,15 @@ class RiderDayReviewService
         $dayFloor = strtotime(Carbon::parse($date)->format('Y-m-d 00:00:00'));
         $out = [];
 
+        // C10 (Sep-29): rate against the PROMISE, exactly as the opened rider and Issues
+        // do (RiderDayReportService::loadOrders) — the live ETA is overwritten by every
+        // re-dispatch. ONE batched read for the whole list; pre-log orders fall back.
+        $promises = EtaPromiseService::promisesFor(array_map(fn ($r) => (int) $r->order_id, $rows));
+
         foreach ($rows as $r) {
             $delTs = strtotime($r->delivered_raw) - $secs;
             if ($delTs < $dayFloor) continue;           // same guard the report uses
+            $eta = $promises[(int) $r->order_id]['promised_at'] ?? $r->eta;
 
             $uid = (int) $r->uid;
             if (!isset($out[$uid])) {
@@ -187,8 +193,8 @@ class RiderDayReviewService
 
             $needs = false;
 
-            if (!empty($r->eta)) {
-                $late = (int) round(($delTs - strtotime($r->eta)) / 60);
+            if (!empty($eta)) {
+                $late = (int) round(($delTs - strtotime($eta)) / 60);
                 $out[$uid]['rated']++;
                 $out[$uid]['late_sum'] += max(0, $late);
                 if ($late <= (int) $this->cfg('late_card_minutes', 10)) {
@@ -214,11 +220,14 @@ class RiderDayReviewService
     private function inFlightCounts(): array
     {
         $rows = DB::select(
-            "SELECT o.assigned_rider_user_id AS uid, o.estimated_delivery_at AS eta
+            "SELECT o.assigned_rider_user_id AS uid, o.id AS order_id, o.estimated_delivery_at AS eta
                FROM t_crm_prod_order o
               WHERE o.assigned_rider_user_id IS NOT NULL
                 AND o.order_status = 'out_for_delivery'"
         );
+
+        // C10 (Sep-29): "overdue" against the PROMISE, like riderInFlight() — one batched read.
+        $promises = EtaPromiseService::promisesFor(array_map(fn ($r) => (int) $r->order_id, $rows));
 
         $now = time();
         $out = [];
@@ -226,7 +235,8 @@ class RiderDayReviewService
             $uid = (int) $r->uid;
             if (!isset($out[$uid])) $out[$uid] = ['in_flight' => 0, 'overdue' => 0];
             $out[$uid]['in_flight']++;
-            if (!empty($r->eta) && strtotime($r->eta) < $now) $out[$uid]['overdue']++;
+            $eta = $promises[(int) $r->order_id]['promised_at'] ?? $r->eta;
+            if (!empty($eta) && strtotime($eta) < $now) $out[$uid]['overdue']++;
         }
         return $out;
     }
@@ -315,7 +325,7 @@ class RiderDayReviewService
             // this, Day Review could say WHEN an order was dispatched but not
             // which batch it belonged to, nor whether the run was re-timed
             // mid-way — both of which the Tracker showed.
-            'waves'      => $this->waveSummary($orders),
+            'waves'      => $this->attachWaveStory($this->waveSummary($orders), $rep['dispatch_log'] ?? []),
             'mid_run_changes' => $rep['mid_run_changes'] ?? [],
         ];
     }
@@ -540,6 +550,34 @@ class RiderDayReviewService
         return array_values($waves);
     }
 
+    /**
+     * Who pressed each wave and what it was (Sep-2026) — so the card can say
+     * "Dispatched 6:52 PM by Taimur · re-time of Asim's 5:59 PM" instead of
+     * leaving a store press to read like the rider's own. Additive keys only.
+     */
+    private function attachWaveStory(array $waves, array $dispatchLog): array
+    {
+        $byBatch = [];
+        foreach ($dispatchLog as $a) {
+            if ($a['type'] === 'dispatch') $byBatch[$a['batch_ts']] = $a;
+        }
+        foreach ($waves as &$w) {
+            $a = $w['dispatched_at'] !== null ? ($byBatch[(string) $w['dispatched_at']] ?? null) : null;
+            if (!$a) continue;
+            $w['by_name']       = $a['by_name'];
+            $w['by_self']       = $a['by_self'];
+            $w['kind']          = $a['kind'];
+            $w['after_cancel']  = $a['after_cancel'] ?? false;
+            $w['shift_min']     = $a['shift_min'] ?? null;
+            $w['prior_at']      = $a['prior_at'] ?? null;
+            $w['prior_by_self'] = $a['prior_by_self'] ?? null;
+            $w['origin_source'] = $a['origin_source'] ?? null;
+            $w['rider_distance_m'] = $a['rider_distance_m'] ?? null;
+        }
+        unset($w);
+        return $waves;
+    }
+
     /** Orders this rider is carrying right now. */
     private function riderInFlight(int $userId): array
     {
@@ -560,16 +598,22 @@ class RiderDayReviewService
             [$userId]
         );
 
+        // C10 (Sep-29): judged against the PROMISE, like his delivered rows (eta_at) and
+        // the day list; eta_live = what the customer was last told. Pre-log → the live ETA.
+        $promises = EtaPromiseService::promisesFor(array_map(fn ($r) => (int) $r->id, $rows));
+
         $now = time();
         $out = [];
         foreach ($rows as $r) {
-            $etaTs = !empty($r->eta) ? strtotime($r->eta) : null;
+            $eta = $promises[(int) $r->id]['promised_at'] ?? $r->eta;
+            $etaTs = !empty($eta) ? strtotime($eta) : null;
             $out[] = [
                 'order_id'      => (int) $r->id,
                 'order_number'  => $r->order_number,
                 'customer_name' => trim((string) $r->customer_name),
                 'amount'        => (float) $r->total_price,
-                'eta_at'        => $r->eta,
+                'eta_at'        => $eta,
+                'eta_live'      => $r->eta,
                 'dispatched_at' => $r->ofd_at,
                 'was_dispatched'=> $r->wave !== null ? 1 : 0,
                 'planned_seq'   => $r->delivery_priority !== null ? (int) $r->delivery_priority : null,

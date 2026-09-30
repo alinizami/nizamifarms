@@ -2855,7 +2855,10 @@ function fmRender(r) {
         '<span>Fuel approved: <b>Rs ' + num(approvedRs) + '</b></span>' +
         '<span>Pending: <b>Rs ' + num(pendingRs) + '</b></span>' +
         (flags ? '<span style="color:#b45309;">⚠ <b>' + flags + '</b> flagged claim' + (flags === 1 ? '' : 's') + '</span>' : '') +
-        (r.service && r.service.state === 'overdue' ? '<span style="color:#b91c1c;">🔴 service overdue ' + num(Math.abs(r.service.due_in_km)) + ' km</span>' : '') +
+        /* ⚠ A TIME-based job can be the overdue one now (29-Sep-2026): no km figure, so the server's own phrase. */
+        (r.service && r.service.state === 'overdue' ? '<span style="color:#b91c1c;">🔴 service '
+            + ((r.service.due_in_km === null || r.service.due_in_km === undefined) && r.service.due_text
+                ? esc(r.service.due_text) : 'overdue ' + num(Math.abs(r.service.due_in_km)) + ' km') + '</span>' : '') +
         '</div>';
 
     (r.days || []).forEach(d => {

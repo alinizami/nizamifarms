@@ -354,8 +354,12 @@ if ($food) {
 LedgerWatchModel::where('user_id', SHABIB)->delete();
 $n0 = $watch->unreadCount(SHABIB);
 ok('with no watermark, the backdated Rs 150k payment is unread', $n0 > 0, true, true);
-$list = $watch->recent(SHABIB, 10);
-ok('the drawer shows at most 10', count($list['items']) <= 10, true, true);
+$list = $watch->recent(SHABIB);
+// C11: with no watermark the unread floor is "the last 7 × 24 h", so the block may reach one
+// day further back (to the oldest unread day) — never more.
+ok('the drawer shows only the last 7 typed days (+ the day of the oldest unread row)',
+    $list['from'] >= now()->subDays(7)->toDateString()
+    && collect($list['items'])->every(fn ($i) => $i['day'] >= $list['from']), true, true);
 $first = collect($list['items'])->firstWhere('id', (int) $late->id);
 ok('…and the incident row is in it', is_array($first), true, true);
 ok('…attributed to Taimur', $first['who'] ?? null, 'Taimur');
@@ -366,12 +370,75 @@ ok('…and marked unread', $first['unread'] ?? null, true);
 $watch->markSeen(SHABIB, $list['latest_id']);
 ok('after viewing, the count is 0', $watch->unreadCount(SHABIB), 0);
 ok('the list still shows them (a notification you can re-read)',
-    count($watch->recent(SHABIB, 10)['items']) > 0, true, true);
+    count($watch->recent(SHABIB)['items']) > 0, true, true);
 
 // ⚠ Two tabs must not resurrect rows he has already cleared.
 $high = $watch->watermark(SHABIB);
 $watch->markSeen(SHABIB, 1);
 ok('the watermark never walks backwards', $watch->watermark(SHABIB), $high);
+
+/**
+ * ⭐ C11 (pre-deploy, Sep-29): the badge counts an unread row however old it is, but the first
+ * page used to show 7 days only — and opening marks everything read. A row typed 10 days ago
+ * was counted, never shown, then cleared. It must be ON the first page, and "Show earlier
+ * days" must keep the dots the first page drew (the drawer passes `seen_since` back).
+ */
+asUser(TAIMUR);
+$watch->markSeen(SHABIB);
+$pre = $watch->watermark(SHABIB);
+$old = LedgerModel::create([
+    'transaction_date' => now()->subDays(10)->toDateString(),
+    'transaction_type' => LedgerModel::TYPE_VENDOR_PAYMENT,
+    'description'      => 'PROOF C11 unread for 10 days',
+    'from_account_id'  => $acct->id, 'to_account_id' => 62, 'amount' => 777.00,
+    'approval_status'  => 'approved',
+]);
+app(BalancePostingService::class)->apply($old);
+$tenAgo = now()->subDays(10)->setTime(11, 0);
+DB::table('t_fin_ledger')->where('id', $old->id)->update(['created_at' => $tenAgo->format('Y-m-d H:i:s')]);
+ok('C11: a row typed 10 days ago, unread, is counted by the badge',
+    $watch->unread(SHABIB)->contains(fn ($r) => (int) $r->id === (int) $old->id), true);
+$p1 = $watch->recent(SHABIB);
+$row = collect($p1['items'])->firstWhere('id', (int) $old->id);
+ok('…and is on the FIRST page', is_array($row), true, true);
+ok('…with its unread dot', $row['unread'] ?? null, true);
+ok('…the block reaches back to its day', $p1['from'], $tenAgo->toDateString());
+ok('…whole days, newest first', collect($p1['items'])->pluck('day')->all(),
+    collect($p1['items'])->pluck('day')->sortDesc()->values()->all());
+ok('…and the page says which watermark the dots were drawn against', $p1['seen_since'], $pre);
+$watch->markSeen(SHABIB, $p1['latest_id']);        // what open() does next
+$p1b = $watch->recent(SHABIB);
+ok('once read, the first page is 7 days again', $p1b['from'], now()->subDays(6)->toDateString());
+$before = $p1b['next_before']; $pg = null; $hit = null; $pageBefore = null;
+for ($n = 0; $before && !$hit && $n < 12; $n++) {
+    $pageBefore = $before;
+    $pg = $watch->recent(SHABIB, $before, $p1['seen_since']);
+    $hit = collect($pg['items'])->firstWhere('id', (int) $old->id);
+    $before = $pg['next_before'];
+}
+ok('C11: "Show earlier days" with since= keeps the row\'s unread dot', $hit['unread'] ?? null, true);
+ok('…without since= it reads as read (the open moved the watermark)',
+    collect($watch->recent(SHABIB, $pageBefore)['items'])->firstWhere('id', (int) $old->id)['unread'] ?? null, false);
+ok('…a since= ABOVE the real watermark is ignored (display only, cannot invent dots)',
+    collect($watch->recent(SHABIB, $pageBefore, $watch->watermark(SHABIB) + 100000)['items'])
+        ->firstWhere('id', (int) $old->id)['unread'] ?? null, false);
+$ctl = app(\App\Http\Controllers\FIN\Hub\HubController::class);
+asUser(SHABIB);
+$viaHttp = $ctl->watchList(\Illuminate\Http\Request::create('/finance/hub/watch/list', 'GET',
+    ['before' => $pageBefore, 'since' => (string) $p1['seen_since']]))->getData(true);
+ok('…the endpoint passes ?since= through',
+    collect($viaHttp['items'] ?? [])->firstWhere('id', (int) $old->id)['unread'] ?? null, true);
+$junk = $ctl->watchList(\Illuminate\Http\Request::create('/finance/hub/watch/list', 'GET',
+    ['before' => $pageBefore, 'since' => '12abc']))->getData(true);
+ok('…and treats a non-number since= as "the current watermark"',
+    collect($junk['items'] ?? [])->firstWhere('id', (int) $old->id)['unread'] ?? null, false);
+// the cap: an unread row a month and more back is not dragged onto the first page
+LedgerWatchModel::where('user_id', SHABIB)->update(['last_seen_ledger_id' => $pre]);
+DB::table('t_fin_ledger')->where('id', $old->id)->update(['created_at' => now()->subDays(40)->setTime(11, 0)->format('Y-m-d H:i:s')]);
+$capped = $watch->recent(SHABIB);
+ok('C11 cap: an unread row 40 days back does not stretch the first page past 31 days',
+    [$capped['from'] >= now()->subDays(30)->toDateString(), collect($capped['items'])->contains('id', (int) $old->id)], [true, false]);
+$watch->markSeen(SHABIB);
 
 // His OWN entry must never appear in his own pill.
 asUser(SHABIB);

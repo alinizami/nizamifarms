@@ -425,7 +425,7 @@ class FuelClaimRules
      * today's odometer, and comparing to the latest rejected exactly those.
      */
     private function checkOdometer(int $userId, int $meter, string $date, ?int $vehicleId = null,
-                                   ?int $ignoreServiceLogId = null): ?string
+                                   $ignoreServiceLogId = null): ?string
     {
         $win = $this->odometerWindow($userId, $date, $vehicleId, $ignoreServiceLogId);
 
@@ -479,11 +479,11 @@ class FuelClaimRules
      * 15-Sep, carrying the 19th's 52,766 sailed in, and then bounded every honest claim from
      * the 16th onward. One rule, one definition: the service door now asks this.
      *
-     * @param  ?int $ignoreServiceLogId  the row being EDITED — it must not bound itself
+     * @param  int|int[]|null $ignoreServiceLogId  the row being EDITED — it must not bound itself
      * @return ?string  the refusal, or null when the reading sits inside the window
      */
     public function odometerObjection(int $userId, int $meter, string $date, ?int $vehicleId = null,
-                                      ?int $ignoreServiceLogId = null): ?string
+                                      $ignoreServiceLogId = null): ?string
     {
         return $this->checkOdometer($userId, $meter, $this->dateOf($date), $vehicleId, $ignoreServiceLogId);
     }
@@ -506,7 +506,7 @@ class FuelClaimRules
      * @param  string $side  'floor' (rows dated BEFORE $date) or 'ceil' (AFTER)
      */
     private function describeReading(int $userId, ?int $vehicleId, int $value, string $side,
-                                     string $date, ?int $ignoreServiceLogId = null): string
+                                     string $date, $ignoreServiceLogId = null): string
     {
         if ($value <= 0) return '';
         $op = $side === 'floor' ? '<' : '>';
@@ -536,7 +536,7 @@ class FuelClaimRules
                     ->leftJoin('t_fleet_maintenance_types as t', 't.id', '=', 'l.maintenance_type_id')
                     ->where('l.meter', $value)
                     ->where('l.service_date', $op, $date)
-                    ->when($ignoreServiceLogId, fn ($q) => $q->where('l.id', '<>', $ignoreServiceLogId));
+                    ->when(ServiceRecordService::normaliseIds($ignoreServiceLogId), fn ($q, $ids) => $q->whereNotIn('l.id', $ids));
                 $q = $hasCol('t_fleet_service_log', 'vehicle_id')
                     ? $forMachine($q, 'l.user_id', 'l.vehicle_id')
                     : $q->where('l.user_id', $userId);
@@ -693,7 +693,7 @@ class FuelClaimRules
      * forever, after which the rider can never file a correct reading again.
      */
     public function odometerWindow(int $userId, string $date, ?int $vehicleId = null,
-                                   ?int $ignoreServiceLogId = null): array
+                                   $ignoreServiceLogId = null): array
     {
         // ⭐ PHASE C: the window belongs to the MACHINE he held on that date, not
         //    to the man. Danish's first fill on DCR-799 (~24,800) must be judged
@@ -704,7 +704,19 @@ class FuelClaimRules
         try {
             $res = new VehicleResolver();
             if ($res->rulesEnabled()) {
-                $vid = $res->vehicleForDay($userId, $date);
+                /**
+                 * ⚠⚠ THE MACHINE THE CALLER NAMED WINS (29-Sep-2026, found on the device).
+                 *    Every service door passes the bike explicitly — the workshop visit, the
+                 *    vehicle card — precisely because "what was this man on that day" is the
+                 *    WRONG answer when the bike is in the workshop and he is on a spare (the
+                 *    Sep-10 "records follow the vehicle" rule). This window ignored it and asked
+                 *    the registry anyway, so a service on the bike that went in was judged
+                 *    against the spare's readings — or, for a keeper with no assignment, against
+                 *    his own attendance history ("far above this bike's last 1,663 km" for a
+                 *    machine at 29,700). `describeReading` already preferred the named machine;
+                 *    the window now agrees with its own message.
+                 */
+                $vid = $vehicleId ?: $res->vehicleForDay($userId, $date);
                 if ($vid) {
                     $win = (new VehicleService())->meterWindowFor($vid, $date, $ignoreServiceLogId);
                     if ($win !== null) return $win;
@@ -771,7 +783,7 @@ class FuelClaimRules
                                 ->where('meter', '>', self::MIN_PLAUSIBLE_METER)
                                 ->whereDate('service_date', '<', $date)
                                 // ⭐ the row being corrected must not bound itself
-                                ->when($ignoreServiceLogId, fn ($q) => $q->where('id', '<>', $ignoreServiceLogId))
+                                ->when(ServiceRecordService::normaliseIds($ignoreServiceLogId), fn ($q, $ids) => $q->whereNotIn('id', $ids))
                                 ->orderByDesc('meter')->limit(40)
                                 ->get(['meter', 'service_date']) as $sl) {
                         $d = substr((string) $sl->service_date, 0, 10);

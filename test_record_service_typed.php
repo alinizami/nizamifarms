@@ -170,8 +170,11 @@ $m3 = $baseMeter + 30;
 ok('a non-clock-resetting job is accepted', $st, 200);
 $p = DB::table('t_ops_rider_profile')->where('user_id', $rider)->first(['last_service_meter']);
 ok('  …but does NOT move the overall clock', (int) $p->last_service_meter, $m2);
-ok('  …and says so out loud',
-   (bool) preg_match('/overall service-due clock is unchanged/i', $body['message'] ?? ''), null, true);
+/* ⭐ 29-Sep-2026 (owner): there is no second "overall clock" to report on any more — every job
+     resets its OWN countdown and the bike's chip is simply the most urgent of those. So the
+     receipt names this job's own next due and never mentions an overall clock. */
+ok('  …and its receipt states the job\'s OWN next due, with no "overall clock" sentence',
+   str_contains($body['message'] ?? '', 'next due') && !preg_match('/overall/i', $body['message'] ?? ''), null, true);
 ok('  …while still writing its own log row',
    (int) DB::table('t_fleet_service_log')->orderByDesc('id')->first()->maintenance_type_id,
    (int) $nonResetting->id);
@@ -416,8 +419,9 @@ ok('both endpoints are gated on canManageService, like recording is',
    substr_count($fcSrc2, 'Not authorised to change service records'), 2);
 
 // ⭐ ONE WRITER. markServiced no longer keeps its own copy of the insert.
+// ⚠ 29-Sep-2026: the ONE writer is now `recordVisit` (several jobs per visit); `record()` wraps it.
 ok('markServiced writes through the shared recorder, not its own insert',
-   (bool) preg_match('/ServiceRecordService::class\)->record\(/', $fcSrc2), null, true);
+   (bool) preg_match('/(ServiceRecordService::class\)|\$svcRec)->record(Visit)?\(/', $fcSrc2), null, true);
 ok('  …and no second insert into the service log is left in the controller',
    substr_count($fcSrc2, "table('t_fleet_service_log')->insert"), 0);
 
@@ -966,7 +970,8 @@ $bl16 = __DIR__ . '/resources/views/pages/riders-map/partials/fleet.blade.php';
 if (is_file($bl16)) {
     $b = file_get_contents($bl16);
     ok('the vehicle page offers "Add the bill"', str_contains($b, 'flvAddBill('), true);
-    ok('  …only on rows with no live bill', str_contains($b, 's.log_id && !s.bill_id && canFix'), true);
+    // ⚠ 29-Sep-2026 (C1): the server's bill_live decides — bill_id survives a rejected claim.
+    ok('  …only on rows with no live bill', str_contains($b, 's.log_id && !flvBillLive(s) && canFix'), true);
     ok('  …and sends the chosen service', str_contains($b, 'body.service_log_id = flNewSvcLogId'), true);
     // ⚠ A stale id would attach the NEXT claim to the wrong reading.
     ok('  …clearing it on every open of the form', str_contains($b, 'flNewSvcLogId = null;'), true);
@@ -980,7 +985,7 @@ if (is_file($fvJs) && is_file($fsJs)) {
     ok('  …with fuel on its own line', str_contains($fv, "line('⛽ Fuel', w.fuel_rs)"), true);
     ok('  …and unclassified shown, not hidden', str_contains($fv, "line('❓ Unclassified'"), true);
     ok('mobile offers "Add the bill"', str_contains($fv, 'onAddBill(s.log_id, s.rider_id'), true);
-    ok('  …only where there is no live bill', str_contains($fv, 's.log_id && !s.bill_id && detail?.can_log_meters'), true);
+    ok('  …only where there is no live bill', str_contains($fv, 's.log_id && !billLive(s) && detail?.can_log_meters'), true);
     // ⚠ It must REUSE the claim sheet that already has the payment sources.
     ok('  …handed up to the screen that owns the claim form', str_contains($fs, 'onAddBill={async'), true);
     ok('  …which sends the chosen service', str_contains($fs, 'body.service_log_id = newClaim.serviceLogId'), true);
@@ -1053,9 +1058,15 @@ try {
 } finally { DB::rollBack(); flushAll(); }
 
 $wvcSrc = file_get_contents(__DIR__ . '/app/Http/Controllers/CRM/WorkshopVisitController.php');
-ok('the visit bill goes through the real request door', str_contains($wvcSrc, 'RequestController::class)->store('), true);
+// ⚠ 29-Sep-2026: the workshop close and the Bikes screen share ONE bill door,
+//   `ServiceRecordService::fileBill`, so the rules are asserted there.
+$fbSrc = file_get_contents(__DIR__ . '/app/Services/Riders/ServiceRecordService.php');
+// ⚠ 29-Sep-2026 (A1): both doors decide through billRecordedVisit, which files via fileBill.
+ok('the visit bill goes through the ONE shared bill door', str_contains($wvcSrc, '->billRecordedVisit(')
+   && str_contains($fbSrc, '$this->fileBill($request, array_merge('), true);
+ok('  …which files through the real request door', str_contains($fbSrc, 'RequestController::class)->store('), true);
 ok('  …and omits requester_user_id when he files his own',
-   str_contains($wvcSrc, '$onBehalf ? (int) $visit[\'user_id\'] : null'), true);
+   str_contains($fbSrc, '$onBehalf ? $riderId : null'), true);
 $wopJs = __DIR__ . '/../NizamiFarmsMobile/src/components/WorkshopOutcomePrompt.js';
 if (is_file($wopJs)) {
     $wop = file_get_contents($wopJs);
@@ -1087,14 +1098,17 @@ if (is_file($rqScr)) {
     $rs = file_get_contents($rqScr);
     ok('the rider form asks his un-billed services', str_contains($rs, "api.get('/rider/store/fleet/unbilled-services')"), true);
     ok('  …offers "Nayi service" as the default', str_contains($rs, 'Nayi service'), true);
-    ok('  …sends the chosen service', str_contains($rs, 'payload.service_log_id = billForLogId'), true);
+    // ⚠ 29-Sep-2026: the pick is a VISIT (one bill may cover several jobs) — one job still
+    //   goes as `service_log_id`, several as `service_log_ids`.
+    ok('  …sends the chosen service', str_contains($rs, 'payload.service_log_id = ids[0]')
+       && str_contains($rs, 'payload.service_log_ids = ids'), true);
     ok('  …and stops sending a meter it will inherit', str_contains($rs, 'delete payload.meter_at_fill'), true);
     ok('  …hiding the type picker too when one is chosen',
        str_contains($rs, "expenseCategory === 'Maintenance' && !billForLogId"), true);
     // ⚠ A stale pick would attach the NEXT bill to the wrong service.
     ok('  …and clearing the pick when the form resets', str_contains($rs, 'setBillForLogId(null);'), true);
     ok('the picker is hidden when he has no un-billed service',
-       str_contains($rs, "unbilled.length > 0 &&"), true);
+       str_contains($rs, "unbilledVisits.length > 0 &&"), true);
 }
 ok('the API door accepts an optional service_log_id',
    str_contains(file_get_contents(__DIR__ . '/app/Http/Controllers/API/RiderController.php'),
@@ -1181,8 +1195,12 @@ if (Illuminate\Support\Facades\Schema::hasColumn('t_fleet_service_log', 'request
     } finally { DB::rollBack(); flushAll(); }
 }
 $ffSrc20 = file_get_contents(__DIR__ . '/app/Http/Controllers/CRM/FleetFuelController.php');
-ok('recordServiceBill sends service_log_id instead of resending the reading',
-   (bool) preg_match("/'service_log_id'\s*=>\s*\\\$logId/", $ffSrc20), true);
+// ⚠ 29-Sep-2026: the bill door is ONE shared method, `ServiceRecordService::fileBill`, used by the
+//   Bikes screen and the workshop close alike. It sends the job ids and lets store() inherit.
+$recSrc20 = file_get_contents(__DIR__ . '/app/Services/Riders/ServiceRecordService.php');
+ok('the shared bill door sends the job ids instead of resending the reading',
+   (bool) preg_match("/'service_log_ids'\s*=>\s*\\\$ids/", $recSrc20)
+   && !preg_match("/'meter_at_fill'\s*=>/", substr($recSrc20, strpos($recSrc20, 'function fileBill'), 6000)), true);
 ok('  …and no longer resends meter_at_fill', substr_count($ffSrc20, "'meter_at_fill'      => isset(\$data['meter'])"), 0);
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1291,7 +1309,7 @@ ok('  …the type-required refusal now lives in the shared recorder',
  *   recorder, which the next assertion's "no duplicate refusal here" pins down.
  */
 ok('  …and markServiced delegates to it rather than keeping a second copy',
-   (bool) preg_match('/(ServiceRecordService::class\)\s*|\$rec\s*)->resolveType/', $src), null, true);
+   (bool) preg_match('/(ServiceRecordService::class\)\s*|\$rec\s*)->resolve(Type|Jobs)/', $src), null, true);
 ok('  …with no duplicate of the refusal left in the controller',
    (bool) preg_match('/Choose which service was done/', $src), false);
 

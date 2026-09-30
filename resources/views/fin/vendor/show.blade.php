@@ -2446,7 +2446,7 @@ function exportVendorToExcel() {
                 showError(d.message || 'Could not read that photo.');
                 return;
             }
-            card = d.card; draftId = d.draft_id;
+            card = rcStampRead(d.card); draftId = d.draft_id;
             // ⭐ Printed discounts start in the adjustment, so the purchase matches the paper.
             document.getElementById('rcAdjust').value = card.discount_adjustment ? String(card.discount_adjustment) : '0';
             render();
@@ -2558,6 +2558,156 @@ function exportVendorToExcel() {
     function baseWord(ing) { return ing.base_unit === 'pcs' ? 'pieces' : (ing.base_unit === 'ml' ? 'millilitres' : 'grams'); }
     function ingById(id) { return INGREDIENTS.filter(function (x) { return String(x.id) === String(id); })[0] || null; }
 
+    // ── 🤖 the reader's suggestion + ⚖ the quantity check (Sep-27) ─────────────────
+    // Same rules as the phone (NizamiFarmsMobile/src/utils/receiptQty.js). Nothing here is
+    // ever applied on its own: the person taps "Yes, use it" / "Record …".
+    var RC_ALIAS = {pcs: 'piece', pc: 'piece', pieces: 'piece', ltr: 'litre', l: 'litre', liter: 'litre',
+                    kgs: 'kg', gm: 'g', gms: 'g', gram: 'g', grams: 'g'};
+    var RC_PRINTED = {kg: {kind: 'g', factor: 1000}, g: {kind: 'g', factor: 1}, L: {kind: 'ml', factor: 1000},
+                      ml: {kind: 'ml', factor: 1}, pcs: {kind: 'pcs', factor: 1}};
+    function rcUnitAny(code) { var c = String(code || '').toLowerCase().trim(); return rcUnit(RC_ALIAS[c] || c); }
+    function rcNum(v) { var n = Number(String(v == null ? '' : v).replace(/,/g, '')); return isFinite(n) ? n : null; }
+    /** A value that was actually read/typed — rcNum() alone turns null and '' into 0. */
+    function rcHas(v) { return v !== null && v !== undefined && String(v).trim() !== '' && rcNum(v) !== null; }
+    function rcRound(n, dp) { var f = Math.pow(10, dp); return Math.round(n * f) / f; }
+    function rcBaseText(n, kind) {
+        if (kind === 'g') { return n >= 1000 ? rcRound(n / 1000, 3) + ' kg' : rcRound(n, 3) + ' g'; }
+        if (kind === 'ml') { return n >= 1000 ? rcRound(n / 1000, 3) + ' L' : rcRound(n, 3) + ' ml'; }
+        return rcRound(n, 3) + ' pcs';
+    }
+    function rcProduct(l) {
+        return PRODUCTS.filter(function (x) { return String(x.id) === String(l.product_id); })[0]
+            || {id: l.product_id, product_name: l.product_name, unit: l.unit};
+    }
+    /**
+     * null | {kind:'convert', qty, rate, text} | {kind:'warn', text}
+     * ⚠⚠ Pre-deploy (Sep-29), same as the phone:
+     *   A2  the money kept is qty × PRINTED price — what this card records without a conversion
+     *       (a printed discount sits in the adjustment). It used to keep the line TOTAL, which
+     *       had the discount off already, so the discount came off twice. The total is used
+     *       only when no price was read.
+     *   C14 from the quantity AS READ (`read_qty`), and only while the line still shows it: a
+     *       quantity the person typed is theirs, never the start of a new offer.
+     */
+    function rcPackFit(l, p) {
+        if (!l || !p || l.qty_converted) { return null; }
+        var pr = rcUnitAny(p.unit);
+        if (!pr) { return null; }
+        var qty = rcNum(l.qty), name = p.product_name || 'this product';
+        var printed = RC_PRINTED[l.pack_size_unit] || null, size = rcNum(l.pack_size_value);
+        if (printed && size > 0) {
+            var packBase = size * printed.factor;
+            if (pr.kind && pr.kind === printed.kind && pr.factor) {
+                var readQty = rcHas(l.read_qty) ? rcNum(l.read_qty) : qty;
+                if (!(readQty > 0) || qty !== readQty) { return null; }
+                var nq = rcRound(readQty * packBase / pr.factor, 3);
+                if (Math.abs(nq - readQty) < 0.0005) { return null; }
+                var money = rcHas(l.unit_price) ? readQty * rcNum(l.unit_price) : (rcNum(l.line_total) || 0);
+                return {kind: 'convert', qty: nq, rate: nq > 0 ? rcRound(money / nq, 2) : 0,
+                        text: 'The bill has ' + rcRound(readQty, 3) + ' × ' + rcRound(size, 3) + ' ' + l.pack_size_unit + ' = ' + nq + ' ' + (nq === 1 ? pr.one : pr.many) + ' of ' + name + '.'};
+            }
+            if (pr.kind === null && rcNum(p.pack_qty_base) > 0 && p.ingredient_base_unit === printed.kind) {
+                var own = rcNum(p.pack_qty_base);
+                if (Math.abs(own - packBase) / own > 0.02) {
+                    return {kind: 'warn', text: name + ' is a ' + rcBaseText(own, printed.kind) + ' ' + p.unit + ', but this bill\'s is ' + rcBaseText(packBase, printed.kind) + '. Check it is the same item — or record the weight on a product bought by weight.'};
+                }
+                return null;
+            }
+            if (pr.kind && pr.kind !== printed.kind && printed.kind !== 'pcs' && pr.kind !== 'pcs') {
+                return {kind: 'warn', text: name + ' is bought by ' + RC_KIND[pr.kind] + ', but the bill shows ' + rcRound(size, 3) + ' ' + l.pack_size_unit + ' packs (' + RC_KIND[printed.kind] + '). Check the quantity before recording.'};
+            }
+            if (pr.kind && pr.kind !== printed.kind && printed.kind === 'pcs') {
+                return {kind: 'warn', text: name + ' is bought by ' + RC_KIND[pr.kind] + ', but the bill counts ' + rcRound(size, 3) + ' pieces a pack. Type the ' + RC_KIND[pr.kind] + ' before recording.'};
+            }
+            return null;
+        }
+        if (l.sold_by === 'weight' && pr.kind && pr.kind !== 'g') {
+            return {kind: 'warn', text: 'The bill weighs this item, but ' + name + ' is bought by ' + RC_KIND[pr.kind] + '. Check the quantity before recording.'};
+        }
+        if (l.sold_by === 'pack' && (pr.kind === 'g' || pr.kind === 'ml')) {
+            return {kind: 'warn', text: 'The bill counts packs, but ' + name + ' is bought per ' + pr.one + '. Type the ' + RC_KIND[pr.kind] + ' before recording.'};
+        }
+        return null;
+    }
+    function rcHints(l, i) {
+        var box = 'margin-top:6px; border-radius:8px; padding:7px 9px; font-size:12px; ';
+        var btn = 'border:none; border-radius:6px; padding:4px 10px; font-size:12px; font-weight:700; cursor:pointer; color:#fff; ';
+        var lnk = 'border:none; background:none; color:#4B5563; font-size:12px; text-decoration:underline; cursor:pointer;';
+        if (!l.product_id) {
+            if (l.ai_dismissed) { return ''; }
+            if (l.ai_suggestion) {
+                return '<div class="rc-ai" data-i="' + i + '" style="' + box + 'background:#EEF2FF; border:1px solid #C7D2FE; color:#312E81;">' +
+                    '🤖 Looks like <b>' + esc(l.ai_suggestion.name) + '</b> ' +
+                    '<button type="button" class="rc-ai-yes" data-i="' + i + '" style="' + btn + 'background:#4F46E5; margin-left:6px;">Yes, use it</button> ' +
+                    '<button type="button" class="rc-ai-no" data-i="' + i + '" style="' + lnk + '">Not this</button></div>';
+            }
+            if (l.ai_ingredient && SUPPORTS_ING) {
+                return '<div class="rc-ai" data-i="' + i + '" style="' + box + 'background:#EEF2FF; border:1px solid #C7D2FE; color:#312E81;">' +
+                    '🤖 Not on this vendor\'s list yet — it looks like the ingredient <b>' + esc(l.ai_ingredient.name) + '</b>. ' +
+                    '<button type="button" class="rc-ai-new" data-i="' + i + '" style="' + btn + 'background:#4F46E5; margin-left:6px;">Add it as a product</button> ' +
+                    '<button type="button" class="rc-ai-no" data-i="' + i + '" style="' + lnk + '">No</button></div>';
+            }
+            return '';
+        }
+        var fit = rcPackFit(l, rcProduct(l));
+        if (!fit) {
+            return l.qty_converted
+                ? '<div style="font-size:11px; color:#047857; margin-top:4px;">⚖ Quantity converted from the bill (' + esc(String(l.printed_qty)) + ' as printed).</div>'
+                : '';
+        }
+        if (fit.kind === 'convert') {
+            var pr = rcUnitAny(rcProduct(l).unit);
+            return '<div class="rc-fit" data-i="' + i + '" style="' + box + 'background:#ECFDF5; border:1px solid #A7F3D0; color:#065F46;">⚖ ' + esc(fit.text) +
+                ' <button type="button" class="rc-fit-use" data-i="' + i + '" data-qty="' + fit.qty + '" data-rate="' + fit.rate + '" style="' + btn + 'background:#047857; margin-left:6px;">Record ' + fit.qty + ' ' + esc(fit.qty === 1 ? pr.one : pr.many) + '</button></div>';
+        }
+        return '<div class="rc-fit-warn" style="font-size:11.5px; color:#B45309; margin-top:6px;">⚠ ' + esc(fit.text) + '</div>';
+    }
+    /**
+     * Point line i at product p — putting the printed numbers back if an earlier product
+     * converted them, but only while the line still shows exactly what that conversion set
+     * (C14): a quantity or rate typed afterwards is the person's to keep.
+     */
+    function rcChoose(i, p) {
+        var l = card.lines[i];
+        if (l.qty_converted) {
+            var untouched = l.converted_qty === undefined
+                || (rcNum(l.qty) === rcNum(l.converted_qty) && rcNum(l.unit_price) === rcNum(l.converted_rate));
+            if (untouched) { l.qty = l.printed_qty; l.unit_price = l.printed_rate; }
+            l.qty_converted = false;
+        }
+        l.product_id = p ? Number(p.id) : null;
+        l.product_name = p ? p.product_name : null;
+        l.unit = p ? p.unit : null;
+        l.ingredient_name = p ? (p.ingredient_name || null) : null;
+        l.qty_base_text = p ? rcQtyBaseText(l, p) : null;
+    }
+    /** ⚖ "Record 2.4 kg": remember the printed numbers AND what the conversion set. */
+    function rcConvert(l, fit, p) {
+        l.printed_qty = l.qty; l.printed_rate = l.unit_price;
+        l.qty = fit.qty; l.unit_price = fit.rate;
+        l.converted_qty = fit.qty; l.converted_rate = fit.rate;
+        l.qty_converted = true;
+        l.qty_base_text = rcQtyBaseText(l, p);
+    }
+    /** C14: every line's quantity AS READ, stamped once when a card arrives. */
+    function rcStampRead(c) {
+        ((c && c.lines) || []).forEach(function (l) { if (l && l.read_qty === undefined) { l.read_qty = l.qty; } });
+        return c;
+    }
+    /**
+     * The "· 2.4 kg" beside the ingredient: qty × the product's pack size, worded like the
+     * server's IngredientModel::display(). null when the product carries no ingredient size.
+     */
+    function rcQtyBaseText(l, p) {
+        var pack = rcNum(p && p.pack_qty_base), base = p && p.ingredient_base_unit;
+        if (!l || !rcHas(l.qty) || !(pack > 0) || !base) { return null; }
+        var q = rcRound(rcNum(l.qty) * pack, 3), u = base;
+        if (base === 'g' && Math.abs(q) >= 1000) { q = q / 1000; u = 'kg'; }
+        else if (base === 'ml' && Math.abs(q) >= 1000) { q = q / 1000; u = 'L'; }
+        var parts = rcRound(q, 3).toFixed(3).replace(/\.?0+$/, '').split('.');
+        return parts[0].replace(/\B(?=(\d{3})+(?!\d))/g, ',') + (parts[1] ? '.' + parts[1] : '') + ' ' + u;
+    }
+
     function render() {
         var w = document.getElementById('rcWarnings');
         w.innerHTML = (card.warnings || []).map(function (x) {
@@ -2579,10 +2729,10 @@ function exportVendorToExcel() {
                         '<select class="rc-prod" data-i="' + i + '" style="margin-top:4px; width:100%; max-width:320px; padding:4px 6px; border:1px solid #D1D5DB; border-radius:6px; font-size:12px;">' +
                             productOptions(l.product_id, l) +
                         '</select>' +
+                        '<div class="rc-hintbox" data-i="' + i + '">' + rcHints(l, i) + '</div>' +
                         (newFor === i ? newProductForm(i) : '') +
                         (l.ingredient_name
-                            ? '<div style="font-size:11px; color:#4F46E5; margin-top:3px;">' + esc(l.ingredient_name) +
-                              (l.qty_base_text ? ' · ' + esc(l.qty_base_text) : '') + '</div>'
+                            ? '<div class="rc-ingline" data-i="' + i + '" style="font-size:11px; color:#4F46E5; margin-top:3px;">' + rcIngText(l) + '</div>'
                             : '') +
                     '</div>' +
                     '<button type="button" class="rc-del" data-i="' + i + '" style="border:none; background:none; color:#9CA3AF; font-size:16px; cursor:pointer;">&times;</button>' +
@@ -2623,16 +2773,46 @@ function exportVendorToExcel() {
                 var i = +el.getAttribute('data-i');
                 if (el.value === '__new__') {
                     // Open the inline form under this line; the select goes back to blank.
-                    newFor = i; newIng = ingById(exactIngredientId(card.lines[i].raw_name));
+                    // 🤖 the reader's ingredient guess first, then an exact spelling match
+                    var ai = card.lines[i].ai_ingredient;
+                    newFor = i; newIng = (ai && ingById(ai.id)) || ingById(exactIngredientId(card.lines[i].raw_name));
                     render();
                     return;
                 }
-                card.lines[i].product_id = el.value ? Number(el.value) : null;
                 var p = PRODUCTS.filter(function (x) { return String(x.id) === el.value; })[0];
-                card.lines[i].product_name = p ? p.product_name : null;
-                card.lines[i].unit = p ? p.unit : null;
-                card.lines[i].ingredient_name = p ? (p.ingredient_name || null) : null;
+                rcChoose(i, el.value ? (p || {id: Number(el.value)}) : null);
                 if (newFor === i) { newFor = null; newIng = null; }
+                render();
+            };
+        });
+        // 🤖 confirm / reject the reader's suggestion, or start the product it names
+        box.querySelectorAll('.rc-ai-yes').forEach(function (el) {
+            el.onclick = function () {
+                var i = +el.getAttribute('data-i'), s = card.lines[i].ai_suggestion;
+                if (!s) { return; }
+                var p = PRODUCTS.filter(function (x) { return String(x.id) === String(s.id); })[0];
+                rcChoose(i, p || {id: s.id, product_name: s.name, unit: s.unit});
+                render();
+            };
+        });
+        box.querySelectorAll('.rc-ai-no').forEach(function (el) {
+            el.onclick = function () { card.lines[+el.getAttribute('data-i')].ai_dismissed = true; render(); };
+        });
+        box.querySelectorAll('.rc-ai-new').forEach(function (el) {
+            el.onclick = function () {
+                var i = +el.getAttribute('data-i'), ai = card.lines[i].ai_ingredient;
+                newFor = i; newIng = (ai && ingById(ai.id)) || ingById(exactIngredientId(card.lines[i].raw_name));
+                render();
+            };
+        });
+        // ⚖ record the converted quantity (the rupee total stays the same). ⚠ Worked out again
+        //   from the line as it is NOW, not from the button's numbers — the qty/rate boxes
+        //   change the line without a re-render (C14).
+        box.querySelectorAll('.rc-fit-use').forEach(function (el) {
+            el.onclick = function () {
+                var l = card.lines[+el.getAttribute('data-i')];
+                var fit = rcPackFit(l, rcProduct(l));
+                if (fit && fit.kind === 'convert') { rcConvert(l, fit, rcProduct(l)); }
                 render();
             };
         });
@@ -2666,10 +2846,10 @@ function exportVendorToExcel() {
             el.oninput = el.onchange = function () { syncPackWrap(+el.getAttribute('data-i')); };
         });
         box.querySelectorAll('.rc-qty').forEach(function (el) {
-            el.oninput = function () { card.lines[+el.getAttribute('data-i')].qty = el.value; totals(); };
+            el.oninput = function () { var i = +el.getAttribute('data-i'); card.lines[i].qty = el.value; rcRefreshLine(i); totals(); };
         });
         box.querySelectorAll('.rc-rate').forEach(function (el) {
-            el.oninput = function () { card.lines[+el.getAttribute('data-i')].unit_price = el.value; totals(); };
+            el.oninput = function () { var i = +el.getAttribute('data-i'); card.lines[i].unit_price = el.value; rcRefreshLine(i); totals(); };
         });
         box.querySelectorAll('.rc-noting').forEach(function (el) {
             el.onchange = function () { card.lines[+el.getAttribute('data-i')].not_ingredient = el.checked; };
@@ -2694,6 +2874,27 @@ function exportVendorToExcel() {
         var adj = parseFloat(document.getElementById('rcAdjust').value) || 0;
         document.getElementById('rcLinesTotal').textContent = money(sum);
         document.getElementById('rcGrand').textContent = money(sum + adj);
+    }
+
+    /** "Onions · 2.4 kg" under a line's product. */
+    function rcIngText(l) {
+        return esc(l.ingredient_name) + (l.qty_base_text ? ' · ' + esc(l.qty_base_text) : '');
+    }
+
+    /**
+     * C14: after a qty / rate keystroke the "· 2.4 kg" line and the ⚖ offer follow the line
+     * WITHOUT a full re-render (which would take the cursor out of the box being typed in).
+     * A typed quantity hides the offer; typing the read quantity back brings it back.
+     */
+    function rcRefreshLine(i) {
+        var l = card.lines[i], box = document.getElementById('rcLines');
+        if (!l || !box) { return; }
+        if (l.product_id) { l.qty_base_text = rcQtyBaseText(l, rcProduct(l)); }
+        var h = box.querySelector('.rc-hintbox[data-i="' + i + '"]');
+        if (h) { h.innerHTML = rcHints(l, i); }
+        var g = box.querySelector('.rc-ingline[data-i="' + i + '"]');
+        if (g) { g.innerHTML = rcIngText(l); }
+        bind();
     }
 
     /** The ingredient whose name is EXACTLY what was typed (case/space-insensitive), or null. */

@@ -1319,6 +1319,53 @@ class RiderController extends Controller
             // works from the rider's real position.
             $origin = $this->selectDispatchOrigin($riderId);
 
+            /**
+             * 🧭 THE STORE CHOSE WHERE TO TIME FROM (Sep-2026, the dispatch sheet).
+             *    `origin=rider|office` overrides the automatic pick; absent/'auto' =
+             *    exactly today's behaviour (riders, old APKs, the van send-out path).
+             *    'rider' uses his live ping only if it is ≤10 min old and possible —
+             *    otherwise the office, and the warning says why.
+             */
+            // C9 (Sep-29): the choice is the STORE's. A rider pressing dispatch for his own
+            // route always gets the automatic pick, whatever a client sends.
+            $originChoice = ((int) ($user->id ?? 0) === (int) $riderId) ? null : $request->input('origin');
+            $riderPos = $this->riderPositionNow((int) $riderId);
+            $riderChosenOnRoad = false;
+            if ($originChoice === 'office' && $riderPos['office']) {
+                $o = $riderPos['office'];
+                $origin = array_merge($origin, [
+                    'location'   => (object) ['latitude' => $o->latitude, 'longitude' => $o->longitude, 'captured_at' => null],
+                    'used_store' => true,
+                    'source'     => 'office_chosen',
+                    'note'       => 'Store chose to time the route from the office.',
+                    'phantom'    => false,
+                ]);
+            } elseif ($originChoice === 'rider') {
+                if ($riderPos['fix'] && in_array($riderPos['freshness'], ['fresh', 'aging'], true)) {
+                    $origin = array_merge($origin, [
+                        'location'   => $riderPos['fix'],
+                        'used_store' => false,
+                        'source'     => 'rider_chosen',
+                        'note'       => 'Store chose to time the route from the rider\'s live location (ping '
+                                        . $this->pingAgeText($riderPos['age_s']) . ').',
+                        'fix'        => $riderPos['fix'],
+                        'distance_from_store_m' => $riderPos['distance_m'],
+                        'phantom'    => false,
+                    ]);
+                    $riderChosenOnRoad = !$riderPos['at_office'];
+                } elseif ($riderPos['office']) {
+                    // Asked for his location, but it is too old / impossible now.
+                    $o = $riderPos['office'];
+                    $origin = array_merge($origin, [
+                        'location'   => (object) ['latitude' => $o->latitude, 'longitude' => $o->longitude, 'captured_at' => null],
+                        'used_store' => true,
+                        'source'     => 'office_rider_unavailable',
+                        'note'       => 'Rider location was chosen but no usable ping — used the office.',
+                        'phantom'    => $riderPos['implausible'],
+                    ]);
+                }
+            }
+
             if (!$origin['location']) {
                 // The ONLY remaining hard stop on this endpoint, and it is a
                 // configuration fault rather than anything the rider did: there is
@@ -1711,6 +1758,12 @@ class RiderController extends Controller
                 if ($this->riderIsDrivingVanNow((int) $riderId)) {
                     $startOffsetMinutes = 0;
                 }
+                // The store chose "his location" while he is out on the road: he is
+                // already moving, there is no walk to the bike to pad for (Sep-2026).
+                // Automatic picks keep today's grace rule untouched.
+                if ($riderChosenOnRoad) {
+                    $startOffsetMinutes = 0;
+                }
             }
 
             // ⭐ Calculate cumulative ETA for each order
@@ -1854,8 +1907,40 @@ class RiderController extends Controller
                 $user->id ?? null,
                 (bool) $origin['is_mid_run'],
                 $deliveredBefore,
-                (string) $scope
+                (string) $scope,
+                [
+                    'origin_source'    => $origin['source'],
+                    // HIS position at the press, whatever origin was used — read by the
+                    // "cleared while he was out" excuse and the "he was X km out" wording.
+                    'rider_distance_m' => $riderPos['fix'] && $riderPos['freshness'] !== 'stale' ? $riderPos['distance_m'] : null,
+                    'rider_gps_age_s'  => $riderPos['age_s'],
+                ]
             );
+
+            // 📲 The store timed HIS route — tell him, in Roman Urdu, so he looks at
+            //    the new times instead of riding on the old ones (owner, Sep-28).
+            //    Never for his own press. Non-fatal.
+            if ((int) ($user->id ?? 0) !== (int) $riderId && !empty($updatedOrders)) {
+                try {
+                    $recentStoreCancel = false;
+                    if (!$isRedispatch && \Schema::hasTable('t_ops_eta_log')) {
+                        $recentStoreCancel = \DB::table('t_ops_eta_log')
+                            ->where('rider_id', $riderId)->where('event', 'cancel')->where('is_rider_self', 0)
+                            ->whereIn('order_id', array_map(fn ($s) => (int) $s['order_id'], $etaLogStops))
+                            ->where('created_at', '>=', now()->subMinutes(10)->format('Y-m-d H:i:s'))
+                            ->exists();
+                    }
+                    app(\App\Services\FirebaseService::class)->notifyRiderRouteTimed(
+                        (int) $riderId,
+                        (string) ($user->fullname ?? 'Office'),
+                        count($updatedOrders),
+                        $isRedispatch || $recentStoreCancel,
+                        (bool) $usedShopLocation
+                    );
+                } catch (\Throwable $e) {
+                    \Log::warning('Rider route-timed push failed (non-fatal)', ['rider_id' => $riderId, 'error' => $e->getMessage()]);
+                }
+            }
 
             // ⭐ Tell the store, now, when a rider re-times his OWN route after he
             //    has already dropped stops — the press that quietly moves times
@@ -1926,6 +2011,16 @@ class RiderController extends Controller
                 'eta_source' => $etaSource,
                 // Stops whose saved pin was rejected as impossible (see above).
                 'bad_pin_orders' => $badPinOrders,
+                // Where these times were measured FROM, in one line for the
+                // success alert (Sep-2026): "Timed from Asim's location (ping 20 s ago)".
+                'origin_used' => [
+                    'kind'  => $usedShopLocation ? 'office' : 'rider',
+                    'source'=> $origin['source'],
+                    'label' => $usedShopLocation
+                        ? 'Timed from the office'
+                        : 'Timed from ' . $rider->fullname . "'s location"
+                          . ($riderPos['fix'] && $riderPos['age_s'] !== null ? ' (ping ' . $this->pingAgeText($riderPos['age_s']) . ')' : ''),
+                ],
             ];
 
             // Everything the team needs to know about HOW these times were worked
@@ -1934,7 +2029,12 @@ class RiderController extends Controller
             // new key would show nothing until the whole fleet had updated.
             $dispatchWarnings = [];
 
-            if ($usedShopLocation) {
+            if ($origin['source'] === 'office_chosen') {
+                // chosen deliberately in the sheet — nothing to warn about
+            } elseif ($origin['source'] === 'office_rider_unavailable' && empty($origin['phantom'])) {
+                $dispatchWarnings[] = "⚠️ {$rider->fullname} ki location purani thi (" . $this->pingAgeText($riderPos['age_s'])
+                    . "), is liye delivery times office se lagaye gaye hain. Unse kahein ke app kholein, phir dobara Dispatch karein.";
+            } elseif ($usedShopLocation) {
                 $dispatchWarnings[] = $this->dispatchOriginWarning($origin, $rider->fullname, 'Delivery times');
             }
 
@@ -2007,7 +2107,7 @@ class RiderController extends Controller
         // exact guardrails a rider genuinely starting his day from the office
         // needs. Same join the canonical detectLeftWithoutDispatch uses, and
         // covered by idx_order_history (order_id, changed_at).
-        return \DB::table('t_crm_prod_order as o')
+        $recentDrop = \DB::table('t_crm_prod_order as o')
             ->join('t_crm_order_status_history as osh', function ($j) {
                 $j->on('o.id', '=', 'osh.order_id')
                   ->where('osh.status_code', '=', 'delivered');
@@ -2016,6 +2116,32 @@ class RiderController extends Controller
             ->where('o.order_status', 'delivered')
             ->where('osh.changed_at', '>=', now()->subMinutes(90))
             ->exists();
+        if ($recentDrop) {
+            return true;
+        }
+
+        /**
+         * Third signal (Sep-2026): WHERE HE IS decides, not whether a cancel
+         * happened. The orders he holds now WERE dispatched today (the log still
+         * says so after a cancel wiped the order rows) AND a fresh (≤5 min),
+         * possible fix puts him away from the office → he is out on the road.
+         * This is Asim's Sep-27 case: a store cancel wiped signal 1, his last drop
+         * was >90 min earlier, and a rider 13.4 km out was timed from the office.
+         *
+         * ⚠ Deliberately NOT "he delivered today": a rider at his pickup point with
+         *   never-dispatched orders must keep the first-dispatch consensus + 5 km
+         *   office anchoring — that is the guard against the Jul-2026 phantom fix
+         *   (a phone at the store claiming 16 km NW). Only a route that was actually
+         *   pressed out qualifies. At the office (≤300 m) this stays false — a rider
+         *   back to collect new orders still gets a fresh first-dispatch wave.
+         */
+        if (\App\Services\Riders\EtaPromiseService::currentOrdersWereDispatchedToday($riderId)) {
+            $pos = $this->riderPositionNow($riderId);
+            if ($pos['freshness'] === 'fresh' && !$pos['at_office'] && $pos['distance_m'] !== null) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**
@@ -2178,13 +2304,259 @@ class RiderController extends Controller
         }
     }
 
+    /** Ping freshness bands for the store's "time from" choice (owner, Sep-28). */
+    const RIDER_FIX_FRESH_S = 300;   // ≤5 min: his location is the default
+    const RIDER_FIX_AMBER_S = 600;   // ≤10 min: still selectable, marked "may be off"
+
+    /**
+     * First-dispatch persistent-phantom backstop: a fix further than this from the office
+     * is not trusted as the start of a FIRST dispatch. ONE number for the automatic pick
+     * (selectDispatchOrigin) and the sheet's phantom guard (dispatchPreview, Sep-29).
+     */
+    const FIRST_DISPATCH_FAR_M = 5000.0;
+
+    /**
+     * Where is the rider RIGHT NOW, and how much can we trust it? (Sep-2026)
+     *
+     * The ONE reading behind the store's "time from his location / the office"
+     * sheet, the explicit `origin=rider` dispatch, the location-based mid-run
+     * signal and the position stamped on the ETA log — so all four always agree.
+     *
+     * Newest fix of the last 30 min that is physically possible (inside the
+     * Pakistan box AND within the phantom ceiling of the office), preferring one
+     * with ≤150 m accuracy. Returns freshness:
+     *   'fresh' ≤5 min · 'aging' ≤10 min · 'stale' older · 'none' no usable fix
+     */
+    private function riderPositionNow(int $riderId): array
+    {
+        $out = ['fix' => null, 'age_s' => null, 'accuracy_m' => null, 'distance_m' => null,
+                'freshness' => 'none', 'at_office' => false, 'implausible' => false, 'office' => null];
+        try {
+            $office = \App\Services\LocationService::getPrimaryBaseLocation();
+            if ($office && $office->latitude && $office->longitude) {
+                $out['office'] = $office;
+            }
+            $fixes = \DB::table('t_ops_rider_location')
+                ->where('user_id', $riderId)
+                ->where('captured_at', '>=', now()->subMinutes(30))
+                ->whereNotNull('latitude')->whereNotNull('longitude')
+                ->orderBy('captured_at', 'desc')
+                ->limit(60)
+                ->get(['latitude', 'longitude', 'accuracy', 'captured_at']);
+
+            $phantomM = $this->phantomOriginMetres();
+            $dist = function ($f) use ($office) {
+                return ($office && $office->latitude && $office->longitude)
+                    ? (int) round(\App\Services\LocationService::calculateDistance(
+                        $f->latitude, $f->longitude, $office->latitude, $office->longitude))
+                    : null;
+            };
+            $possible = $fixes->filter(function ($f) use ($dist, $phantomM) {
+                if (!\App\Services\LocationService::isPlausibleFix($f->latitude, $f->longitude)) return false;
+                $d = $dist($f);
+                return $d === null || $d <= $phantomM;
+            })->values();
+            if ($fixes->isNotEmpty() && $possible->isEmpty()) {
+                $out['implausible'] = true;   // the phone is reporting somewhere impossible
+            }
+            $fix = $possible->first(fn ($f) => $f->accuracy === null || (float) $f->accuracy <= 150.0)
+                ?: $possible->first();
+            if (!$fix) {
+                return $out;
+            }
+            /**
+             * ⚠ Age = time since this fix ARRIVED, deliberately. The phone's own `fix_age_s` is
+             *   NOT added (tried and withdrawn, 29-Sep review): the native tracker only takes a
+             *   new fix after 10 m of movement and re-sends the last one on its 5-min timer, so an
+             *   "old" fix mostly means "he has not moved" — his position is still right. Adding
+             *   that age turned standing riders stale (sheet, mid-run signal, cancel stamp).
+             */
+            $age = max(0, now()->timestamp - strtotime((string) $fix->captured_at));
+            $out['fix'] = $fix;
+            $out['age_s'] = $age;
+            $out['accuracy_m'] = $fix->accuracy !== null ? (int) round((float) $fix->accuracy) : null;
+            $out['distance_m'] = $dist($fix);
+            $out['freshness'] = $age <= self::RIDER_FIX_FRESH_S ? 'fresh'
+                : ($age <= self::RIDER_FIX_AMBER_S ? 'aging' : 'stale');
+            $out['at_office'] = $out['freshness'] !== 'stale' && $out['distance_m'] !== null
+                && $out['distance_m'] <= \App\Services\Riders\EtaPromiseService::OUT_OF_OFFICE_M;
+        } catch (\Throwable $e) {
+            \Log::warning('riderPositionNow failed (non-fatal)', ['rider_id' => $riderId, 'error' => $e->getMessage()]);
+        }
+        return $out;
+    }
+
+    /** "20 s ago" / "4 min ago" — the store sheet and dispatch notes. */
+    private function pingAgeText(?int $s): string
+    {
+        if ($s === null) return 'no ping';
+        if ($s < 60) return $s . ' s ago';
+        if ($s < 3600) return intdiv($s, 60) . ' min ago';
+        return intdiv($s, 3600) . ' h ago';
+    }
+
+    /**
+     * "his GPS from 8 min ago (mid-run)" / "the office (no GPS in the last 30 min)" —
+     * what the automatic pick (selectDispatchOrigin) would time the route from, for the
+     * sheet's "Let the system decide" choice (Sep-29). Display only.
+     */
+    private function autoOriginLabel(array $auto, int $riderId): string
+    {
+        $fix = $auto['fix'] ?? null;
+        $km = isset($auto['distance_from_store_m']) && $auto['distance_from_store_m'] !== null
+            ? number_format($auto['distance_from_store_m'] / 1000, 1) . ' km' : null;
+        if (!empty($auto['location']) && empty($auto['used_store']) && $fix) {
+            $age = max(0, now()->timestamp - strtotime((string) $fix->captured_at));
+            return 'his GPS from ' . $this->pingAgeText($age)
+                 . (!empty($auto['is_mid_run']) ? ' (mid-run)' : ' (first dispatch of these orders)');
+        }
+        if (empty($auto['location'])) {
+            return 'nowhere — no GPS and no office location set';
+        }
+        switch ($auto['source'] ?? '') {
+            case 'store_far_gps':
+                return 'the office (not on a delivery run; his GPS reads ' . ($km ?? 'far') . ' away)';
+            case 'store_phantom_gps_midrun':
+                return 'the office (his phone is reporting an impossible location)';
+            case 'store_no_gps':
+            case 'store_no_gps_midrun':
+                return 'the office (no GPS from his phone in the last 30 min)';
+        }
+        return 'the office';
+    }
+
+    /**
+     * Is this account a rider the store dispatches for (C9, Sep-29)? Active login AND
+     * either an active rider profile (the "Delivery Rider" tick — the assign list's own
+     * rule) or out-for-delivery orders on his name right now (a man being dispatched is
+     * by definition a rider, even an unticked stand-in).
+     */
+    private function isDispatchableRider(int $userId): bool
+    {
+        try {
+            $active = \DB::table('t_sys_user')->where('id', $userId)->where('is_active', 1)->exists();
+            if (!$active) return false;
+            if (\DB::table('t_ops_rider_profile')->where('user_id', $userId)->where('active', 1)->exists()) {
+                return true;
+            }
+            return \DB::table('t_crm_prod_order')
+                ->where('assigned_rider_user_id', $userId)
+                ->where('order_status', 'out_for_delivery')
+                ->exists();
+        } catch (\Throwable $e) {
+            return false;
+        }
+    }
+
+    /**
+     * 🧭 What the store sees BEFORE pressing Dispatch for a rider (Sep-2026).
+     *
+     * GET /rider/{riderId}/dispatch-preview — read-only, writes nothing.
+     * Answers: where is he, how old is that ping, is he at the office, and which
+     * origin should the sheet pre-select? The sheet only ASKS when he is away
+     * from the office; at the office both answers are the same place.
+     */
+    public function dispatchPreview(Request $request, $riderId)
+    {
+        try {
+            $user = Auth::user();
+            if (!$this->canManageRiderRoute($user, $riderId)) {
+                return response()->json(['success' => false, 'message' => 'Permission denied'], 403);
+            }
+            $rider = \DB::table('t_sys_user')->where('id', $riderId)->select('id', 'fullname')->first();
+            if (!$rider) {
+                return response()->json(['success' => false, 'message' => 'Rider not found'], 404);
+            }
+            // C9 (Sep-29): riders only — this endpoint reads a live GPS position, so it
+            // must not answer for any staff account id. The new sheet treats a refusal
+            // like any failed preview: the server's automatic pick, as before.
+            if (!$this->isDispatchableRider((int) $riderId)) {
+                return response()->json(['success' => false, 'message' => 'Not a rider'], 404);
+            }
+            $pos = $this->riderPositionNow((int) $riderId);
+            $fresh = $pos['freshness'];
+
+            // What the server would pick with NO origin sent ("Let the system decide").
+            // selectDispatchOrigin is read-only (DB reads only), so asking costs nothing.
+            $auto = $this->selectDispatchOrigin((int) $riderId);
+
+            // rider option: enabled (fresh) · amber (5–10 min) · disabled (older / none)
+            $riderOption = $fresh === 'fresh' ? 'enabled' : ($fresh === 'aging' ? 'amber' : 'disabled');
+            $disabledReason = null;
+            $amberReason = $riderOption === 'amber' ? 'Ping is a few minutes old — times may be a little off.' : null;
+            if ($riderOption === 'disabled') {
+                $disabledReason = $pos['implausible']
+                    ? "His phone is reporting an impossible location (GPS fault) — times will be from the office."
+                    : ($pos['fix'] ? 'Last ping ' . $this->pingAgeText($pos['age_s']) . ' — he has likely moved. Ask him to open the app, then press again.'
+                                   : 'No GPS from his phone in the last 30 min. Ask him to open the app, then press again.');
+            }
+
+            /**
+             * B2 — the phantom-GPS guard on a FIRST dispatch (Sep-29). Same test the automatic
+             * pick uses: not mid-run, not at a van meet point, and his fix is beyond the 5 km
+             * first-dispatch backstop — the Jul-2026 "phone at the store says 16 km NW" shape.
+             * Never pre-selected, never 'enabled'; still one tap away (staff may know better).
+             */
+            $phantomSuspect = false;
+            if ($riderOption !== 'disabled' && empty($auto['is_mid_run'])
+                && $pos['distance_m'] !== null && $pos['distance_m'] > self::FIRST_DISPATCH_FAR_M) {
+                $phantomSuspect = true;
+                $riderOption = 'amber';
+                $amberReason = 'Not on a delivery run and his phone says '
+                    . number_format($pos['distance_m'] / 1000, 1) . ' km away — often a wrong GPS fix. Check with him before choosing.';
+            }
+
+            return response()->json([
+                'success'  => true,
+                'rider'    => ['id' => (int) $rider->id, 'name' => $rider->fullname],
+                'position' => $pos['fix'] ? [
+                    'latitude'     => (float) $pos['fix']->latitude,
+                    'longitude'    => (float) $pos['fix']->longitude,
+                    'accuracy_m'   => $pos['accuracy_m'],
+                    'captured_at'  => $pos['fix']->captured_at,
+                    'age_s'        => $pos['age_s'],
+                    'age_text'     => $this->pingAgeText($pos['age_s']),
+                    'distance_m'   => $pos['distance_m'],
+                    'distance_text'=> $pos['distance_m'] === null ? null
+                        : ($pos['distance_m'] >= 1000 ? number_format($pos['distance_m'] / 1000, 1) . ' km' : $pos['distance_m'] . ' m'),
+                ] : null,
+                'freshness'       => $fresh,
+                'at_office'       => $pos['at_office'],
+                // ask only when he is NOT at the office — otherwise both are the same place
+                'ask'             => !$pos['at_office'],
+                'rider_option'    => $riderOption,
+                'rider_disabled_reason' => $disabledReason,
+                // Why "his location" is amber (old ping, or the B2 phantom guard).
+                'rider_amber_reason'    => $amberReason,
+                'rider_phantom_suspect' => $phantomSuspect,
+                // Pre-selected only when the ping is FRESH (owner: "rider location only if
+                // it's fresh"); an amber ping stays one tap away.
+                'default_origin'  => ($riderOption === 'enabled' && !$pos['at_office']) ? 'rider' : 'office',
+                // B1 (owner D2, Sep-29): the sheet's default — his location only when fresh AND
+                // trustworthy, otherwise "Let the system decide" (no origin sent = automatic).
+                'default_choice'  => ($riderOption === 'enabled' && !$pos['at_office']) ? 'rider' : 'auto',
+                'auto_origin'     => [
+                    'source'     => $auto['source'],
+                    'kind'       => (!empty($auto['location']) && empty($auto['used_store'])) ? 'rider' : 'office',
+                    'is_mid_run' => (bool) $auto['is_mid_run'],
+                    'label'      => $this->autoOriginLabel($auto, (int) $riderId),
+                ],
+                'office'          => $pos['office'] ? ['latitude' => (float) $pos['office']->latitude,
+                                                       'longitude' => (float) $pos['office']->longitude] : null,
+            ]);
+        } catch (\Throwable $e) {
+            \Log::error('dispatchPreview failed', ['rider_id' => $riderId, 'error' => $e->getMessage()]);
+            return response()->json(['success' => false, 'message' => 'Could not read his location'], 500);
+        }
+    }
+
     private function selectDispatchOrigin(int $riderId): array
     {
         // Tunables — kept inline so this stays a single-file, cache-free deploy.
         $windowMinutes  = 30;       // how far back to look for a GPS fix
         $accuracyMaxM   = 150.0;    // fixes worse than this are "low confidence"
         $clusterRadiusM = 1500.0;   // a fix within this of the consensus is trusted
-        $farBackstopM   = 5000.0;   // even anchored, beyond this ⇒ persistent phantom
+        $farBackstopM   = self::FIRST_DISPATCH_FAR_M;   // even anchored, beyond this ⇒ persistent phantom
         // ⭐ PHANTOM CEILING (Sep-2026). Beyond this a fix is not "far", it is
         //    IMPOSSIBLE, and it may not be used as an origin on ANY branch.
         //    See phantomOriginMetres() for why the number is what it is.
@@ -2572,10 +2944,18 @@ class RiderController extends Controller
             // a new one. A RIDER cancelling his own dispatch must NOT do that —
             // otherwise cancel-then-redispatch would launder his lateness. Both
             // are logged (with is_rider_self) so the difference is provable.
+            // Where he was when the times were cleared: a store cancel while he is
+            // out on the road is the store's re-plan, and must not later read as
+            // "left without dispatch" (Sep-2026).
+            $pos = $this->riderPositionNow((int) $riderId);
             \App\Services\Riders\EtaPromiseService::logCancel(
                 (int) $riderId,
                 $clearedIds,
-                $user->id ?? null
+                $user->id ?? null,
+                [
+                    'rider_distance_m' => $pos['fix'] && $pos['freshness'] !== 'stale' ? $pos['distance_m'] : null,
+                    'rider_gps_age_s'  => $pos['age_s'],
+                ]
             );
 
             \Log::info('Dispatch cancelled (ETAs cleared)', [
@@ -13818,6 +14198,8 @@ class RiderController extends Controller
                  *    Absent = "a new service", which is exactly today's behaviour.
                  */
                 'service_log_id' => 'nullable|integer',
+                // ⭐ 29-Sep-2026: ONE bill for several jobs of the same visit (one receipt).
+                'service_log_ids'   => 'nullable',
                 'attendance_id' => 'nullable|integer',
                 'leave_start_date' => 'nullable|date',
                 'leave_end_date' => 'nullable|date|after_or_equal:leave_start_date',
@@ -13905,8 +14287,17 @@ class RiderController extends Controller
              *    live bill, the claim is REFUSED. Without it, a manager recording the service
              *    with the receipt and the rider filing the same receipt sends money out twice.
              */
+            // 🔗 (29-Sep-2026) Only a Maintenance bill may be tied to service records — the one
+            //    rule, shared with Request\RequestController::store. No transaction is open yet here.
+            if ($linkRefusal = \App\Services\Riders\ServiceRecordService::linkRefusalForCategory(
+                    $request->input('expense_category'),
+                    \App\Services\Riders\ServiceRecordService::normaliseIds(
+                        $request->input('service_log_ids'), $request->input('service_log_id')))) {
+                return response()->json(['success' => false, 'message' => $linkRefusal], 422);
+            }
             $svcLink = app(\App\Services\Riders\ServiceRecordService::class)
-                ->validateBillTarget($request->input('service_log_id'), (int) $user->id);
+                // ⭐ One id, or every job of one visit that one receipt paid for (29-Sep-2026).
+                ->validateBillTarget($request->input('service_log_ids') ?: $request->input('service_log_id'), (int) $user->id);
             if (!$svcLink['ok']) {
                 return response()->json(['success' => false, 'message' => $svcLink['message']], 422);
             }
@@ -13919,6 +14310,12 @@ class RiderController extends Controller
                 $validated['meter_at_fill']       = $svcLink['inherit']['meter'];
                 $validated['expense_date']        = $svcLink['inherit']['date'];
                 $validated['maintenance_type_id'] = $svcLink['inherit']['maintenance_type_id'];
+                // ⭐ …and the machine the service was recorded on (29-Sep-2026). An older engine
+                //   sends no `vehicle_id` in the inherit, so this is a no-op until it is uploaded.
+                if (!$request->filled('vehicle_id') && !empty($svcLink['inherit']['vehicle_id'])) {
+                    $request->merge(['vehicle_id' => (int) $svcLink['inherit']['vehicle_id']]);
+                    $validated['vehicle_id'] = (int) $svcLink['inherit']['vehicle_id'];
+                }
                 // ⚠ Re-resolve: the inherited type decides service_type, which the rules below judge.
                 $svcResolved = app(\App\Services\Riders\MaintenanceTypeService::class)->resolve(
                     $svcLink['inherit']['maintenance_type_id'], $request->input('service_type')
@@ -14219,9 +14616,9 @@ class RiderController extends Controller
 
             // 🧾 Tie the bill to the service he chose. Inside the transaction, so a claim can
             //    never exist un-linked when he explicitly said which service it was for.
-            if ($request->filled('service_log_id')) {
+            if (!empty($svcLink['log_ids']) || $request->filled('service_log_id')) {
                 app(\App\Services\Riders\ServiceRecordService::class)
-                    ->attachBillToService((int) $request->input('service_log_id'), (int) $newRequest->id);
+                    ->attachBillToService($svcLink['log_ids'] ?? (int) $request->input('service_log_id'), (int) $newRequest->id);
             }
 
             DB::commit();
@@ -15891,12 +16288,16 @@ class RiderController extends Controller
                 $leftRiders = [];
                 if (!empty($candidateRiderIds)) {
                     foreach ($this->detectLeftWithoutDispatch($candidateRiderIds) as $rid => $info) {
-                        if (!empty($info['flagged'])) {
+                        // C7 (Sep-29): a store cancel while he was out, never re-sent, stays
+                        // on the banner with `store_cancelled` (new APK words it as such; an
+                        // old APK lists him under the plain warning). He is not blamed.
+                        if (!empty($info['flagged']) || !empty($info['store_cancelled'])) {
                             $leftRiders[] = [
                                 'rider_id' => $rid,
                                 'rider_name' => $info['rider_name'] ?: "Rider #{$rid}",
                                 'undispatched_count' => $info['undispatched_count'],
                                 'distance_meters' => $info['distance_meters'],
+                                'store_cancelled' => empty($info['flagged']) && !empty($info['store_cancelled']),
                             ];
                         }
                     }
@@ -16340,6 +16741,18 @@ class RiderController extends Controller
             $justCollected = [];
         }
 
+        // 🧭 Sep-2026: the store cleared his times while he was OUT (mid re-plan).
+        //    His orders are untimed because of the store, not because he forgot —
+        //    never write a missed-dispatch row against him for it.
+        $storeCleared = \App\Services\Riders\EtaPromiseService::storeClearedWhileAway($riderIds);
+        // …but only while he has NOT been back to the office since that cancel. Once
+        // he returns, a fresh departure with still-untimed orders is his own again.
+        foreach ($storeCleared as $rid => $cancelAt) {
+            if ($this->riderWasAtOfficeSince((int) $rid, $officeLat, $officeLng, $radiusMeters, (string) $cancelAt)) {
+                unset($storeCleared[$rid]);
+            }
+        }
+
         // Names (only needed for flagged riders, but cheap to fetch all).
         $names = \DB::table('t_sys_user')
             ->whereIn('id', $riderIds)
@@ -16368,8 +16781,26 @@ class RiderController extends Controller
             if (isset($justCollected[$rid])) {
                 $entry['van_handover_recent'] = true;
             }
+            if (isset($storeCleared[$rid])) {
+                $entry['store_cleared'] = true;
+                /**
+                 * C7 (Sep-29): he is still never blamed (no `flagged`, so no missed-dispatch
+                 * row), but the STORE must still see that his orders are out untimed. The
+                 * banner reads `store_cancelled`: "dispatch cancelled while he was out — not
+                 * re-sent". Same live conditions as the warning: untimed orders, nothing
+                 * dispatched pending, fresh GPS away from the office, not a van collection.
+                 */
+                if ($cnt > 0 && !$hasPendingDispatched && isset($latestByRider[$rid]) && !isset($justCollected[$rid])) {
+                    $pt = $latestByRider[$rid];
+                    $dist = $this->haversineDistance($officeLat, $officeLng, (float) $pt->latitude, (float) $pt->longitude);
+                    if ($dist > $radiusMeters) {
+                        $entry['store_cancelled'] = true;
+                        $entry['distance_meters'] = (int) round($dist);
+                    }
+                }
+            }
             if ($cnt > 0 && !$hasPendingDispatched && isset($latestByRider[$rid])
-                && !isset($justCollected[$rid])) {
+                && !isset($justCollected[$rid]) && !isset($storeCleared[$rid])) {
                 $pt = $latestByRider[$rid];
                 $dist = $this->haversineDistance($officeLat, $officeLng, (float) $pt->latitude, (float) $pt->longitude);
                 $entry['distance_meters'] = (int) round($dist);
@@ -23605,7 +24036,9 @@ class RiderController extends Controller
                     // The manager's own category name, so the approver sees WHAT the
                     // job was rather than just "maintenance".
                     'maintenance_type' => app(\App\Services\Riders\MaintenanceTypeService::class)
-                        ->labelFor($req->maintenance_type_id ?? null, $req->service_type),
+                        // ⭐ + the claim id: a bill paying for several jobs of one visit is
+                        //   labelled with all of them (29-Sep-2026). An older engine ignores it.
+                        ->labelFor($req->maintenance_type_id ?? null, $req->service_type, $req->id ?? null),
                     'filed_source_id' => $req->payment_source_account_id,
                     'filed_bank_id' => $req->receiving_account_id,
                     'attachment_url' => $attachmentUrl,

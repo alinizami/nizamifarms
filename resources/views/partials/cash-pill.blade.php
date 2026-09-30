@@ -5,6 +5,8 @@
   by mistake and only surfaced days later: "a floating icon like the invoices one but with a
   cash symbol, alerting Shabib of cash transactions done by people other than him — last 10
   records — and once he views it, it's read, while the icon shows unread."
+  Sep-29: "last 10 records" became the last 7 DAYS, headed by the day each entry was typed,
+  with "Show earlier days" for the next block (see LedgerWatchService::recent).
 
   This blocks nothing. Taimur is allowed to make that payment and it was correctly
   auto-approved; the fix is that the same event now ARRIVES instead of having to be excavated.
@@ -82,6 +84,26 @@
   .nfcp-meta b { color: #475569; font-weight: 700; }
   .nfcp-back { font-size: 10.5px; font-weight: 700; color: #b45309; margin-top: 3px; }
   .nfcp-empty { padding: 34px 12px; text-align: center; color: #9ca3af; font-size: 12.5px; }
+  /* One heading per TYPED day. Sticky, so while he scrolls a long day he still knows which
+     day he is in. top:-10px cancels #nfCpBody's top padding so it sits flush when stuck. */
+  .nfcp-day {
+    position: sticky; top: -10px; z-index: 1; background: #fff;
+    display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap;
+    padding: 9px 2px 6px; margin: 0 0 6px; border-bottom: 1px solid #eef0f2;
+  }
+  .nfcp-day-name { font-size: 12.5px; font-weight: 800; color: #0f172a; flex: 1; }
+  .nfcp-day-sum { font-size: 11px; font-weight: 700; color: #64748b; white-space: nowrap; }
+  .nfcp-day-sum .out { color: #b91c1c; }
+  .nfcp-day-sum .in { color: #047857; }
+  .nfcp-gap { font-size: 11px; color: #9ca3af; text-align: center; padding: 4px 0 10px; }
+  .nfcp-more {
+    display: block; width: 100%; margin: 6px 0 4px; padding: 9px 12px; cursor: pointer;
+    background: #f0fdf4; color: #047857; border: 1px solid #bbf7d0; border-radius: 9px;
+    font-size: 12.5px; font-weight: 700; font-family: inherit;
+  }
+  .nfcp-more:hover { background: #dcfce7; }
+  .nfcp-more[disabled] { opacity: .6; cursor: default; }
+  .nfcp-end { font-size: 11px; color: #9ca3af; text-align: center; padding: 8px 0 2px; }
   #nfCpFoot { padding: 10px 14px; border-top: 1px solid #eef0f2; font-size: 12px; }
   #nfCpFoot a { color: #047857; font-weight: 700; text-decoration: none; }
   #nfCpFoot a:hover { text-decoration: underline; }
@@ -159,9 +181,10 @@
         '<span class="nfcp-amt ' + (out ? 'out' : 'in') + '">' + sign + ' ' + money(i.effect) + '</span>' +
       '</div>' +
       (i.description ? '<div class="nfcp-desc">' + esc(i.description) + '</div>' : '') +
+      // Time only — the day is in the heading above the card.
       '<div class="nfcp-meta"><b>' + esc(i.who) + '</b>' +
         (i.source ? ' · ' + esc(i.source) : '') +
-        ' · ' + esc(i.typed_at || '') +
+        ' · ' + esc(i.time || i.typed_at || '') +
         ' · ' + esc(i.account) + '</div>' +
       // Informational only. Backdating is routine here — it is worth SEEING next to
       // "somebody else's hand", not worth shouting about on its own.
@@ -172,28 +195,107 @@
     '</a>';
   }
 
+  // ── Grouped by the day it was TYPED (Sep-29, owner: "segregate it by date") ────────────
+  // The server sends whole days, newest first, 7 at a time, and never splits a day across
+  // two pages — so a page can simply be appended, and each heading's total is the whole day.
+  var NEXT = null;       // `before` for the next "Show earlier days"; null = nothing earlier
+  var list = null;       // where day blocks go
+  var tail = null;       // the button / "that's everything" line under them
+  // ⭐ C11: the watermark the first page's dots were drawn against (before the open marked
+  // everything read) — sent as `since` so earlier pages keep their dots. null = not known.
+  var SEEN_SINCE = null;
+  // ⚠ C12: bumped on every open. A "Show earlier days" (or a first page) still loading when
+  // the drawer was closed and opened again belongs to the OLD drawer — its answer is dropped
+  // instead of overwriting NEXT and appending under the new page.
+  var GEN = 0;
+
+  function daySum(items) {
+    var out = 0, inn = 0;
+    items.forEach(function (i) { var e = Number(i.effect) || 0; if (e < 0) { out += e; } else { inn += e; } });
+    var parts = [];
+    if (out) { parts.push('<span class="out">− ' + money(out) + '</span>'); }
+    if (inn) { parts.push('<span class="in">+ ' + money(inn) + '</span>'); }
+    return items.length + (items.length === 1 ? ' entry' : ' entries') + (parts.length ? ' · ' + parts.join(' · ') : '');
+  }
+
+  function daysHtml(items) {
+    var html = '', i = 0;
+    while (i < items.length) {
+      var day = items[i].day, group = [];
+      while (i < items.length && items[i].day === day) { group.push(items[i]); i++; }
+      // ⚠ Each day in its OWN section: a sticky heading is held inside its parent, so the next
+      // day pushes the old heading off. In one shared container they all stay stuck, stacked.
+      html += '<section><div class="nfcp-day"><span class="nfcp-day-name">' + esc(group[0].day_label || day || '') + '</span>' +
+              '<span class="nfcp-day-sum">' + daySum(group) + '</span></div>' +
+              group.map(card).join('') + '</section>';
+    }
+    return html;
+  }
+
+  function renderTail() {
+    tail.innerHTML = NEXT
+      ? '<button type="button" class="nfcp-more">Show earlier days</button>'
+      : '<div class="nfcp-end">That’s everything — older entries are in the Ledger Hub.</div>';
+    var btn = tail.querySelector('.nfcp-more');
+    if (btn) { btn.onclick = loadEarlier; }
+  }
+
   function render(d) {
     var items = (d && d.items) || [];
-    if (!items.length) {
+    NEXT = (d && d.next_before) || null;
+    SEEN_SINCE = (d && typeof d.seen_since === 'number') ? d.seen_since : null;
+    if (!items.length && !NEXT) {
       note.textContent = '';
       body.innerHTML = '<div class="nfcp-empty">Nothing on your accounts but your own entries.</div>';
       foot.innerHTML = '';
       return;
     }
     note.innerHTML = 'Money moved on ' + (d.watching === 1 ? 'the till you hold' : 'the ' + d.watching + ' tills you hold')
-      + ' by someone other than you — newest first. Your own entries, anything you approved, and order deliveries are not listed.';
-    body.innerHTML = items.map(card).join('');
+      + ' by someone other than you — newest first, by the day it was typed. Your own entries, anything you approved, and order deliveries are not listed.';
+    body.innerHTML = '<div></div><div></div>';
+    list = body.firstChild;
+    tail = body.lastChild;
+    list.innerHTML = items.length ? daysHtml(items) : '<div class="nfcp-gap">Nothing in the last 7 days.</div>';
+    renderTail();
     foot.innerHTML = '<a href="' + esc(URL_HUB) + '">Open the Ledger Hub →</a>';
   }
 
+  async function loadEarlier() {
+    var btn = tail.querySelector('.nfcp-more');
+    if (!btn || !NEXT) { return; }
+    var gen = GEN;
+    btn.disabled = true;
+    btn.textContent = 'Loading…';
+    try {
+      var res = await fetch(URL_LIST + '?before=' + encodeURIComponent(NEXT)
+        + (SEEN_SINCE !== null ? '&since=' + encodeURIComponent(SEEN_SINCE) : ''),
+        { headers: { 'Accept': 'application/json' } });
+      if (gen !== GEN) { return; }            // the drawer was reopened meanwhile (C12)
+      if (!res.ok) { throw new Error('HTTP ' + res.status); }
+      var j = await res.json();
+      if (gen !== GEN) { return; }
+      list.insertAdjacentHTML('beforeend', daysHtml(j.items || []));
+      NEXT = j.next_before || null;
+      renderTail();
+    } catch (e) {
+      if (gen !== GEN) { return; }
+      btn.disabled = false;
+      btn.textContent = 'Could not load — tap to try again';
+    }
+  }
+
   async function open() {
+    var gen = ++GEN;
     wrap.classList.add('open');
     body.innerHTML = '<div class="nfcp-empty">Loading…</div>';
     foot.innerHTML = '';
+    NEXT = null;
     try {
-      var res = await fetch(URL_LIST + '?limit=10', { headers: { 'Accept': 'application/json' } });
+      var res = await fetch(URL_LIST, { headers: { 'Accept': 'application/json' } });
+      if (gen !== GEN) { return; }            // a newer open owns the drawer now (C12)
       if (!res.ok) { body.innerHTML = '<div class="nfcp-empty">Could not load.</div>'; return; }
       var j = await res.json();
+      if (gen !== GEN) { return; }
       render(j);
       // ⭐ "Once he views it, it can be read." Marked at the SERVER's newest id, not the
       // newest in this list, so a row that landed while the drawer was opening is not
@@ -205,6 +307,7 @@
       });
       setCount(0);
     } catch (e) {
+      if (gen !== GEN) { return; }
       body.innerHTML = '<div class="nfcp-empty">Could not load.</div>';
     }
   }

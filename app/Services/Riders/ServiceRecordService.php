@@ -320,8 +320,206 @@ class ServiceRecordService
     }
 
     /**
+     * ⭐⭐ WHICH JOB RECORDS ARE ALREADY PAID FOR — as [log_id => request_id] (29-Sep-2026).
+     *
+     * ⚠⚠ WHY `liveBillLinks()` CANNOT ANSWER THIS. It is keyed by the BILL, and one bill may
+     *    now cover several jobs (Qasim's one receipt for Oil + Tuning, Brake Shoe and Chain
+     *    Set). Flipping it keeps ONE job per bill and silently drops the rest — which then read
+     *    as un-billed, and can be billed a SECOND time. That is double money, so every
+     *    "is this job billed?" question asks this instead. `liveBillLinks()` stays for the
+     *    other question ("does a job speak for this claim?"), where bill-keyed is right.
+     */
+    public static function liveBilledLogIds(): array
+    {
+        try {
+            if (!Schema::hasTable('t_fleet_service_log')
+                || !Schema::hasColumn('t_fleet_service_log', 'request_id')) {
+                return [];
+            }
+            $out = [];
+            foreach (DB::table('t_fleet_service_log as l')
+                        ->join('t_req_master as r', 'r.id', '=', 'l.request_id')
+                        ->whereNotNull('l.request_id')
+                        ->whereIn('r.status', self::LIVE_BILL_STATUSES)
+                        ->get(['l.id', 'l.request_id']) as $r) {
+                $out[(int) $r->id] = (int) $r->request_id;
+            }
+            return $out;
+        } catch (\Throwable $e) {
+            return [];
+        }
+    }
+
+    /**
+     * ⭐⭐ WHAT A VISIT IS — the one derived definition (29-Sep-2026).
+     *
+     * The same machine, the same day, the same odometer. That is physically one trip: a bike
+     * cannot show one reading on two separate visits. It is DERIVED rather than stored, so it
+     * needs no new column and it already groups every record filed before this existed (Kanan,
+     * 19-Sep: Chain Set + Oil + Tuning at 52,766 were entered one at a time and are one visit).
+     *
+     * ⚠ The machine comes from `logVehicleOf()` — the same rule every reader uses — so the
+     *   visit a screen draws and the machine a countdown moves can never disagree.
+     *
+     * @param object|array $row needs user_id, service_date, meter (+ vehicle_id once it exists)
+     */
+    public static function visitKeyOf($row, ?VehicleResolver $resolver = null): string
+    {
+        $get = fn (string $k) => is_array($row) ? ($row[$k] ?? null) : ($row->$k ?? null);
+        $vid = self::logVehicleOf($row, $resolver);
+        return ($vid ? 'v' . $vid : 'u' . (int) $get('user_id'))
+            . '|' . substr((string) $get('service_date'), 0, 10)
+            . '|' . (int) $get('meter');
+    }
+
+    /**
+     * The other job records of the same visit (never the row itself). Used by a visit edit, so
+     * one wrong odometer is corrected on every job it was typed for — and by Remove, so a
+     * workshop visit's link can move to a job that survives.
+     *
+     * @return array<int, object>
+     */
+    public function visitSiblingsOf(object $row): array
+    {
+        try {
+            $cols = array_merge(['id', 'user_id', 'meter', 'service_date', 'maintenance_type_id', 'note'],
+                                self::logVehicleCols(),
+                                Schema::hasColumn('t_fleet_service_log', 'request_id') ? ['request_id'] : []);
+            $key = self::visitKeyOf($row);
+            $out = [];
+            foreach (DB::table('t_fleet_service_log')
+                        ->where('id', '<>', (int) $row->id)
+                        ->whereDate('service_date', substr((string) $row->service_date, 0, 10))
+                        ->where('meter', (int) $row->meter)
+                        ->orderBy('id')
+                        ->get($cols) as $r) {
+                if (self::visitKeyOf($r) === $key) $out[] = $r;
+            }
+            return $out;
+        } catch (\Throwable $e) {
+            return [];
+        }
+    }
+
+    /**
+     * The job names of a set of records, in ONE order everywhere: oil services first (they are
+     * what a manager reads first), then as they were recorded. "Oil + Tuning + Brake Shoe".
+     * It is the bill's title when filed AND the label every claim list prints — one function,
+     * so the approval queue, Daily Closing and the vehicle page read identically.
+     */
+    public function jobNamesOfLogs(array $logIds): string
+    {
+        $ids = self::normaliseIds($logIds);
+        if (!$ids) return '';
+        try {
+            $rows = DB::table('t_fleet_service_log as l')
+                ->leftJoin('t_fleet_maintenance_types as t', 't.id', '=', 'l.maintenance_type_id')
+                ->whereIn('l.id', $ids)
+                ->orderByDesc('t.resets_service_clock')->orderBy('l.id')
+                ->get(['l.id', 't.type_name']);
+            $names = [];
+            foreach ($rows as $r) {
+                $n = trim((string) ($r->type_name ?? '')) ?: 'Service';
+                if (!in_array($n, $names, true)) $names[] = $n;
+            }
+            return implode(' + ', $names);
+        } catch (\Throwable $e) {
+            return '';
+        }
+    }
+
+    /** @internal per-process memo for jobLabelsForClaims(); cleared by bustCaches(). */
+    private static array $claimLabelMemo = [];
+
+    /**
+     * ⭐⭐ WHAT WAS THIS BILL FOR — for bills that cover MORE THAN ONE job (29-Sep-2026).
+     *
+     * A claim carries one `maintenance_type_id` (the lead job, so every older reader keeps
+     * working), but a shared bill paid for several. Every place that prints a claim's job
+     * asks `MaintenanceTypeService::labelFor(..., $requestId)`, which asks this — so Daily
+     * Closing, the Bikes claim list, the vehicle page and spend-by-job all say
+     * "Oil + Tuning + Brake Shoe" rather than quietly crediting one job with the whole receipt.
+     *
+     * @param int[] $requestIds
+     * @return array<int, string> [request_id => "A + B"] — only claims linked to 2+ jobs
+     */
+    public function jobLabelsForClaims(array $requestIds): array
+    {
+        $ids = self::normaliseIds($requestIds);
+        if (!$ids) return [];
+        $want = array_values(array_filter($ids, fn ($i) => !array_key_exists($i, self::$claimLabelMemo)));
+        if ($want) {
+            foreach ($want as $i) self::$claimLabelMemo[$i] = null;
+            try {
+                if (Schema::hasTable('t_fleet_service_log') && Schema::hasColumn('t_fleet_service_log', 'request_id')) {
+                    $by = [];
+                    foreach (DB::table('t_fleet_service_log')->whereIn('request_id', $want)
+                                ->orderBy('id')->get(['id', 'request_id']) as $r) {
+                        $by[(int) $r->request_id][] = (int) $r->id;
+                    }
+                    foreach ($by as $rid => $logIds) {
+                        if (count($logIds) > 1) self::$claimLabelMemo[$rid] = $this->jobNamesOfLogs($logIds) ?: null;
+                    }
+                }
+            } catch (\Throwable $e) {
+                // no label is better than a wrong one — the claim's own type still prints
+            }
+        }
+        $out = [];
+        foreach ($ids as $i) {
+            if (!empty(self::$claimLabelMemo[$i])) $out[$i] = self::$claimLabelMemo[$i];
+        }
+        return $out;
+    }
+
+    /** Test seam + write hook: forget every combined claim label. */
+    public static function flushClaimLabels(): void
+    {
+        self::$claimLabelMemo = [];
+    }
+
+    /**
+     * The lead job of a set of records — the first OIL service, otherwise the first recorded.
+     * The shared bill carries this job's type so every single-type reader (and every old APK)
+     * still sees a sensible, real job on it.
+     */
+    /** The lead record of a set of ids — see leadLogOf(). A workshop visit links to this one. */
+    public function leadLogId(array $logIds): ?int
+    {
+        $ids = self::normaliseIds($logIds);
+        if (!$ids) return null;
+        try {
+            $rows = DB::table('t_fleet_service_log')->whereIn('id', $ids)->get(['id', 'maintenance_type_id'])->keyBy('id');
+            $ordered = [];
+            foreach ($ids as $id) if (isset($rows[$id])) $ordered[] = $rows[$id];
+            $lead = $this->leadLogOf($ordered);
+            return $lead ? (int) $lead->id : $ids[0];
+        } catch (\Throwable $e) {
+            return $ids[0];
+        }
+    }
+
+    private function leadLogOf(array $logs): ?object
+    {
+        if (!$logs) return null;
+        try {
+            $typeIds = array_values(array_unique(array_filter(array_map(fn ($l) => (int) $l->maintenance_type_id, $logs))));
+            $resets  = $typeIds
+                ? DB::table('t_fleet_maintenance_types')->whereIn('id', $typeIds)->pluck('resets_service_clock', 'id')->all()
+                : [];
+            foreach ($logs as $l) {
+                if (!empty($resets[(int) $l->maintenance_type_id])) return $l;
+            }
+        } catch (\Throwable $e) {
+            // fall through to the first recorded
+        }
+        return reset($logs) ?: null;
+    }
+
+    /**
      * 🧾 THE SERVICES A BILL CAN BE ATTACHED TO — this rider's own readings that no live bill
-     *    speaks for yet, newest first. This is the list the picker shows on every bill form.
+     *    speaks for yet, newest first. One row per JOB (the shape every installed APK reads),
+     *    each carrying its `visit_key` so a newer screen can offer the whole visit at once.
      *
      * ⚠ Scoped to ONE rider because a claim belongs to a requester: attaching a bill to
      *   another man's service would move his countdown and his money together.
@@ -333,27 +531,28 @@ class ServiceRecordService
     {
         try {
             if (!Schema::hasTable('t_fleet_service_log')) return [];
-            $hasLink = Schema::hasColumn('t_fleet_service_log', 'request_id');
-            $live    = $hasLink ? array_flip(self::liveBillLinks()) : [];   // [log_id => request_id]
+            // ⚠⚠ Keyed by JOB, not by bill — see liveBilledLogIds() for the double-money reason.
+            $live = self::liveBilledLogIds();
 
             $rows = DB::table('t_fleet_service_log as l')
                 ->leftJoin('t_fleet_maintenance_types as t', 't.id', '=', 'l.maintenance_type_id')
                 ->where('l.user_id', $riderId)
                 ->whereNotNull('l.meter')
                 ->whereDate('l.service_date', '>=', \Carbon\Carbon::today()->subDays($days)->format('Y-m-d'))
-                ->orderByDesc('l.service_date')->orderByDesc('l.id')
+                ->orderByDesc('l.service_date')->orderByDesc('l.meter')->orderByDesc('t.resets_service_clock')->orderBy('l.id')
                 ->limit(40)
                 ->get(array_merge(['l.id', 'l.user_id', 'l.meter', 'l.service_date',
-                                   'l.maintenance_type_id', 'l.request_id', 't.type_name', 't.bucket'],
+                                   'l.maintenance_type_id', 't.type_name', 't.bucket'],
                                   self::logVehicleCols('l.')));
 
+            $resolver = new VehicleResolver();
             $out = [];
             foreach ($rows as $r) {
                 if (isset($live[(int) $r->id])) continue;   // a live bill already speaks for it
                 // ⚠ The machine is resolved the SAME way the countdowns resolve it — the
                 //   stamp first, the registry for a row filed before the stamp existed — so
                 //   the vehicle page never offers a service that belongs to a different bike.
-                $vid = self::logVehicleOf($r);
+                $vid = self::logVehicleOf($r, $resolver);
                 if ($vehicleId && (int) $vid !== (int) $vehicleId) continue;
 
                 $out[] = [
@@ -364,6 +563,7 @@ class ServiceRecordService
                     'type_name'           => $r->type_name ?: 'Service',
                     'bucket'              => $r->bucket,
                     'vehicle_id'          => $vid ? (int) $vid : null,
+                    'visit_key'           => self::visitKeyOf($r, $resolver),
                     // What the picker shows: "30 Aug · Oil + Tuning · 27,906 km"
                     'label'               => \Carbon\Carbon::parse($r->service_date)->format('j M')
                                              . ' · ' . ($r->type_name ?: 'Service')
@@ -378,90 +578,170 @@ class ServiceRecordService
     }
 
     /**
-     * ⭐⭐ MAY THIS BILL BE ATTACHED TO THIS SERVICE? — the one gate every bill door calls.
+     * 🧾⭐⭐ THE VISITS A BILL CAN BE ATTACHED TO (29-Sep-2026) — the same un-billed jobs as
+     *    `unbilledServicesFor()`, grouped the ONE way a visit is defined. One receipt usually
+     *    covers everything done on that trip, so a picker offers the visit with all its jobs
+     *    ticked and lets the person untick any that were billed separately.
      *
-     * Returns the reading to INHERIT so the filer never retypes a meter he has already
-     * entered (the owner's whole reason for asking for this): the claim takes the log's
-     * odometer, its job and its date.
+     * @return array<int, array{visit_key:string, date:string, meter:int, vehicle_id:?int,
+     *                          log_ids:int[], jobs:array, label:string}>
+     */
+    public function unbilledVisitsFor(int $riderId, ?int $vehicleId = null, int $days = 60): array
+    {
+        $visits = [];
+        foreach ($this->unbilledServicesFor($riderId, $vehicleId, $days) as $s) {
+            $k = $s['visit_key'];
+            if (!isset($visits[$k])) {
+                $visits[$k] = [
+                    'visit_key'  => $k,
+                    'date'       => $s['date'],
+                    'meter'      => $s['meter'],
+                    'vehicle_id' => $s['vehicle_id'],
+                    'log_ids'    => [],
+                    'jobs'       => [],
+                ];
+            }
+            $visits[$k]['log_ids'][] = $s['log_id'];
+            $visits[$k]['jobs'][]    = ['log_id' => $s['log_id'], 'maintenance_type_id' => $s['maintenance_type_id'],
+                                        'type_name' => $s['type_name']];
+        }
+        foreach ($visits as &$v) {
+            $v['label'] = \Carbon\Carbon::parse($v['date'])->format('j M')
+                . ' · ' . ($this->jobNamesOfLogs($v['log_ids']) ?: 'Service')
+                . ' · ' . number_format((int) $v['meter']) . ' km';
+        }
+        unset($v);
+        return array_values($visits);
+    }
+
+    /**
+     * ⭐⭐ MAY THIS BILL BE ATTACHED TO THESE JOBS? — the one gate every bill door calls.
      *
-     * ⚠⚠ THE DOUBLE-MONEY GUARD LIVES HERE. If the chosen service already has a live bill,
-     *    this refuses — naming the bill, its amount and who filed it. That is the case where
+     * Accepts ONE log id (every installed APK and the old forms) or a LIST of them (29-Sep-2026:
+     * one receipt for a visit's several jobs). Returns the reading to INHERIT so the filer never
+     * retypes a meter he has already entered: the claim takes the visit's odometer and date,
+     * and the LEAD job's type (the first oil service, otherwise the first job).
+     *
+     * ⚠⚠ THE DOUBLE-MONEY GUARD LIVES HERE. If ANY chosen job already has a live bill, this
+     *    refuses — naming the job, the bill, its amount and who filed it. That is the case where
      *    a manager records the service with the receipt and the rider then files the same
      *    receipt from his phone: without this, the money goes out twice.
+     * ⚠ Several jobs must be ONE visit (same machine, day and odometer). A receipt from one trip
+     *   cannot pay for work done on another, and the claim can only carry one reading.
      *
-     * @return array{ok:bool, message:string, inherit?:array{meter:int,maintenance_type_id:?int,date:string}}
+     * @param int|int[]|string|null $logIds
+     * @return array{ok:bool, message:string, log_ids?:int[],
+     *               inherit?:array{meter:int,maintenance_type_id:?int,date:string}}
      */
-    public function validateBillTarget($logId, int $requesterId): array
+    public function validateBillTarget($logIds, int $requesterId): array
     {
-        if (empty($logId)) return ['ok' => true, 'message' => ''];
+        $ids = self::normaliseIds($logIds);
+        if (!$ids) return ['ok' => true, 'message' => ''];
         try {
             if (!Schema::hasTable('t_fleet_service_log')) {
                 return ['ok' => false, 'message' => 'Service records are not set up yet.'];
             }
-            $log = DB::table('t_fleet_service_log')->where('id', (int) $logId)->first();
-            if (!$log) {
-                return ['ok' => false, 'message' => 'That service record no longer exists. Refresh and choose again.'];
+            $found = DB::table('t_fleet_service_log')->whereIn('id', $ids)->get()->keyBy('id');
+            $logs  = [];
+            foreach ($ids as $id) {
+                if (!isset($found[$id])) {
+                    return ['ok' => false, 'message' => 'That service record no longer exists. Refresh and choose again.'];
+                }
+                $logs[] = $found[$id];
             }
-            // ⚠ A claim belongs to its requester — attaching it to someone else's service
-            //   would move another man's countdown and his money in one step.
-            if ((int) $log->user_id !== $requesterId) {
-                return ['ok' => false, 'message' => 'That service was recorded for a different rider.'];
+            $names = count($logs) > 1
+                ? DB::table('t_fleet_maintenance_types')->pluck('type_name', 'id')->all() : [];
+            $jobOf = fn ($l) => count($logs) > 1 ? (($names[(int) $l->maintenance_type_id] ?? 'That job') . ': ') : '';
+
+            foreach ($logs as $log) {
+                // ⚠ A claim belongs to its requester — attaching it to someone else's service
+                //   would move another man's countdown and his money in one step.
+                if ((int) $log->user_id !== $requesterId) {
+                    return ['ok' => false, 'message' => $jobOf($log) . 'That service was recorded for a different rider.'];
+                }
+                if ($log->meter === null) {
+                    return ['ok' => false, 'message' => $jobOf($log) . 'That service record has no odometer reading to bill against.'];
+                }
             }
-            if ($log->meter === null) {
-                return ['ok' => false, 'message' => 'That service record has no odometer reading to bill against.'];
+            if (count($logs) > 1) {
+                $resolver = new VehicleResolver();
+                $keys = array_unique(array_map(fn ($l) => self::visitKeyOf($l, $resolver), $logs));
+                if (count($keys) > 1) {
+                    return ['ok' => false, 'message' =>
+                        'One bill can only cover jobs from the SAME visit — the same machine, day and '
+                        . 'odometer. File a separate bill for the other visit.'];
+                }
             }
-            if (Schema::hasColumn('t_fleet_service_log', 'request_id') && !empty($log->request_id)) {
-                $live = DB::table('t_req_master')->where('id', $log->request_id)
-                    ->whereIn('status', self::LIVE_BILL_STATUSES)->first(['id', 'amount', 'created_by', 'status']);
-                if ($live) {
+
+            if (Schema::hasColumn('t_fleet_service_log', 'request_id')) {
+                foreach ($logs as $log) {
+                    if (empty($log->request_id)) continue;
+                    $live = DB::table('t_req_master')->where('id', $log->request_id)
+                        ->whereIn('status', self::LIVE_BILL_STATUSES)->first(['id', 'amount', 'created_by', 'status']);
+                    if (!$live) continue;   // a dead link (rejected / cancelled) is simply overwritten
                     /**
                      * ⚠⚠ A REFUSAL MUST NAME THE WAY OUT, and it must name the RIGHT one.
-                     *
-                     *    ONE VISIT COMMONLY MEANS SEVERAL JOBS — checked against the data, not
-                     *    guessed: every same-odometer pair on this system is two DIFFERENT jobs
-                     *    done in one visit (Waseem, 27,906 km: Oil + Tuning Rs 3,500 AND Brake
-                     *    Shoe Rs 650), never the same job billed twice. Each job is its own
-                     *    service record with its own bill, which this model already supports.
-                     *
-                     * ⚠ So the way out is NOT "file it without choosing" — a maintenance claim
-                     *   needs a meter anyway, and an unlinked twin is the duplicate row this
-                     *   whole design removes. It is: record the OTHER job as its own service
-                     *   and bill that one.
+                     *    Several jobs can share one bill, and separate jobs can carry separate
+                     *    bills — but ONE job can never be paid for twice. The way out is to
+                     *    reverse the wrong bill, or to leave this job out of the new one.
                      */
-                    return ['ok' => false, 'message' =>
-                        'That service already has a bill — Rs ' . number_format((float) $live->amount)
+                    return ['ok' => false, 'message' => $jobOf($log)
+                        . 'That service already has a bill — Rs ' . number_format((float) $live->amount)
                         . ' filed by ' . $this->nameOf($live->created_by ? (int) $live->created_by : null)
                         . ($live->status === 'pending' ? ' (waiting for approval)' : '')
                         . '. If that bill is wrong, reverse it first. If this bill is for a DIFFERENT '
                         . 'job done in the same visit, record that job as its own service (same '
                         . 'odometer) and attach the bill to it.'];
                 }
-                // A dead link (rejected / cancelled) is simply overwritten below.
             }
-            return ['ok' => true, 'message' => '', 'inherit' => [
-                'meter'               => (int) $log->meter,
-                'maintenance_type_id' => $log->maintenance_type_id ? (int) $log->maintenance_type_id : null,
-                'date'                => substr((string) $log->service_date, 0, 10),
+
+            $lead = $this->leadLogOf($logs) ?: $logs[0];
+            /**
+             * ⭐ …and the MACHINE (29-Sep-2026, found on the device). The bill used to inherit
+             *   the reading, job and date but not the bike, so the claim was stamped from "what
+             *   was he on that day" — the spare, in exactly the workshop case the service record
+             *   is stamped to avoid. The money now lands on the machine the work was done on.
+             */
+            $vid = self::logVehicleOf($lead);
+            return ['ok' => true, 'message' => '', 'log_ids' => $ids, 'inherit' => [
+                'meter'               => (int) $lead->meter,
+                'maintenance_type_id' => $lead->maintenance_type_id ? (int) $lead->maintenance_type_id : null,
+                'date'                => substr((string) $lead->service_date, 0, 10),
+                'vehicle_id'          => $vid ? (int) $vid : null,
             ]];
         } catch (\Throwable $e) {
-            Log::error('validateBillTarget failed', ['log' => $logId, 'error' => $e->getMessage()]);
+            Log::error('validateBillTarget failed', ['log' => $ids, 'error' => $e->getMessage()]);
             return ['ok' => false, 'message' => 'Could not check that service record.'];
         }
     }
 
-    /** Tie a freshly created bill to the service it was filed for. */
-    public function attachBillToService(int $logId, int $requestId): void
+    /**
+     * Tie a freshly created bill to the job record(s) it was filed for — one id, or every job
+     * of a visit that one receipt paid for. Each record carries the SAME `request_id`: that is
+     * the whole of "one bill, several jobs", and it needs no new table.
+     *
+     * @param int|int[] $logIds
+     */
+    public function attachBillToService($logIds, int $requestId): void
     {
+        $ids = self::normaliseIds($logIds);
+        if (!$ids) return;
         try {
             if (!Schema::hasColumn('t_fleet_service_log', 'request_id')) return;
-            $cols = ['id', 'user_id', 'note'];
+            $cols = ['id', 'user_id', 'note', 'service_date', 'meter'];
             if (self::logKeepsPhoto()) $cols[] = 'photo_path';
-            $row = DB::table('t_fleet_service_log')->where('id', $logId)->first($cols);
-            if (!$row) return;
-            DB::table('t_fleet_service_log')->where('id', $logId)->update([
-                'request_id' => $requestId,
-                'note'       => mb_substr(trim(($row->note ? $row->note . ' · ' : '') . 'bill attached'), 0, 250),
-            ]);
+            $cols = array_merge($cols, self::logVehicleCols());
+            $rows = DB::table('t_fleet_service_log')->whereIn('id', $ids)->orderBy('id')->get($cols);
+            if ($rows->isEmpty()) return;
+
+            $photo = null;
+            foreach ($rows as $row) {
+                DB::table('t_fleet_service_log')->where('id', $row->id)->update([
+                    'request_id' => $requestId,
+                    'note'       => mb_substr(trim(($row->note ? $row->note . ' · ' : '') . 'bill attached'), 0, 250),
+                ]);
+                if (!$photo && !empty($row->photo_path ?? null)) $photo = $row->photo_path;
+            }
 
             /**
              * 📷⭐⭐ THE BILL INHERITS THE RIDER'S PHOTO (owner ruling, 11-Sep-2026).
@@ -469,15 +749,13 @@ class ServiceRecordService
              * ⭐ This is the point of storing the picture on the WORK. The rider photographs
              *   the receipt at the workshop and files nothing; days later a manager enters the
              *   amount from the vehicle page — and the claim he creates now carries the same
-             *   photo, so whoever approves it can see what is being paid for. Before this, the
-             *   evidence and the money could never meet: a photo needed an amount, and the
-             *   amount arrived long after the photo could have been taken.
+             *   photo, so whoever approves it can see what is being paid for.
              *
              * ⚠ NEVER overwrites. A manager who attached his own picture to the claim has
              *   given the better evidence; this only fills an empty hand.
              * ⚠ Non-fatal: failing to decorate a claim must not unlink a filed bill.
              */
-            if (!empty($row->photo_path ?? null)) {
+            if ($photo) {
                 try {
                     // ⚠ `t_req_master` — the requests table (RequestModel::$table), NOT the
                     //   't_sys_*' the naming convention would suggest. `attachments` is a JSON
@@ -486,18 +764,279 @@ class ServiceRecordService
                     $existing = $req && !empty($req->attachments) ? json_decode($req->attachments, true) : null;
                     if ($req && empty($existing)) {
                         DB::table('t_req_master')->where('id', $requestId)
-                            ->update(['attachments' => json_encode([$row->photo_path])]);
+                            ->update(['attachments' => json_encode([$photo])]);
                     }
                 } catch (\Throwable $e) {
                     Log::warning('bill did not inherit the service photo',
-                        ['log' => $logId, 'request' => $requestId, 'error' => $e->getMessage()]);
+                        ['log' => $ids, 'request' => $requestId, 'error' => $e->getMessage()]);
                 }
             }
 
-            $this->bustCaches((int) $row->user_id);
+            $first = $rows->first();
+            $this->bustCaches((int) $first->user_id, self::logVehicleOf($first));
         } catch (\Throwable $e) {
-            Log::error('attachBillToService failed', ['log' => $logId, 'request' => $requestId, 'error' => $e->getMessage()]);
+            Log::error('attachBillToService failed', ['log' => $ids, 'request' => $requestId, 'error' => $e->getMessage()]);
         }
+    }
+
+    /**
+     * 💰⭐⭐ FILE THE BILL FOR A VISIT — the ONE bill door for "record a service and pay for
+     *    it" (29-Sep-2026). The Bikes screen and the workshop close each had their own copy;
+     *    they differed in the claim's title (the workshop named the job it was BOOKED for, not
+     *    the one done) and in who counted as "on behalf of". One copy now.
+     *
+     * ⭐⭐ THIS DELIBERATELY DOES NOT INSERT A CLAIM. Filing a maintenance expense means a
+     *    request number, the L1/L2 auto-approval rule, the ledger posting, the BikeServiceClock
+     *    hook and the vehicle stamping. All of that already lives in RequestController::store,
+     *    so the money goes through the real door and inherits every rule, including later ones.
+     * ⚠ The reading, job and date are INHERITED from the records (`service_log_ids`), never
+     *   resent — resending made the bill door re-judge a reading the service door had just
+     *   accepted (review, 3-Sep).
+     * ⚠ Failure is NOT fatal to the service. The caller keeps the records and reports that the
+     *   bill did not file; it can be added later from the vehicle page.
+     *
+     * @param array $o {log_ids:int[], rider_id:int, amount:float, payment_source_account_id?,
+     *                  description?, note_after?}
+     * @return array{ok:bool, message:string, request_id?:int, auto_approved?:bool}
+     */
+    public function fileBill(\Illuminate\Http\Request $request, array $o): array
+    {
+        $ids = self::normaliseIds($o['log_ids'] ?? []);
+        try {
+            if (!$ids) return ['ok' => false, 'message' => 'there was no service record to bill against.'];
+            $amount = (float) ($o['amount'] ?? 0);
+            if ($amount <= 0) return ['ok' => false, 'message' => 'no amount was given.'];
+
+            $category = \App\Models\Request\RequestCategoryModel::where('category_code', 'expense')
+                ->where('is_active', 1)->first();
+            if (!$category) return ['ok' => false, 'message' => 'the expense category is not set up.'];
+
+            /**
+             * 🧾 THE BILL PHOTO rides through under the field RequestController::store reads
+             *    (`attachment_image`), as the SAME UploadedFile instance — a copy would land as an
+             *    ordinary file and fail the `image` rule.
+             */
+            $files = [];
+            if ($request->hasFile('bill_image')) $files['attachment_image'] = $request->file('bill_image');
+
+            /**
+             * ⚠⚠ A RIDER FILING HIS OWN BILL MUST NOT LOOK LIKE FILING FOR SOMEONE ELSE.
+             *    store() treats `requester_user_id` as "on behalf of", which needs a right no
+             *    rider holds. Omitted when the filer IS the rider; sent when a manager files for
+             *    him. The filer is read the way store() reads it (auth()->user()), so the two
+             *    halves cannot disagree about who is filing.
+             */
+            $riderId  = (int) ($o['rider_id'] ?? 0);
+            $actorId  = (int) (auth()->id() ?: (($request->user())->id ?? 0));
+            $onBehalf = $riderId && $riderId !== $actorId;
+
+            $sub = \Illuminate\Http\Request::create('/api/requests/store', 'POST', array_filter([
+                'category_id'        => $category->id,
+                'requester_user_id'  => $onBehalf ? $riderId : null,
+                // ⭐ Every job it pays for, in the one order every claim list prints.
+                'title'              => mb_substr($this->jobNamesOfLogs($ids) ?: 'Maintenance', 0, 190),
+                'description'        => $o['description'] ?? 'Filed with the service record.',
+                'amount'             => $amount,
+                'expense_category'   => 'Maintenance',
+                'service_log_ids'    => $ids,
+                'payment_source_account_id' => $o['payment_source_account_id'] ?? null,
+                // ⚠ Bikes is Nizami Farms operations — ALWAYS business unit 1, never Khaas, so a
+                //   Khaas-mode manager like Qasim can never file a bike bill into the other books.
+                'business_unit_id'   => 1,
+            ], fn ($v) => $v !== null), [], $files);
+            // The sub-request acts as the SAME signed-in user — the approval decision hangs on it.
+            $sub->setUserResolver($request->getUserResolver());
+
+            $res  = app(\App\Http\Controllers\Request\RequestController::class)->store($sub);
+            $body = json_decode($res->getContent(), true);
+            if ($res->getStatusCode() < 200 || $res->getStatusCode() >= 300 || empty($body['success'])) {
+                return ['ok' => false, 'message' => $body['message'] ?? 'the request was refused.'];
+            }
+            $reqId = (int) ($body['request_id'] ?? 0);
+
+            if ($reqId && !empty($o['note_after']) && Schema::hasColumn('t_fleet_service_log', 'request_id')) {
+                DB::table('t_fleet_service_log')->whereIn('id', $ids)->where('request_id', $reqId)
+                    ->update(['note' => mb_substr((string) $o['note_after'], 0, 250)]);
+            }
+
+            // ⭐ `auto_approved` is the server's own answer to "did this land in the ledger
+            //   already?" — echoed, never re-derived, so the message cannot contradict it.
+            $approved = !empty($body['auto_approved']);
+            return ['ok' => true, 'request_id' => $reqId, 'auto_approved' => $approved, 'message' =>
+                'Rs ' . number_format($amount) . ' bill '
+                . ($approved ? 'added and approved' : 'sent for approval') . ' as an expense.'
+                . (count($ids) > 1 ? ' One bill for all ' . count($ids) . ' jobs.' : '')
+                . (!empty($files) ? ' Bill attached.' : ' No bill photo attached.')];
+        } catch (\Throwable $e) {
+            Log::error('ServiceRecordService::fileBill failed', ['log' => $ids, 'error' => $e->getMessage()]);
+            return ['ok' => false, 'message' => 'it could not be filed.'];
+        }
+    }
+
+    /**
+     * 💰⭐⭐ THE BILL FOR A SAVE THAT HAS JUST RECORDED A VISIT — the ONE decision both "record a
+     *    service" doors take, the Bikes screen and the workshop close (29-Sep-2026, pre-deploy A1).
+     *
+     * ⚠⚠ WHY THIS EXISTS. Those doors used to leave out the jobs that already carried a live bill
+     *    and file a NEW bill, for the FULL amount typed, on the rest. Re-save a visit to add Chain
+     *    Set with the same Rs 5,200 still in the box and the one receipt was paid twice. So: if ANY
+     *    job of this save (the duplicates `recordVisit` handed back included) is already under a
+     *    live bill, NO bill is filed. The jobs stay recorded; the reply names the bill that is
+     *    already there and says what to do if this really is a second receipt.
+     * ⭐ When no job is billed, every job of the save is billed — including an all-duplicate save
+     *   whose first bill never filed (or which was first recorded with no money). The double-money
+     *   guard in `validateBillTarget` still runs inside `fileBill`.
+     *
+     * @param array $recorded the result of recordVisit()
+     * @param array $o        fileBill()'s options, without `log_ids`
+     * @return array{ok:bool, filed:bool, skipped_existing:bool, existing_bill_ids:int[], message:string,
+     *               request_id?:int, auto_approved?:bool}
+     */
+    public function billRecordedVisit(\Illuminate\Http\Request $request, array $recorded, array $o): array
+    {
+        $ids     = self::normaliseIds($recorded['service_log_ids'] ?? []);
+        $paid    = $ids ? self::liveBilledLogIds() : [];
+        $covered = array_values(array_filter($ids, fn ($id) => isset($paid[$id])));
+        if ($covered) {
+            $billIds = array_values(array_unique(array_map(fn ($id) => (int) $paid[$id], $covered)));
+            return ['ok' => true, 'filed' => false, 'skipped_existing' => true, 'existing_bill_ids' => $billIds,
+                    'message' => $this->alreadyBilledNote($ids, $covered, $billIds)];
+        }
+        /**
+         * ⚠⚠ …AND THE REST OF THE VISIT (29-Sep-2026 verification). Ticking ONLY the new job
+         *    (Chain Set) beside an already-billed one (Oil + Tuning) and typing the receipt's
+         *    amount again got past the check above — none of the TICKED jobs was billed — and
+         *    filed the same receipt twice. The visit's live bill now counts too — found by the
+         *    SAME rule the "visit bill #N" line on Past services uses (`visit_bill_id`).
+         * ⚠ Only when the amount typed MATCHES that bill (same whole rupees): the receipt typed again.
+         *   A DIFFERENT amount is a separate receipt at the same visit — a real pattern (Waseem
+         *   30-Aug: Rs 3,500 + Rs 650, two bills, one visit) — and still files, exactly as before.
+         *   Way out either way: "Add the bill" on the visit.
+         */
+        if ($ids && ($visitBill = $this->liveBillOfVisit($recorded, $ids, (float) ($o['amount'] ?? 0)))) {
+            return ['ok' => true, 'filed' => false, 'skipped_existing' => true, 'existing_bill_ids' => [$visitBill],
+                    'message' => $this->alreadyBilledNote($ids, [], [$visitBill])];
+        }
+        $bill = $this->fileBill($request, array_merge($o, ['log_ids' => $ids]));
+        return $bill + ['filed' => (bool) $bill['ok'], 'skipped_existing' => false, 'existing_bill_ids' => []];
+    }
+
+    /**
+     * The live bill (a linked job's bill, or a claim) already standing on the visit these jobs
+     * were just recorded into, for the SAME amount — read from Past services itself, so it is
+     * the bill the screen names as "visit bill #N". Null when there is none.
+     * ⚠ FAILS OPEN (null) on an error: the save then bills as before, and approval is the net.
+     */
+    private function liveBillOfVisit(array $recorded, array $ids, float $amount): ?int
+    {
+        try {
+            $vid   = (int) ($recorded['vehicle_id'] ?? 0);
+            $first = DB::table('t_fleet_service_log')->where('id', (int) $ids[0])->first(['meter', 'service_date']);
+            if (!$vid || !$first || $first->meter === null) return null;
+            $key = 'v' . $vid . '|' . substr((string) $first->service_date, 0, 10) . '|' . (int) $first->meter;
+            foreach ((new VehicleService())->serviceHistoryFor($vid, 200) as $r) {
+                if (($r['visit_key'] ?? null) !== $key || empty($r['bill_live'])) continue;
+                if (!empty($r['log_id']) && in_array((int) $r['log_id'], $ids, true)) continue;
+                $bid = !empty($r['manual']) ? ($r['bill_id'] ?? null) : ($r['req_id'] ?? null);
+                if (!$bid) continue;
+                // the bill's OWN amount — a shared bill's later jobs carry 0 on the row
+                $billAmt = (float) DB::table('t_req_master')->where('id', (int) $bid)->value('amount');
+                if ($amount > 0 && (int) round($billAmt) === (int) round($amount)) return (int) $bid;   // same rupees
+            }
+        } catch (\Throwable $e) {
+            Log::warning('liveBillOfVisit failed (billing as before)', ['ids' => $ids, 'error' => $e->getMessage()]);
+        }
+        return null;
+    }
+
+    /**
+     * "No second bill was filed — this visit already has bill #123 (Rs 5,200) for Oil + Tuning +
+     * Brake Shoe. If Chain Set is on that same receipt, it is already paid; …" — the way out is
+     * always named: the visit's "Add the bill" still bills whatever is left un-billed.
+     */
+    private function alreadyBilledNote(array $ids, array $covered, array $billIds): string
+    {
+        $parts = [];
+        try {
+            $bills = DB::table('t_req_master')->whereIn('id', $billIds)->get(['id', 'amount', 'status'])->keyBy('id');
+            foreach ($billIds as $rid) {
+                $b = $bills[$rid] ?? null;
+                $jobs = $this->jobNamesOfLogs(DB::table('t_fleet_service_log')->where('request_id', $rid)
+                                                ->pluck('id')->all());
+                $parts[] = 'bill #' . $rid
+                    . ($b ? ' (Rs ' . number_format((float) $b->amount) . ($b->status === 'pending' ? ', waiting for approval' : '') . ')' : '')
+                    . ($jobs !== '' ? ' for ' . $jobs : '');
+            }
+        } catch (\Throwable $e) {
+            foreach ($billIds as $rid) $parts[] = 'bill #' . $rid;
+        }
+        $s = 'No second bill was filed — this visit already has ' . implode('; ', $parts) . '.';
+        $rest = array_values(array_diff($ids, $covered));
+        if ($rest) {
+            $n = $this->jobNamesOfLogs($rest) ?: 'the new job';
+            $s .= ' If ' . $n . ' is on that same receipt, it is already paid; if it is a separate '
+                . 'receipt, use "Add the bill" on the visit.';
+        }
+        return $s;
+    }
+
+    /**
+     * 🔗⭐ A SERVICE LINK BELONGS ON A MAINTENANCE BILL ONLY (29-Sep-2026, pre-deploy C6). Every
+     *    bill door that takes `service_log_id(s)` asks this, so a petrol or other expense can
+     *    never be tied to a service record — which would reset nothing, yet hide the job from
+     *    "Add the bill" as if it were paid. Null = fine (no link, or a Maintenance bill).
+     */
+    public static function linkRefusalForCategory(?string $expenseCategory, array $linkIds): ?string
+    {
+        if (!$linkIds || $expenseCategory === 'Maintenance') return null;
+        return 'Only a maintenance bill can be linked to a service. Choose Maintenance as the '
+            . 'category, or file this expense without choosing a service.';
+    }
+
+    /** @internal save locks this process already holds — a nested bill door must not wait on its own caller. */
+    private static array $heldSaveLocks = [];
+
+    public const SAVE_BUSY_MESSAGE = 'Another save for this bike is in progress — try again in a moment.';
+
+    /**
+     * 🔒 ONE SAVE AT A TIME PER RIDER (29-Sep-2026, pre-deploy C3). Web and phone pressing Save on
+     *    the same service at the same moment both passed the double-tap and double-money checks
+     *    before either had written — two rows, or two bills. Record-and-bill now holds a short
+     *    cache lock (database store; `cache_locks`) keyed by the rider the work belongs to, which
+     *    covers every machine he holds.
+     *
+     * ⚠ FAILS OPEN. If the lock itself cannot be taken (store down, table missing) the save goes
+     *   ahead exactly as before and a warning is logged — a lock must never be why a real service
+     *   cannot be recorded. Only a lock another save genuinely HOLDS refuses, with a way out.
+     * ⚠ Re-entrant within one process: the Bikes screen files its bill through
+     *   RequestController::store, which asks for the same lock.
+     *
+     * @return array{ok:bool, message:string, release:callable}
+     */
+    public static function acquireSaveLock(int $riderId): array
+    {
+        $noop = function () {};
+        $key  = 'svc_save_rider_' . $riderId;
+        if ($riderId <= 0 || isset(self::$heldSaveLocks[$key])) {
+            return ['ok' => true, 'message' => '', 'release' => $noop];
+        }
+        $lock = null;
+        try {
+            $lock = Cache::lock($key, 30);
+            if (!$lock->get()) {
+                return ['ok' => false, 'message' => self::SAVE_BUSY_MESSAGE, 'release' => $noop];
+            }
+        } catch (\Throwable $e) {
+            Log::warning('Service save lock unavailable — saving without it', ['rider' => $riderId, 'error' => $e->getMessage()]);
+            $lock = null;
+        }
+        self::$heldSaveLocks[$key] = true;
+        return ['ok' => true, 'message' => '', 'release' => function () use ($key, $lock) {
+            unset(self::$heldSaveLocks[$key]);
+            if ($lock) {
+                try { $lock->release(); } catch (\Throwable $e) { /* it expires on its own */ }
+            }
+        }];
     }
 
     /**
@@ -597,22 +1136,132 @@ class ServiceRecordService
     }
 
     /**
-     * Write the service record.
+     * ⭐⭐ THE JOB IDS A FORM SENT, AS ONE CLEAN LIST (29-Sep-2026).
+     *
+     * Every door accepts BOTH shapes — the new `maintenance_type_ids[]` and the old scalar
+     * `maintenance_type_id` an installed APK still posts — and they must mean the same thing
+     * everywhere, so the merging lives here once. Order is kept (the first ticked job leads),
+     * repeats and non-positive values are dropped. A comma string ("1,2") is accepted too:
+     * that is what a FormData `String(array)` produces, and refusing it would only punish an
+     * old client for a shape it could not help.
+     *
+     * @return int[]
+     */
+    public static function normaliseIds(...$sources): array
+    {
+        $out = [];
+        foreach ($sources as $s) {
+            if ($s === null || $s === '' || $s === false) continue;
+            if (is_string($s) && str_contains($s, ',')) $s = explode(',', $s);
+            foreach ((array) $s as $v) {
+                $n = (int) $v;
+                if ($n > 0 && !in_array($n, $out, true)) $out[] = $n;
+            }
+        }
+        return $out;
+    }
+
+    /**
+     * ⭐⭐ SEVERAL JOBS IN ONE VISIT (owner ask, 29-Sep-2026 — Qasim ticks Oil + Tuning, Brake
+     *    Shoe and Chain Set for one trip to the workshop, with one receipt).
+     *
+     * Every id is judged by `resolveType()` — the ONE rule — and a single bad id refuses the
+     * whole visit, naming the job. A visit is never half-written: the manager would otherwise
+     * see two of his three jobs reset and have no idea the third was dropped.
+     *
+     * ⚠ No ids at all goes through `resolveType(null)` so the "Choose which service was done"
+     *   refusal (and the pre-batch-12 no-type-list behaviour) stays in exactly one place.
+     *
+     * @return array{ok:bool, jobs:array<int,array{type:?object,counts_down:bool}>, message:string}
+     */
+    public function resolveJobs($typeIds, ?string $class = null): array
+    {
+        $ids = self::normaliseIds($typeIds);
+        if (!$ids) {
+            $r = $this->resolveType(null, $class);
+            return $r['ok']
+                ? ['ok' => true, 'jobs' => [['type' => null, 'counts_down' => true]], 'message' => '']
+                : ['ok' => false, 'jobs' => [], 'message' => $r['message']];
+        }
+        $jobs = [];
+        foreach ($ids as $id) {
+            $r = $this->resolveType($id, $class);
+            if (!$r['ok']) {
+                return ['ok' => false, 'jobs' => [], 'message' =>
+                    (count($ids) > 1 ? 'Nothing was saved. ' : '') . $r['message']];
+            }
+            $jobs[] = ['type' => $r['type'], 'counts_down' => (bool) ($r['counts_down'] ?? true)];
+        }
+        return ['ok' => true, 'jobs' => $jobs, 'message' => ''];
+    }
+
+    /**
+     * Write ONE job's service record — the pre-29-Sep shape, kept for every caller that
+     * records a single job. It is `recordVisit()` with a list of one, so there is still ONE
+     * writer and one set of guards.
      *
      * @param array $in {rider_id, meter, date, type (?object from resolveType), actor_id, note}
      * @return array{ok: bool, service_log_id: ?int, moved_clock: bool, message: string}
      */
     public function record(array $in): array
     {
+        $in['jobs'] = [[
+            'type'        => $in['type'] ?? null,
+            'counts_down' => array_key_exists('counts_down', $in) ? (bool) $in['counts_down'] : true,
+        ]];
+        $r = $this->recordVisit($in);
+        $first = $r['jobs'][0] ?? null;
+        return [
+            'ok'             => $r['ok'],
+            'service_log_id' => $first['log_id'] ?? null,
+            'moved_clock'    => $r['moved_clock'],
+            'vehicle_id'     => $r['vehicle_id'] ?? null,
+            'duplicate'      => !empty($first['duplicate']),
+            'message'        => $r['message'],
+        ];
+    }
+
+    /**
+     * ⭐⭐ WRITE A VISIT — THE ONE WRITER OF `t_fleet_service_log` (29-Sep-2026).
+     *
+     * One row per job, all sharing the machine, the odometer, the date, the note, the person
+     * and the proof photo. That is not a new model: every countdown reader already keeps the
+     * furthest reading PER JOB, and two jobs at one odometer on one day never bound each other
+     * in the meter window (strict before/after), so N rows reset N countdowns on every screen —
+     * the Bikes chip, the vehicle page, the rider's phone and the alerts — with nothing else
+     * changing. Staff were already doing exactly this by hand, one job at a time.
+     *
+     * ⚠⚠ ALL OR NOTHING. The odometer is judged ONCE (it is the same number for every job),
+     *    and the rows are written in one transaction, so a failure can never leave two of three
+     *    jobs recorded and a manager believing all three were.
+     *
+     * ⚠⚠ A DOUBLE TAP IS NOT A SECOND SERVICE. Rider 77 carries four identical Oil + Tuning
+     *    rows from 2-Sep — one tap, three retries. The same job on the same machine at the same
+     *    odometer on the same day cannot have been done twice, so it is not inserted again and
+     *    the receipt says so. When EVERY job is such a repeat the answer is still `ok`: the
+     *    work is on file, which is what the person pressing Save wanted to know.
+     *
+     * @param array $in {rider_id, vehicle_id?, meter, date?, jobs: [{type, counts_down}], actor_id,
+     *                   note?, photo_path?}
+     * @return array{ok:bool, service_log_ids:int[], jobs:array, moved_clock:bool, vehicle_id:?int,
+     *               all_duplicate:bool, message:string}
+     */
+    public function recordVisit(array $in): array
+    {
         $riderId = (int) ($in['rider_id'] ?? 0);
         $meter   = (int) ($in['meter'] ?? 0);
-        $date    = $in['date'] ?: \Carbon\Carbon::today()->format('Y-m-d');
-        $type    = $in['type'] ?? null;
+        $date    = !empty($in['date']) ? substr((string) $in['date'], 0, 10) : \Carbon\Carbon::today()->format('Y-m-d');
         $actorId = (int) ($in['actor_id'] ?? 0);
+        $jobs    = array_values((array) ($in['jobs'] ?? []));
+
+        $fail = fn (string $m) => ['ok' => false, 'service_log_ids' => [], 'jobs' => [], 'moved_clock' => false,
+                                   'vehicle_id' => null, 'all_duplicate' => false, 'message' => $m];
 
         if (!$riderId || $meter <= 0) {
-            return ['ok' => false, 'service_log_id' => null, 'moved_clock' => false,
-                    'message' => 'A rider and an odometer reading are both needed.'];
+            return $fail('A rider and an odometer reading are both needed.');
+        }
+        if (!$jobs) {
+            return $fail('Choose which service was done.');
         }
 
         /**
@@ -630,9 +1279,7 @@ class ServiceRecordService
          *    countdown that never reset, with nothing anywhere saying why.
          *
          * ⭐ The SAME spine every meter reading is judged against (`readingPlausibleFor`),
-         *   so what this door accepts is exactly what the countdown will later count. A
-         *   back-dated service at a genuinely lower odometer sits inside the machine's own
-         *   range and passes; only a number the machine could never have shown is refused.
+         *   so what this door accepts is exactly what the countdown will later count.
          * ⚠ Fails OPEN when the machine is unknown or the check throws — a guard must never
          *   be the reason a real service cannot be recorded.
          */
@@ -642,121 +1289,238 @@ class ServiceRecordService
                 if (!$veh->readingPlausibleFor($vehicleId, $meter)) {
                     $cur  = $veh->currentMeterFor($vehicleId);
                     $name = $veh->find($vehicleId)['name'] ?? 'that machine';
-                    return ['ok' => false, 'service_log_id' => null, 'moved_clock' => false,
-                            'message' => number_format($meter) . ' km does not fit ' . $name . '\'s own readings'
-                                . ($cur !== null ? ' (it was last seen at ' . number_format($cur) . ' km)' : '')
-                                . '. Check the odometer — a missing digit here would record a service '
-                                . 'that no countdown can use.'];
+                    return $fail(number_format($meter) . ' km does not fit ' . $name . '\'s own readings'
+                        . ($cur !== null ? ' (it was last seen at ' . number_format($cur) . ' km)' : '')
+                        . '. Check the odometer — a missing digit here would record a service '
+                        . 'that no countdown can use.');
                 }
             } catch (\Throwable $e) {
                 // A plausibility wobble must never lose a real recording.
             }
         }
 
-        // ⭐⭐ THE SAME ODOMETER RULE EVERY CLAIM ANSWERS (Sep-20 2026). Magnitude alone let a
-        //    service typed on 19-Sep, dated 15-Sep, carry the 19th's 52,766 in — and from then
-        //    on every honest claim from the 16th was refused against it. Judged against the
-        //    SERVICE date, exactly as a claim is judged against its own date, and it refuses
-        //    only on positive evidence: a bike with no readings around that date passes.
+        // ⭐⭐ THE SAME ODOMETER RULE EVERY CLAIM ANSWERS (Sep-20 2026), asked once for the
+        //    whole visit — every job carries the same reading and the same date.
         if ($bad = $this->odometerObjection($riderId, $meter, $date, $vehicleId)) {
-            return ['ok' => false, 'service_log_id' => null, 'moved_clock' => false, 'message' => $bad];
+            return $fail($bad);
         }
 
         try {
-            $logId = null;
+            $canLog = Schema::hasTable('t_fleet_service_log');
 
             /**
-             * Every scheduled type gets a log row, so the per-type countdown on the Bikes
-             * drawer resets. Deliberately NOT a zero-amount expense request: a service
-             * record is not a money movement, and faking one would push Rs 0 rows into the
-             * expense reports and the ledger.
-             *
-             * ⚠ `$type` is null here ONLY when the type table does not exist yet — a meter
-             *   with no type is refused by resolveType() — and then there is nothing to log
-             *   against, exactly as before types were introduced. The profile stamp below
-             *   still happens in that case, so nothing regresses.
+             * 📷⭐⭐ THE PROOF PHOTO BELONGS TO THE WORK, NOT TO A BILL (owner ruling,
+             *    11-Sep-2026). One photo, one receipt — every job of the visit points at it.
+             * ⚠ Schema-guarded: the photo is simply not kept until the Sep-12 columns exist.
              */
-            if ($type && Schema::hasTable('t_fleet_service_log')) {
-                /**
-                 * 📷⭐⭐ THE PROOF PHOTO BELONGS TO THE WORK, NOT TO A BILL (owner ruling,
-                 *    11-Sep-2026): *"the photo is entered because when they go for the
-                 *    service, the riders will get this as proof. And using this, my managers
-                 *    might enter the amount."*
-                 *
-                 * ⚠⚠ UNTIL NOW A PHOTO COULD ONLY RIDE ON AN EXPENSE CLAIM, so the ordinary
-                 *    workshop case — rider handed a receipt, no money moved, manager pays
-                 *    later — had nowhere to put it. The manager then typed an amount he could
-                 *    not see the evidence for. Stored here, the photo exists from the moment
-                 *    the work is recorded, and any bill filed later inherits it.
-                 * ⚠ Schema-guarded: safe to upload before the Sep-12 SQL runs; the photo is
-                 *   simply not kept until the columns exist (the record itself is unaffected).
-                 */
-                $photoCols = [];
-                if (!empty($in['photo_path']) && self::logKeepsPhoto()) {
-                    $photoCols = [
-                        'photo_path' => (string) $in['photo_path'],
-                        'photo_by'   => $actorId ?: null,
-                        'photo_at'   => now(),
+            $photoCols = [];
+            if (!empty($in['photo_path']) && self::logKeepsPhoto()) {
+                $photoCols = [
+                    'photo_path' => (string) $in['photo_path'],
+                    'photo_by'   => $actorId ?: null,
+                    'photo_at'   => now(),
+                ];
+            }
+
+            $out = [];
+            $movedAny = false;
+            DB::transaction(function () use ($jobs, $canLog, $riderId, $vehicleId, $meter, $date, $actorId,
+                                             $photoCols, $in, &$out, &$movedAny) {
+                $seen = [];
+                foreach ($jobs as $j) {
+                    $type   = $j['type'] ?? null;
+                    $counts = array_key_exists('counts_down', $j) ? (bool) $j['counts_down'] : true;
+                    $tid    = $type ? (int) $type->id : null;
+                    if ($tid !== null && isset($seen[$tid])) continue;
+                    if ($tid !== null) $seen[$tid] = true;
+
+                    /**
+                     * ⭐ ONLY AN OIL SERVICE stamps the rider-profile fallback clock. Every job
+                     *   still resets its OWN countdown — that is derived from the row itself —
+                     *   but the profile stamp is the one-clock-era seed for a rider with no
+                     *   registered machine, and a brake job must never make an overdue oil
+                     *   change look done there. A job with no countdown on this machine moves
+                     *   nothing at all (owner ruling, 11-Sep: "it won't reset any countdowns").
+                     */
+                    $moved = $counts && (!$type || $type->resets_service_clock);
+
+                    $logId = null;
+                    $dup   = false;
+                    if ($type && $canLog) {
+                        $existing = $this->existingJobRecord($riderId, $vehicleId, (int) $type->id, $date, $meter);
+                        if ($existing) {
+                            $logId = $existing;
+                            $dup   = true;
+                        } else {
+                            $logId = (int) DB::table('t_fleet_service_log')->insertGetId(
+                                // ⭐ The stamp, when the column exists. Schema-guarded so this
+                                //   file is safe to upload before service_log_vehicle_sep2026.sql.
+                                (self::logStampsVehicle() && $vehicleId ? ['vehicle_id' => $vehicleId] : [])
+                                + $photoCols + [
+                                'user_id'             => $riderId,
+                                'maintenance_type_id' => (int) $type->id,
+                                'meter'               => $meter,
+                                'service_date'        => $date,
+                                'note'                => mb_substr((string) ($in['note'] ?? 'Recorded on the Bikes screen (no bill filed)'), 0, 250),
+                                'created_by'          => $actorId ?: null,
+                                'created_at'          => now(),
+                            ]);
+                        }
+                    }
+                    if ($moved && !$dup) $movedAny = true;
+
+                    $out[] = [
+                        'type'        => $type,
+                        'type_id'     => $tid,
+                        'name'        => $type ? (string) $type->type_name : 'Service',
+                        'log_id'      => $logId,
+                        'counts_down' => $counts,
+                        'moved_clock' => $moved,
+                        'duplicate'   => $dup,
                     ];
                 }
 
-                $logId = (int) DB::table('t_fleet_service_log')->insertGetId(
-                    // ⭐ The stamp, when the column exists. Schema-guarded so this file is
-                    //   safe to upload before service_log_vehicle_sep2026.sql runs.
-                    (self::logStampsVehicle() && $vehicleId ? ['vehicle_id' => $vehicleId] : [])
-                    + $photoCols + [
-                    'user_id'             => $riderId,
-                    'maintenance_type_id' => (int) $type->id,
-                    'meter'               => $meter,
-                    'service_date'        => $date,
-                    'note'                => $in['note'] ?? 'Recorded on the Bikes screen (no bill filed)',
-                    'created_by'          => $actorId ?: null,
-                    'created_at'          => now(),
-                ]);
-            }
-
-            /**
-             * ⭐ ONLY a clock-resetting type moves the bike's overall service-due clock. A
-             * brake-shoe job is real work on its own 10,000 km cycle, but it must never make
-             * an overdue oil change look done — the same rule the approval path enforces via
-             * BikeServiceClock.
-             *
-             * ⚠⚠ NO INTERVAL IS WRITTEN HERE. The old "schedule follows the work done" write
-             *    stamped the recorded type's interval as the bike's own override, which after
-             *    Aug-27 silently rewrote a DIFFERENT job's schedule (Oil Change 1,200 → 2,500
-             *    from one click) and opted the bike out of the company default forever. An
-             *    override is written only when a manager explicitly asks for one.
-             *
-             * ⚠⚠ AND NOW: A JOB WITH NO COUNTDOWN ON THIS MACHINE MOVES NOTHING (11-Sep-2026).
-             *    Since `resolveType()` stopped refusing unscheduled work, a type with no figure
-             *    for this class reaches here for the first time. `resets_service_clock` alone
-             *    would have let it stamp `last_service_meter` — i.e. "Other repair" would have
-             *    silently marked the oil change done. The caller passes `counts_down`; when the
-             *    job does not count down on THIS machine, the work is logged and no clock moves.
-             *    That is exactly the owner's ruling: *"it won't reset any countdowns."*
-             */
-            $countsDown = array_key_exists('counts_down', $in) ? (bool) $in['counts_down'] : true;
-            $movedClock = $countsDown && (!$type || $type->resets_service_clock);
-            if ($movedClock) {
-                DB::table('t_ops_rider_profile')->where('user_id', $riderId)->update([
-                    'last_service_meter' => $meter,
-                    'last_service_at'    => $date,
-                    'updated_at'         => now(),
-                ]);
-            }
+                if ($movedAny) {
+                    DB::table('t_ops_rider_profile')->where('user_id', $riderId)->update([
+                        'last_service_meter' => $meter,
+                        'last_service_at'    => $date,
+                        'updated_at'         => now(),
+                    ]);
+                }
+            });
 
             // ⚠ The MACHINE's caches, not just the rider's — the record may be for a bike he
             //   is not on today, which is the whole reason the stamp exists.
             $this->bustCaches($riderId, $vehicleId);
 
-            return ['ok' => true, 'service_log_id' => $logId, 'moved_clock' => $movedClock,
-                    'vehicle_id' => $vehicleId,
-                    'message' => $this->receipt($type, $meter, $date, $movedClock)];
+            // Each job says when it is next due — the same resolver every countdown reads.
+            $class = null;
+            try {
+                $class = $vehicleId ? (new VehicleService())->classOf($vehicleId) : null;
+            } catch (\Throwable $e) {
+                $class = null;
+            }
+            foreach ($out as &$o) {
+                $o['next_due'] = $this->nextDueText($o['type'], $o['counts_down'], $vehicleId, $class,
+                                                    $riderId, $meter, $date);
+            }
+            unset($o);
+
+            $allDup = $out && !array_filter($out, fn ($o) => empty($o['duplicate']));
+            $ids    = array_values(array_filter(array_map(fn ($o) => $o['log_id'], $out)));
+
+            return [
+                'ok'              => true,
+                'service_log_ids' => $ids,
+                'jobs'            => array_map(function ($o) {
+                    unset($o['type']);
+                    return $o;
+                }, $out),
+                'moved_clock'     => $movedAny,
+                'vehicle_id'      => $vehicleId,
+                'all_duplicate'   => (bool) $allDup,
+                'message'         => $this->visitReceipt($out, $meter, $date),
+            ];
         } catch (\Throwable $e) {
-            Log::error('ServiceRecordService::record failed', ['rider' => $riderId, 'error' => $e->getMessage()]);
-            return ['ok' => false, 'service_log_id' => null, 'moved_clock' => false,
-                    'message' => 'Could not save the service record.'];
+            Log::error('ServiceRecordService::recordVisit failed', ['rider' => $riderId, 'error' => $e->getMessage()]);
+            return $fail('Could not save the service record.');
         }
+    }
+
+    /**
+     * The row that already says "this job was done on this machine, this day, at this
+     * reading" — the double-tap guard. Keyed on the MACHINE when the stamp exists; a row
+     * filed before the stamp is matched on the rider instead, exactly as the readers do.
+     */
+    private function existingJobRecord(int $riderId, ?int $vehicleId, int $typeId, string $date, int $meter): ?int
+    {
+        try {
+            $q = DB::table('t_fleet_service_log')
+                ->where('maintenance_type_id', $typeId)
+                ->whereDate('service_date', $date)
+                ->where('meter', $meter);
+            if ($vehicleId && self::logStampsVehicle()) {
+                $q->where(function ($w) use ($vehicleId, $riderId) {
+                    $w->where('vehicle_id', $vehicleId)
+                      ->orWhere(fn ($x) => $x->whereNull('vehicle_id')->where('user_id', $riderId));
+                });
+            } else {
+                $q->where('user_id', $riderId);
+            }
+            $id = $q->orderBy('id')->value('id');
+            return $id ? (int) $id : null;
+        } catch (\Throwable $e) {
+            return null;   // a guard that cannot answer must not block the recording
+        }
+    }
+
+    /**
+     * "next due at 56,125 km" / "next due on 27 Mar 2027" / "logged as work done, no
+     * countdown" — ONE job's effect, from the same resolver every countdown reads, so the
+     * receipt can never quote a figure the schedule panel then contradicts (the old receipt
+     * used the raw bike figure, which on the van was simply wrong).
+     */
+    private function nextDueText($type, bool $countsDown, ?int $vehicleId, ?string $class, ?int $riderId,
+                                 int $meter, string $date): string
+    {
+        if (!$type) return '';
+        if (!$countsDown) return 'logged as work done — no countdown';
+        try {
+            $r = (new ServiceIntervalResolver())->resolveFor($vehicleId, $class, $type, $riderId);
+            if (($r['basis'] ?? 'km') === MaintenanceTypeModel::BASIS_TIME && !empty($r['days'])) {
+                return 'next due on ' . \Carbon\Carbon::parse($date)->addDays((int) $r['days'])->format('j M Y');
+            }
+            if (!empty($r['km'])) {
+                return 'next due at ' . number_format($meter + (int) $r['km']) . ' km';
+            }
+        } catch (\Throwable $e) {
+            // fall through to the job's own figure
+        }
+        return (int) ($type->interval_km ?? 0) > 0
+            ? 'next due at ' . number_format($meter + (int) $type->interval_km) . ' km'
+            : '';
+    }
+
+    /**
+     * ⭐ WHAT ACTUALLY HAPPENED, IN WORDS — one sentence for one job, one line per job for a
+     *   visit. Every door prints this, so the Bikes screen, the workshop close and the rider's
+     *   "did it get done?" can never describe the same save differently.
+     *
+     * ⚠ No "overall service clock" sentence any more (owner, 29-Sep-2026). Every job resets its
+     *   own countdown and says when it is next due; the bike's summary chip is simply the most
+     *   urgent of those, so there is no second clock to report on.
+     *
+     * @param array $jobs rows from recordVisit (need name, counts_down, duplicate, next_due)
+     */
+    public function visitReceipt(array $jobs, int $meter, string $date): string
+    {
+        $backdated = $date !== \Carbon\Carbon::today()->format('Y-m-d');
+        $when = $backdated ? ' on ' . \Carbon\Carbon::parse($date)->format('D j M') : '';
+        $at   = number_format($meter) . ' km' . $when;
+
+        $fresh = array_values(array_filter($jobs, fn ($j) => empty($j['duplicate'])));
+        $dups  = array_values(array_filter($jobs, fn ($j) => !empty($j['duplicate'])));
+
+        if (!$fresh) {
+            $names = implode(' + ', array_map(fn ($j) => $j['name'], $dups));
+            return 'Already recorded — ' . $names . ' at ' . $at . ' is on file, so nothing was added again.';
+        }
+
+        if (count($jobs) === 1) {
+            $j = $fresh[0];
+            $s = $j['name'] . ' recorded at ' . $at;
+            if (empty($j['counts_down']) && !empty($j['type_id'])) {
+                return $s . '. Recorded as work done — no countdown was reset, because this job is not on a schedule';
+            }
+            return $s . (!empty($j['next_due']) ? ' — ' . $j['next_due'] : '');
+        }
+
+        $lines = array_map(fn ($j) => $j['name'] . (!empty($j['next_due']) ? ' (' . $j['next_due'] . ')' : ''), $fresh);
+        $s = count($fresh) . ' jobs recorded at ' . $at . ': ' . implode(' · ', $lines);
+        if ($dups) {
+            $s .= '. Already on file, not added again: ' . implode(' + ', array_map(fn ($j) => $j['name'], $dups));
+        }
+        return $s;
     }
 
     /**
@@ -789,18 +1553,39 @@ class ServiceRecordService
             $row = DB::table('t_fleet_service_log')->where('id', $logId)->first();
             if (!$row) return ['ok' => false, 'message' => 'That service record no longer exists.'];
 
-            $update = ['note' => $row->note];
+            /**
+             * ⭐⭐ A VISIT IS CORRECTED AS ONE (owner ruling, 29-Sep-2026). The jobs of one trip
+             *    share one odometer and one day because they ARE one reading. Fixing a typo on
+             *    one job and leaving it on the others would leave the visit with two truths —
+             *    and the wrong one still inside a countdown. So a meter or date fix moves every
+             *    job of the visit unless the caller explicitly says `apply_to_visit = 0`.
+             * ⚠ WHICH JOB it was stays per row: correcting Oil Change → Oil + Tuning is about
+             *   one job only.
+             */
+            $toVisit  = !array_key_exists('apply_to_visit', $in) || $in['apply_to_visit'] === null
+                        || filter_var($in['apply_to_visit'], FILTER_VALIDATE_BOOLEAN);
+            $siblings = $this->visitSiblingsOf($row);
+            $addIds   = self::normaliseIds($in['add_type_ids'] ?? null);
 
-            if (array_key_exists('maintenance_type_id', $in) && $in['maintenance_type_id']) {
+            $update = [];
+            if (array_key_exists('maintenance_type_id', $in) && $in['maintenance_type_id']
+                && (int) $in['maintenance_type_id'] !== (int) $row->maintenance_type_id) {
                 $t = $this->resolveType($in['maintenance_type_id']);
                 if (!$t['ok']) return ['ok' => false, 'message' => $t['message']];
+                // ⚠ Re-typing a job into one the visit already has would record it twice.
+                foreach ($siblings as $s) {
+                    if ((int) $s->maintenance_type_id === (int) $t['type']->id) {
+                        return ['ok' => false, 'message' => $t['type']->type_name . ' is already recorded for '
+                            . 'this visit. Remove this record instead of changing it.'];
+                    }
+                }
                 $update['maintenance_type_id'] = (int) $t['type']->id;
             }
-            if (!empty($in['meter'])) {
+            if (!empty($in['meter']) && (int) $in['meter'] !== (int) $row->meter) {
                 if ((int) $in['meter'] <= 0) return ['ok' => false, 'message' => 'Give the odometer in kilometres.'];
                 $update['meter'] = (int) $in['meter'];
             }
-            if (!empty($in['date'])) {
+            if (!empty($in['date']) && $in['date'] !== substr((string) $row->service_date, 0, 10)) {
                 if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $in['date'])) {
                     return ['ok' => false, 'message' => 'Give the date as YYYY-MM-DD.'];
                 }
@@ -810,55 +1595,158 @@ class ServiceRecordService
                 }
                 $update['service_date'] = $in['date'];
             }
-            if (count($update) === 1) return ['ok' => false, 'message' => 'Nothing to change.'];
+            if (!$update && !$addIds) return ['ok' => false, 'message' => 'Nothing to change.'];
+
+            $moves   = isset($update['meter']) || isset($update['service_date']);
+            $targets = [$row];
+            if ($moves && $toVisit) {
+                $targets = array_merge($targets, $siblings);
+            } elseif (isset($update['meter']) && !empty($row->request_id)) {
+                /**
+                 * ⚠⚠ ONE BILL, ONE READING. Jobs paid by the same receipt share the claim's single
+                 *    odometer, and the claim mirrors onto every job it pays for — so moving just
+                 *    one of them would be undone by its own bill a moment later. Even "this job
+                 *    only" therefore carries the jobs on the same bill.
+                 */
+                foreach ($siblings as $s) {
+                    if (!empty($s->request_id) && (int) $s->request_id === (int) $row->request_id) $targets[] = $s;
+                }
+            }
+            $targetIds = array_map(fn ($r) => (int) $r->id, $targets);
+
+            $newMeter = (int) ($update['meter'] ?? $row->meter);
+            $newDate  = (string) ($update['service_date'] ?? substr((string) $row->service_date, 0, 10));
+
+            /**
+             * ⚠⚠ A MOVE MUST NOT LAND ON A TWIN (pre-deploy C5, 29-Sep-2026). A meter or date fix
+             *    that puts a job exactly where the SAME job is already recorded — same machine,
+             *    day and odometer, a different record — would leave one job on file twice, the
+             *    very shape the double-tap guard exists to prevent. Only a job change was checked
+             *    before; a move is now checked the same way, and the refusal names the twin.
+             */
+            if ($moves) {
+                foreach ($targets as $t) {
+                    $tid = (int) ((int) $t->id === (int) $row->id && isset($update['maintenance_type_id'])
+                        ? $update['maintenance_type_id'] : $t->maintenance_type_id);
+                    if ($tid <= 0) continue;
+                    $moved = clone $t;
+                    $moved->meter = $newMeter;
+                    $moved->service_date = $newDate;
+                    $key = self::visitKeyOf($moved);
+                    foreach (DB::table('t_fleet_service_log')
+                                ->whereNotIn('id', $targetIds)
+                                ->where('maintenance_type_id', $tid)
+                                ->whereDate('service_date', $newDate)
+                                ->where('meter', $newMeter)
+                                ->orderBy('id')
+                                ->get(array_merge(['id', 'user_id', 'meter', 'service_date'], self::logVehicleCols())) as $twin) {
+                        if (self::visitKeyOf($twin) !== $key) continue;
+                        $jobName = (string) (DB::table('t_fleet_maintenance_types')->where('id', $tid)->value('type_name') ?: 'this job');
+                        return ['ok' => false, 'message' => 'Service record #' . (int) $twin->id . ' dated '
+                            . \Carbon\Carbon::parse($newDate)->format('j M Y') . ' already has ' . $jobName
+                            . ' at ' . number_format($newMeter) . ' km — remove one of them first, then correct the other.'];
+                    }
+                }
+            }
 
             // ⭐⭐ A CORRECTION IS JUDGED LIKE A NEW ENTRY (Sep-20 2026) — on the pair it
-            //    will LEAVE BEHIND (new meter or old, new date or old), with this row itself
-            //    left out of the window so it cannot bound its own correction. Without this
-            //    the Edit door could "fix" log #28 into another impossible pair in silence.
-            if (isset($update['meter']) || isset($update['service_date'])) {
-                $bad = $this->odometerObjection(
-                    (int) $row->user_id,
-                    (int) ($update['meter'] ?? $row->meter),
-                    (string) ($update['service_date'] ?? substr((string) $row->service_date, 0, 10)),
-                    self::logVehicleOf($row),
-                    $logId
-                );
+            //    will LEAVE BEHIND, with every record being moved left out of the window so the
+            //    visit can never bound its own correction.
+            if ($moves) {
+                $bad = $this->odometerObjection((int) $row->user_id, $newMeter, $newDate,
+                                                self::logVehicleOf($row), $targetIds);
                 if ($bad) return ['ok' => false, 'message' => $bad];
             }
 
             // ⭐ The correction is part of the record. Without this an audit cannot tell a
             //   figure someone chose from one someone later fixed.
-            $update['note'] = trim(($row->note ? $row->note . ' · ' : '')
-                . 'corrected ' . \Carbon\Carbon::today()->format('j M Y') . ' by ' . $this->nameOf($actorId));
-            $update['note'] = mb_substr($update['note'], 0, 250);
+            $stamp = 'corrected ' . \Carbon\Carbon::today()->format('j M Y') . ' by ' . $this->nameOf($actorId);
 
-            DB::table('t_fleet_service_log')->where('id', $logId)->update($update);
+            $claims = [];
+            DB::transaction(function () use ($targets, $row, $update, $stamp, &$claims) {
+                foreach ($targets as $t) {
+                    $u = array_intersect_key($update, array_flip(['meter', 'service_date']));
+                    if ((int) $t->id === (int) $row->id && isset($update['maintenance_type_id'])) {
+                        $u['maintenance_type_id'] = $update['maintenance_type_id'];
+                    }
+                    if (!$u) continue;
+                    $u['note'] = mb_substr(trim(($t->note ? $t->note . ' · ' : '') . $stamp), 0, 250);
+                    DB::table('t_fleet_service_log')->where('id', $t->id)->update($u);
+                    if (!empty($t->request_id)) {
+                        $claims[(int) $t->request_id] = ($claims[(int) $t->request_id] ?? false)
+                            || ((int) $t->id === (int) $row->id && isset($u['maintenance_type_id']));
+                    }
+                }
+            });
 
             /**
-             * ⭐⭐ ONE JOB = ONE TRUTH (review, 3-Sep). When this record was filed WITH its bill,
-             *    the claim carries the same odometer and job. Correct the log alone and the
-             *    two halves disagree — harmless while linked (the evidence engine follows the
-             *    log), but the moment the log is removed the claim resurfaces carrying the
-             *    figure that was just declared wrong. So the reading is mirrored onto the
-             *    claim through the same narrow door a manager would use by hand. The AMOUNT is
-             *    never touched — that is the whole point of that door.
+             * ⭐⭐ ONE JOB = ONE TRUTH (review, 3-Sep). A bill filed with these records carries
+             *    the same odometer. Correct the records alone and the two halves disagree — so
+             *    the reading is mirrored onto each bill through the same narrow door a manager
+             *    would use by hand. The AMOUNT is never touched.
+             * ⚠ The JOB is mirrored only onto a bill that pays for this one job alone. A shared
+             *   bill keeps its lead job; its label is read from the records it pays for.
              */
             $mirrored = '';
-            if (!empty($row->request_id) && (isset($update['meter']) || isset($update['maintenance_type_id']))) {
-                $m = $this->correctClaim((int) $row->request_id, [
-                    'meter'               => $update['meter'] ?? null,
-                    'maintenance_type_id' => $update['maintenance_type_id'] ?? null,
-                ], $actorId);
+            foreach ($claims as $rid => $typeChangedHere) {
+                $linkedCount = (int) DB::table('t_fleet_service_log')->where('request_id', $rid)->count();
+                $mc = [];
+                if (isset($update['meter'])) $mc['meter'] = $update['meter'];
+                if ($typeChangedHere && $linkedCount === 1) $mc['maintenance_type_id'] = $update['maintenance_type_id'];
+                if (!$mc) continue;
+                $m = $this->correctClaim($rid, $mc, $actorId);
                 $mirrored = $m['ok'] ? ' The linked expense now carries the same reading.'
                                      : ' ⚠ The linked expense could NOT be updated: ' . $m['message'];
+            }
+
+            /**
+             * ➕ A JOB FORGOTTEN AT THE TIME (29-Sep-2026) — recorded into the SAME visit through
+             *    the one writer, so it is judged, stamped and de-duplicated exactly like the rest.
+             */
+            $added = '';
+            if ($addIds) {
+                $vid   = self::logVehicleOf($row);
+                $class = null;
+                try {
+                    $class = $vid ? (new VehicleService())->classOf($vid) : null;
+                } catch (\Throwable $e) {
+                    $class = null;
+                }
+                $jobs = $this->resolveJobs($addIds, $class);
+                if (!$jobs['ok']) {
+                    return ['ok' => false, 'message' => ($update ? 'The correction was saved, but ' : '')
+                        . $jobs['message']];
+                }
+                $rec = $this->recordVisit([
+                    'rider_id'   => (int) $row->user_id,
+                    'vehicle_id' => $vid,
+                    'meter'      => $newMeter,
+                    'date'       => $newDate,
+                    'jobs'       => $jobs['jobs'],
+                    'actor_id'   => $actorId,
+                    'note'       => 'Added to this visit ' . \Carbon\Carbon::today()->format('j M Y')
+                                    . ' by ' . $this->nameOf($actorId),
+                ]);
+                if (!$rec['ok']) {
+                    return ['ok' => false, 'message' => ($update ? 'The correction was saved, but the job could not be added: ' : '')
+                        . $rec['message']];
+                }
+                $added = ' ' . $rec['message'] . '.';
             }
 
             $this->rebuildProfileStamp((int) $row->user_id);
             // ⚠ The machine the row is ABOUT — a correction to a service on a bike he no
             //   longer holds must still clear that bike's countdown cache.
             $this->bustCaches((int) $row->user_id, self::logVehicleOf($row));
-            return ['ok' => true, 'message' => 'Service record corrected.' . $mirrored];
+
+            $n = count($targets);
+            $said = $update
+                ? ($n > 1 && $moves
+                    ? 'Visit corrected — all ' . $n . ' jobs now read ' . number_format($newMeter)
+                      . ' km on ' . \Carbon\Carbon::parse($newDate)->format('j M') . '.'
+                    : 'Service record corrected.')
+                : '';
+            return ['ok' => true, 'message' => trim($said . $mirrored . $added)];
         } catch (\Throwable $e) {
             Log::error('ServiceRecordService::amend failed', ['log' => $logId, 'error' => $e->getMessage()]);
             return ['ok' => false, 'message' => 'Could not correct that record.'];
@@ -955,15 +1843,27 @@ class ServiceRecordService
             $mirrored = '';
             try {
                 if (Schema::hasColumn('t_fleet_service_log', 'request_id')) {
-                    $log = DB::table('t_fleet_service_log')->where('request_id', $requestId)->first(['id', 'user_id']);
-                    if ($log) {
+                    /**
+                     * ⚠⚠ EVERY record the bill pays for (29-Sep-2026) — one receipt may cover a
+                     *    whole visit, and those jobs share one odometer. Mirroring onto the first
+                     *    only would split the visit into two readings.
+                     * ⚠ The JOB is mirrored only when the bill pays for exactly one record: a
+                     *   shared bill's lead job is not "the" job of its other records.
+                     */
+                    $logs = DB::table('t_fleet_service_log')->where('request_id', $requestId)
+                        ->orderBy('id')->get(['id', 'user_id']);
+                    if ($logs->isNotEmpty()) {
                         $lu = [];
-                        if (isset($update['meter_at_fill']))       $lu['meter'] = $update['meter_at_fill'];
-                        if (isset($update['maintenance_type_id'])) $lu['maintenance_type_id'] = $update['maintenance_type_id'];
+                        if (isset($update['meter_at_fill'])) $lu['meter'] = $update['meter_at_fill'];
+                        if (isset($update['maintenance_type_id']) && $logs->count() === 1) {
+                            $lu['maintenance_type_id'] = $update['maintenance_type_id'];
+                        }
                         if ($lu) {
-                            DB::table('t_fleet_service_log')->where('id', $log->id)->update($lu);
-                            $this->rebuildProfileStamp((int) $log->user_id);
-                            $mirrored = ' The linked service record now carries the same reading.';
+                            DB::table('t_fleet_service_log')->whereIn('id', $logs->pluck('id')->all())->update($lu);
+                            $this->rebuildProfileStamp((int) $logs->first()->user_id);
+                            $mirrored = $logs->count() > 1
+                                ? ' All ' . $logs->count() . ' linked service records now carry the same reading.'
+                                : ' The linked service record now carries the same reading.';
                         }
                     }
                 }
@@ -998,7 +1898,10 @@ class ServiceRecordService
         }
     }
 
-    /** Remove a service record that should never have been there. */
+    /**
+     * Remove ONE job record that should never have been there. Always per job — unticking
+     * Chain Set from a visit removes Chain Set, never the Oil + Tuning done beside it.
+     */
     public function remove(int $logId, int $actorId): array
     {
         try {
@@ -1008,38 +1911,117 @@ class ServiceRecordService
             $row = DB::table('t_fleet_service_log')->where('id', $logId)->first();
             if (!$row) return ['ok' => false, 'message' => 'That service record no longer exists.'];
             // ⚠ Read BEFORE the delete — afterwards there is no row to resolve the machine from.
-            $wasFor = self::logVehicleOf($row);
+            $wasFor   = self::logVehicleOf($row);
+            $siblings = $this->visitSiblingsOf($row);
 
             DB::table('t_fleet_service_log')->where('id', $logId)->delete();
-            // ⚠ A visit that produced this record must stop pointing at a row that is gone.
+            /**
+             * ⚠ A workshop visit that produced this record must stop pointing at a row that is
+             *   gone. When another job of the SAME visit survives, the link moves to it (the
+             *   visit still produced a service); only a visit with nothing left loses it.
+             */
             try {
                 if (Schema::hasTable(WorkshopVisitService::T_VISIT)) {
                     DB::table(WorkshopVisitService::T_VISIT)
-                        ->where('service_log_id', $logId)->update(['service_log_id' => null]);
+                        ->where('service_log_id', $logId)
+                        ->update(['service_log_id' => $siblings ? (int) $siblings[0]->id : null]);
                 }
             } catch (\Throwable $e) { /* the visit stays, it just loses the link */ }
 
             $this->rebuildProfileStamp((int) $row->user_id);
-            $this->bustCaches((int) $row->user_id, $wasFor);
 
             /**
              * ⚠⚠ DELETING A SERVICE NEVER DELETES MONEY (review, 3-Sep). When this record was
              *    filed with its bill, the claim stays exactly as it is — approved, in the
-             *    ledger, or in a queue. What changes is only that it stops being hidden behind
-             *    this row: it resurfaces in Past services and in the evidence as an ordinary
-             *    claim. The manager is told so, because "I removed it" must not be read as
-             *    "the expense is gone too".
+             *    ledger, or in a queue. The manager is told so, because "I removed it" must not
+             *    be read as "the expense is gone too".
+             * ⭐ A bill SHARED by several jobs (29-Sep-2026) keeps covering the ones that
+             *   remain, and its lead job moves to one of them — otherwise the bill would go on
+             *   printing the name of the job just removed.
              */
             $kept = '';
             if (!empty($row->request_id)) {
-                $amt = DB::table('t_req_master')->where('id', $row->request_id)->value('amount');
-                $kept = ' The Rs ' . number_format((float) $amt) . ' expense filed with it is NOT removed'
-                      . ' — it stays on record; reverse it from the claims flow if it should not stand.';
+                $amt  = DB::table('t_req_master')->where('id', $row->request_id)->value('amount');
+                $left = DB::table('t_fleet_service_log')->where('request_id', $row->request_id)
+                    ->orderBy('id')->get(['id', 'maintenance_type_id']);
+                if ($left->isNotEmpty()) {
+                    try {
+                        $claimType = DB::table('t_req_master')->where('id', $row->request_id)->value('maintenance_type_id');
+                        if (!$left->contains(fn ($l) => (int) $l->maintenance_type_id === (int) $claimType)) {
+                            $lead = $this->leadLogOf($left->all());
+                            $t = $lead ? app(MaintenanceTypeService::class)->find($lead->maintenance_type_id) : null;
+                            if ($t) {
+                                DB::table('t_req_master')->where('id', $row->request_id)->update([
+                                    'maintenance_type_id' => (int) $t->id,
+                                    'service_type'        => $t->bucket === 'regular' ? 'oil_change' : 'repair',
+                                ]);
+                            }
+                        }
+                    } catch (\Throwable $e) {
+                        Log::warning('remove: shared bill lead not moved', ['log' => $logId, 'error' => $e->getMessage()]);
+                    }
+                    $kept = ' The Rs ' . number_format((float) $amt) . ' bill stays on record and now covers '
+                          . ($this->jobNamesOfLogs($left->pluck('id')->all()) ?: 'the remaining jobs') . '.';
+                } else {
+                    $kept = ' The Rs ' . number_format((float) $amt) . ' expense filed with it is NOT removed'
+                          . ' — it stays on record; reverse it from the claims flow if it should not stand.'
+                          . $this->releaseClaimAsService((int) $row->request_id, $row, $actorId);
+                }
             }
+            $this->bustCaches((int) $row->user_id, $wasFor);
             return ['ok' => true, 'message' => 'Service record removed.' . $kept];
         } catch (\Throwable $e) {
             Log::error('ServiceRecordService::remove failed', ['log' => $logId, 'error' => $e->getMessage()]);
             return ['ok' => false, 'message' => 'Could not remove that record.'];
+        }
+    }
+
+    /**
+     * ⭐⭐ THE LAST JOB ON A BILL WAS REMOVED — the bill stops counting as that service (owner
+     *    ruling D7, 29-Sep-2026: "asks first and says the clock goes back, and the clock really
+     *    does go back").
+     *
+     * ⚠⚠ WHY SOMETHING HAS TO CHANGE ON THE CLAIM. While a job record carries the bill, the
+     *    evidence engine hides the claim (the job speaks for it). Remove the last job and the
+     *    APPROVED claim steps back in as evidence at the same odometer — so the countdown the
+     *    manager just took back would never move. The claim's job type is cleared, and for an
+     *    oil-bucket claim its legacy `service_type` too: an untyped claim marked oil_change is
+     *    counted by the legacy "untyped oil change" readers (overallServiceStateFor,
+     *    lastServicePointBefore, the rider fallback anchor), which would put the clock right
+     *    back. A `repair` flag is kept — no clock reads it, and its "Repair" label stays.
+     * ⭐ The MONEY is untouched: amount, category (Maintenance), status, date, machine, the
+     *   ledger posting and the title that names the job. It reads as a plain maintenance
+     *   expense from here on; the description records why, and a manager can re-type a pending
+     *   one through the claim edit if the work did happen after all.
+     * ⚠ Only a LIVE bill — a rejected or cancelled one is not evidence of anything already.
+     *
+     * @return string the sentence for the receipt ('' when nothing changed)
+     */
+    private function releaseClaimAsService(int $requestId, object $removedRow, int $actorId): string
+    {
+        try {
+            $claim = DB::table('t_req_master')->where('id', $requestId)
+                ->first(['id', 'status', 'expense_category', 'maintenance_type_id', 'service_type', 'description']);
+            if (!$claim || !in_array($claim->status, self::LIVE_BILL_STATUSES, true)
+                || ($claim->expense_category ?? '') !== 'Maintenance') {
+                return '';
+            }
+            $job = (string) (DB::table('t_fleet_maintenance_types')->where('id', (int) $removedRow->maintenance_type_id)
+                                ->value('type_name') ?: 'this job');
+            $u = ['maintenance_type_id' => null];
+            if (in_array($claim->service_type, ['oil_change', 'general'], true)) $u['service_type'] = null;
+            $note = trim((string) ($claim->description ?? ''));
+            $u['description'] = mb_substr(($note !== '' ? $note . "\n" : '')
+                . 'Service record removed ' . \Carbon\Carbon::today()->format('j M Y') . ' by ' . $this->nameOf($actorId)
+                . ' (' . $job . ') — this bill no longer counts as a service; the amount was not changed.', 0, 2000);
+            $u['updated_by'] = $actorId ?: null;
+            $u['updated_at'] = now();
+            DB::table('t_req_master')->where('id', $requestId)->update($u);
+            return ' This was the last job on bill #' . $requestId . ', so that bill no longer counts as a '
+                . 'service for ' . $job . ' — its countdown goes back to the previous ' . $job . ' on record.';
+        } catch (\Throwable $e) {
+            Log::warning('remove: claim not released as a service', ['request' => $requestId, 'error' => $e->getMessage()]);
+            return '';
         }
     }
 
@@ -1059,7 +2041,7 @@ class ServiceRecordService
      *   the reason a real service cannot be recorded. It refuses only on positive evidence.
      */
     private function odometerObjection(int $riderId, int $meter, string $date, ?int $vehicleId,
-                                       ?int $ignoreLogId = null): ?string
+                                       $ignoreLogId = null): ?string   // int, or a whole visit's ids
     {
         try {
             return (new FuelClaimRules())->odometerObjection($riderId, $meter, $date, $vehicleId, $ignoreLogId);
@@ -1101,35 +2083,21 @@ class ServiceRecordService
     }
 
     /**
-     * What actually changed, in words. Names the job and its next due, and is explicit
-     * when the bike's overall clock did NOT move — otherwise recording brake shoes reads
-     * as "the bike is serviced", which is the confusion per-type schedules exist to end.
+     * One job, in words — kept for any caller that still thinks in single jobs. It is the
+     * visit receipt for a list of one, so there is ONE sentence for "what just happened".
+     * ⚠ `$movedClock` no longer changes the wording: every job resets its own countdown and
+     *   says when it is next due; the old "overall clock unchanged" line is gone (29-Sep-2026).
      */
     public function receipt($type, int $meter, string $date, bool $movedClock): string
     {
-        $backdated = $date !== \Carbon\Carbon::today()->format('Y-m-d');
-        $said = [];
-        $said[] = ($type ? $type->type_name : 'Service')
-            . ' recorded at ' . number_format($meter) . ' km'
-            . ($backdated ? ' on ' . \Carbon\Carbon::parse($date)->format('D j M') : '')
-            . ($type && (int) $type->interval_km > 0
-                ? ' — next due at ' . number_format($meter + (int) $type->interval_km) . ' km'
-                : '');
-        if ($type && !$movedClock) {
-            /**
-             * ⚠ TWO DIFFERENT REASONS NOTHING MOVED, and a manager must be able to tell them
-             *   apart (11-Sep-2026). Either the job HAS a countdown of its own but is not the
-             *   one that resets the overall clock (brake shoes), or it has no countdown on this
-             *   machine at all (an "other repair", or a job with no figures for a van). Saying
-             *   "only an oil service moves that" for the second case would imply a countdown
-             *   exists somewhere, and a manager would go looking for it.
-             */
-            $hasOwn = (int) ($type->interval_km ?? 0) > 0;
-            $said[] = $hasOwn
-                ? 'The bike\'s overall service-due clock is unchanged (only an oil service moves that)'
-                : 'Recorded as work done — no countdown was reset, because this job is not on a schedule';
-        }
-        return implode('. ', $said);
+        $counts = $type ? ((int) ($type->interval_km ?? 0) > 0 || !empty($type->interval_days)) : true;
+        return $this->visitReceipt([[
+            'name'        => $type ? (string) $type->type_name : 'Service',
+            'type_id'     => $type ? (int) $type->id : null,
+            'counts_down' => $counts,
+            'duplicate'   => false,
+            'next_due'    => $this->nextDueText($type, $counts, null, null, null, $meter, $date),
+        ]], $meter, $date);
     }
 
     /**
@@ -1147,6 +2115,8 @@ class ServiceRecordService
      */
     public function bustCaches(int $riderId, ?int $vehicleId = null): void
     {
+        // A write may have linked a bill to more jobs, or taken one away — forget the labels.
+        self::flushClaimLabels();
         try {
             $vid = (new VehicleResolver())->currentVehicleFor($riderId);
         } catch (\Throwable $e) {

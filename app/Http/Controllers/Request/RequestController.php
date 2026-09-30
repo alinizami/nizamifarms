@@ -185,8 +185,42 @@ class RequestController extends Controller
 
     /**
      * Store new request
+     *
+     * 🔒 C3 (29-Sep-2026): a bill LINKED to service records holds the same per-rider save lock as
+     *    "Record a service", so the same receipt filed from two screens at once cannot pass the
+     *    double-money guard twice. Every other request goes straight through, exactly as before.
+     *    Fails open when the lock store is unavailable; re-entrant for the Bikes screen, which
+     *    files its bill through here while already holding the lock.
      */
     public function store(Request $request)
+    {
+        $linkIds = \App\Services\Riders\ServiceRecordService::normaliseIds(
+            $request->input('service_log_ids'), $request->input('service_log_id'));
+        if (!$linkIds) return $this->storeRequest($request);
+
+        $saveLock = \App\Services\Riders\ServiceRecordService::acquireSaveLock(
+            (int) ($request->input('requester_user_id') ?: auth()->id()));
+        if (!$saveLock['ok']) {
+            return response()->json(['success' => false, 'busy' => true, 'message' => $saveLock['message']], 409);
+        }
+        $level = DB::transactionLevel();
+        try {
+            return $this->storeRequest($request);
+        } finally {
+            /**
+             * ⚠⚠ A REFUSAL INSIDE storeRequest() LEAVES ITS TRANSACTION OPEN — several of its
+             *    early returns (the double-money refusal among them) come after
+             *    DB::beginTransaction() with no rollBack. Nothing was written in it, and the
+             *    connection would roll it back at the end of the request anyway — but the lock's
+             *    release (a DELETE on the same connection) would be rolled back WITH it, leaving
+             *    this rider "busy" for 30 s after an ordinary refusal. So it is closed here first.
+             */
+            while (DB::transactionLevel() > $level) DB::rollBack();
+            ($saveLock['release'])();
+        }
+    }
+
+    private function storeRequest(Request $request)
     {
         $validated = $request->validate([
             'category_id' => 'required|exists:t_req_category,id',
@@ -207,6 +241,8 @@ class RequestController extends Controller
              *    meter or date. Absent = a new service, i.e. today's behaviour.
              */
             'service_log_id' => 'nullable|integer',
+            // ⭐ 29-Sep-2026: ONE bill for several jobs of the same visit (one receipt).
+            'service_log_ids'   => 'nullable',
             // The named type. When present the server derives service_type from its
             // bucket and ignores whatever the client sent for it.
             'maintenance_type_id' => 'nullable|integer',
@@ -241,6 +277,15 @@ class RequestController extends Controller
                 'success' => false,
                 'message' => 'Staff salaries must be paid from the Payroll screen, not entered as an expense.'
             ], 422);
+        }
+
+        // 🔗 C6 (29-Sep-2026): only a Maintenance bill may be tied to service records — the one
+        //    rule, shared with the rider's own request door. Asked before any transaction opens.
+        if ($linkRefusal = \App\Services\Riders\ServiceRecordService::linkRefusalForCategory(
+                $validated['expense_category'] ?? null,
+                \App\Services\Riders\ServiceRecordService::normaliseIds(
+                    $request->input('service_log_ids'), $validated['service_log_id'] ?? null))) {
+            return response()->json(['success' => false, 'message' => $linkRefusal], 422);
         }
 
         // A per-km claim anchored to a real attendance row + meter reading. Same
@@ -544,7 +589,8 @@ class RequestController extends Controller
              *   never to the manager filing it.
              */
             $svcLink = app(\App\Services\Riders\ServiceRecordService::class)
-                ->validateBillTarget($validated['service_log_id'] ?? null, (int) $requesterId);
+                ->validateBillTarget(\App\Services\Riders\ServiceRecordService::normaliseIds(
+                    $request->input('service_log_ids'), $validated['service_log_id'] ?? null), (int) $requesterId);
             if (!$svcLink['ok']) {
                 return response()->json(['success' => false, 'message' => $svcLink['message']], 422);
             }
@@ -552,6 +598,11 @@ class RequestController extends Controller
                 $validated['meter_at_fill']       = $svcLink['inherit']['meter'];
                 $validated['expense_date']        = $svcLink['inherit']['date'];
                 $validated['maintenance_type_id'] = $svcLink['inherit']['maintenance_type_id'];
+                // ⭐ …and the machine the service was recorded on (29-Sep-2026), unless the form
+                //   named one — so the money lands on the bike that went in, not today's spare.
+                if (empty($validated['vehicle_id']) && !empty($svcLink['inherit']['vehicle_id'])) {
+                    $validated['vehicle_id'] = (int) $svcLink['inherit']['vehicle_id'];
+                }
                 $svcResolved = app(\App\Services\Riders\MaintenanceTypeService::class)->resolve(
                     $svcLink['inherit']['maintenance_type_id'], $validated['service_type'] ?? null
                 );
@@ -781,9 +832,10 @@ class RequestController extends Controller
 
             // 🧾 Tie the bill to the service that was chosen for it, before anything else
             //    reads the pair — the approval hook below can post to the ledger immediately.
-            if (!empty($validated['service_log_id'])) {
+            //    ⭐ Every job the bill was chosen for — one receipt may pay for a whole visit.
+            if (!empty($svcLink['log_ids'])) {
                 app(\App\Services\Riders\ServiceRecordService::class)
-                    ->attachBillToService((int) $validated['service_log_id'], (int) $requestModel->id);
+                    ->attachBillToService($svcLink['log_ids'], (int) $requestModel->id);
             }
 
             // 🏍️ Record which machine this claim was for (Aug-2026). Keyed to the

@@ -193,6 +193,11 @@ class ReceiptController extends Controller
         // Resolved from the container, not newed up, so a test can bind a fake reader
         // and prove the card end to end without spending a real model call.
         $reader = app(ReceiptExtractionService::class);
+        // 🤖 Sep-27: this vendor's products (and, for Frozen, the recipe ingredients) go to
+        //    the reader IN THE SAME CALL, so it can say which of OURS each line is.
+        if (method_exists($reader, 'withHints')) {
+            $reader->withHints($this->readerHints($vendor));
+        }
         $read   = $reader->extract($path);
 
         if (!$read) {
@@ -243,14 +248,6 @@ class ReceiptController extends Controller
         ]);
     }
 
-    /**
-     * Turn what the model read into what a person confirms.
-     *
-     * Every line comes back, in printed order, whether or not it matched anything. A
-     * line we could not place is shown EMPTY and flagged, never guessed — guessing here
-     * would put meat against the wrong product, and the whole point of the card is that
-     * a human looks at it.
-     */
     /**
      * The products most likely to be what a printed line means — at most three.
      *
@@ -323,6 +320,62 @@ class ReceiptController extends Controller
         ], array_slice($scored, 0, 3));
     }
 
+    /**
+     * 🤖 What the reader may match a printed line to: this vendor's ACTIVE products, and —
+     * only where the vendor deals in ingredients (Frozen) — the active, non-meat recipe
+     * ingredients (meat is never bought on a vendor line). Fails soft to nothing: a bill
+     * with no hints reads exactly as it always has.
+     *
+     * ⭐ Owner ruling D5 (Sep-29): suggestions are for FROZEN vendors only (business unit 2).
+     *   Every other vendor gets no hints at all, so its bill is read with exactly the
+     *   pre-suggestion prompt and schema.
+     */
+    private function readerHints(VendorModel $vendor): array
+    {
+        $hints = ['products' => [], 'ingredients' => []];
+        if ((int) ($vendor->business_unit_id ?? 0) !== 2) {
+            return $hints;
+        }
+        try {
+            foreach ((new PurchaseLogService())->vendorProducts((int) $vendor->id) as $p) {
+                $hints['products'][] = ['id' => (int) $p->id, 'name' => (string) $p->product_name, 'unit' => $p->unit];
+            }
+            if ($this->vendorDealsInIngredients($vendor)) {
+                $hints['ingredients'] = IngredientModel::where('business_unit_id', (int) $vendor->business_unit_id)
+                    ->where('is_active', 1)
+                    ->whereNull('storage_product_id')
+                    ->orderBy('name')
+                    ->get(['id', 'name'])
+                    ->map(fn ($i) => ['id' => (int) $i->id, 'name' => (string) $i->name])
+                    ->all();
+            }
+        } catch (\Throwable $e) {
+            \Log::warning('Receipt: reader hints failed (reading without them)', ['error' => $e->getMessage()]);
+        }
+        return $hints;
+    }
+
+    /** The same rule as VendorProductController::dealsInIngredients — Frozen, and the column exists. */
+    private function vendorDealsInIngredients(VendorModel $vendor): bool
+    {
+        if ((int) ($vendor->business_unit_id ?? 0) !== 2) {
+            return false;
+        }
+        try {
+            return \App\Models\FIN\VendorPurchaseItemModel::supportsIngredients();
+        } catch (\Throwable $e) {
+            return false;
+        }
+    }
+
+    /**
+     * Turn what the model read into what a person confirms.
+     *
+     * Every line comes back, in printed order, whether or not it matched anything. A
+     * line we could not place is shown EMPTY and flagged, never guessed — guessing here
+     * would put meat against the wrong product, and the whole point of the card is that
+     * a human looks at it.
+     */
     private function buildCard(VendorModel $vendor, array $read, ReceiptExtractionService $reader): array
     {
         $resolver = new PurchaseLogService();
@@ -338,6 +391,13 @@ class ReceiptController extends Controller
         // Read once; used for the "did you mean" ranking on every unmatched line and for
         // telling an empty catalogue apart from a failed match.
         $catalogue = $resolver->vendorProducts((int) $vendor->id);
+        $catalogueById = [];
+        foreach ($catalogue as $p) {
+            $catalogueById[(int) $p->id] = $p;
+        }
+        $aiDeals = $this->vendorDealsInIngredients($vendor);
+        $aiCount = 0;      // lines with a product suggestion (tap to confirm)
+        $aiNewCount = 0;   // lines not on the list, with an ingredient guess (add as new)
 
         $lines = [];
         foreach ($read['lines'] as $raw) {
@@ -386,7 +446,50 @@ class ReceiptController extends Controller
                 $raw['sold_by'] ?? null, $raw['pack_size_value'] ?? null, $raw['pack_size_unit'] ?? null
             );
 
+            // 🤖 The reader's own guess — ONLY for a line nothing else could place, only a
+            //    product still on this vendor's ACTIVE list, and never applied: the person
+            //    taps to confirm. The ingredient guess is offered only when there is no
+            //    product guess, as the start of "add it as a new product".
+            $aiProduct = null;
+            $aiIngredient = null;
+            if (!$match) {
+                $aid = (int) ($raw['ai_match'] ?? 0);
+                if ($aid && isset($catalogueById[$aid])) {
+                    $ap = $catalogueById[$aid];
+                    $aiProduct = [
+                        'id'   => (int) $ap->id,
+                        'name' => (string) $ap->product_name,
+                        'unit' => $ap->unit ?? null,
+                        'rate' => (float) ($ap->rate_per_unit ?? 0),
+                    ];
+                } elseif ($aiDeals && (int) ($raw['ai_ingredient'] ?? 0)) {
+                    $ai = $ingredients->get((int) $raw['ai_ingredient']);
+                    if ($ai && !$ai->isMeat() && (int) $ai->business_unit_id === (int) $vendor->business_unit_id) {
+                        $aiIngredient = ['id' => (int) $ai->id, 'name' => $ai->name, 'base_unit' => $ai->base_unit];
+                    }
+                }
+                if ($aiProduct) {
+                    $aiCount++;
+                } elseif ($aiIngredient) {
+                    $aiNewCount++;
+                }
+            }
+
+            $wordSuggestions = $match ? [] : $this->closestProducts((string) $raw['raw_name'], $catalogue);
+            if ($aiProduct) {
+                // shown once, as the reader's suggestion — not again in "Did you mean"
+                $wordSuggestions = array_values(array_filter($wordSuggestions, fn ($s) => $s['id'] !== $aiProduct['id']));
+            } elseif ($aiIngredient && !empty($read['hinted_products'])) {
+                // ⚠ Seen on the live Mega slip: "Fresh Green Chillies" drew a shared-word
+                //   "Did you mean Red Chilli Whole?" while the reader — shown the whole list —
+                //   answered "none of these, it is Green Chilli". A word overlap that the
+                //   reader has already looked at and rejected is a trap, not a hint.
+                $wordSuggestions = [];
+            }
+
             $lines[] = [
+                'ai_suggestion'   => $aiProduct,
+                'ai_ingredient'   => $aiIngredient,
                 'discount_applied' => $discountApplied,
                 'suggested_unit'   => $prefill['unit'],
                 'suggested_pack_qty_base' => $prefill['pack_qty_base'],
@@ -414,7 +517,7 @@ class ReceiptController extends Controller
                 // ⭐ "Not found" is a dead end. When we cannot place a line, offer the
                 //   closest products this vendor already has so the answer is usually one
                 //   tap — and if none of them fit, the card offers adding it as new.
-                'suggestions'     => $match ? [] : $this->closestProducts((string) $raw['raw_name'], $catalogue),
+                'suggestions'     => $wordSuggestions,
 
                 // a line the person can tick off as not-an-ingredient
                 'not_ingredient'  => false,
@@ -458,6 +561,26 @@ class ReceiptController extends Controller
         if ($catalogueSize === 0) {
             $warnings[] = 'This vendor has no products yet, so nothing on the bill can be matched. '
                 . 'Add each item as a product — you can do it from here, one line at a time.';
+        } elseif ($unmatched > 0 && ($aiCount + $aiNewCount) > 0) {
+            // 🤖 ONE box, not three. Seen on the phone 29-Sep: "13 could not be matched", "1 has a
+            //    suggestion" and "9 are not on the list" stacked above the bill, all about the same
+            //    13 lines. Said once, as the three things a person actually does.
+            $byHand = max(0, $unmatched - $aiCount - $aiNewCount);
+            $parts = [];
+            if ($aiCount > 0) {
+                $parts[] = '🤖 ' . ($aiCount === 1 ? '1 has a suggestion' : $aiCount . ' have a suggestion')
+                    . ' from this vendor\'s list — tap to confirm';
+            }
+            if ($aiNewCount > 0) {
+                $parts[] = '🤖 ' . ($aiNewCount === 1
+                    ? '1 is not on this vendor\'s list yet but looks like a recipe ingredient — add it as a product in one tap'
+                    : $aiNewCount . ' are not on this vendor\'s list yet but look like recipe ingredients — add each as a product in one tap');
+            }
+            if ($byHand > 0) {
+                $parts[] = ($byHand === 1 ? '1 needs' : $byHand . ' need') . ' picking by hand';
+            }
+            $warnings[] = ($unmatched === 1 ? '1 line needs' : $unmatched . ' lines need') . ' a product: '
+                . implode('; ', $parts) . '. Nothing is used until you tap.';
         } elseif ($unmatched > 0) {
             $warnings[] = $unmatched === 1
                 ? 'One line could not be matched to this vendor\'s product list. Pick the product it '
@@ -606,6 +729,10 @@ class ReceiptController extends Controller
             // matching already gets it right.
             $learned = $this->teachFromCard($request, (int) $vendorId);
 
+            // 🤖 How the reader's suggestions fared — kept on the draft so the hit rate can be
+            //    read later. Measurement only: it can never touch the purchase.
+            $this->recordAiOutcome($draft, $request);
+
             return response()->json([
                 'success'        => true,
                 'transaction_id' => $body['transaction_id'] ?? null,
@@ -637,9 +764,49 @@ class ReceiptController extends Controller
     }
 
     /**
-     * Rebuild the request the weighted-purchase endpoint expects, carrying the uploaded
-     * bill image through. Same shape a hand-typed purchase posts.
+     * 🤖 For every line the reader suggested a product for: did the person take it
+     *    (accepted), pick something else (changed), or leave the line off (dropped)?
+     *    Stored as `ai_outcome` inside the draft's parsed_json. Never throws.
      */
+    private function recordAiOutcome(ReceiptDraftModel $draft, Request $request): void
+    {
+        try {
+            $card = json_decode((string) $draft->parsed_json, true);
+            if (!is_array($card) || empty($card['lines'])) {
+                return;
+            }
+            // what was submitted, by printed name (a name can repeat on a bill)
+            $sent = [];
+            foreach ((array) $request->input('items', []) as $item) {
+                $sent[trim((string) ($item['raw_name'] ?? ''))][] = (int) ($item['product_id'] ?? 0);
+            }
+            $out = ['suggested' => 0, 'accepted' => 0, 'changed' => 0, 'dropped' => 0, 'lines' => []];
+            foreach ($card['lines'] as $l) {
+                $sug = $l['ai_suggestion']['id'] ?? null;
+                if (!$sug) {
+                    continue;
+                }
+                $out['suggested']++;
+                $key = trim((string) ($l['raw_name'] ?? ''));
+                $chosen = isset($sent[$key]) && $sent[$key] ? array_shift($sent[$key]) : null;
+                $state = $chosen === null ? 'dropped' : ((int) $chosen === (int) $sug ? 'accepted' : 'changed');
+                $out[$state]++;
+                $out['lines'][] = ['printed' => $key, 'suggested' => (int) $sug, 'chosen' => $chosen, 'state' => $state];
+            }
+            if ($out['suggested'] === 0) {
+                return;
+            }
+            $card['ai_outcome'] = $out;
+            $draft->update(['parsed_json' => json_encode($card)]);
+            \Log::info('Receipt AI suggestions', [
+                'draft' => $draft->id, 'suggested' => $out['suggested'],
+                'accepted' => $out['accepted'], 'changed' => $out['changed'], 'dropped' => $out['dropped'],
+            ]);
+        } catch (\Throwable $e) {
+            \Log::warning('Receipt AI outcome not recorded (purchase is safe)', ['error' => $e->getMessage()]);
+        }
+    }
+
     /**
      * Teach the resolver what this shop calls each product, from a card a person just
      * confirmed. Returns the names learned, for the message on screen.
@@ -703,6 +870,10 @@ class ReceiptController extends Controller
         }
     }
 
+    /**
+     * Rebuild the request the weighted-purchase endpoint expects, carrying the uploaded
+     * bill image through. Same shape a hand-typed purchase posts.
+     */
     private function purchaseRequest(Request $request, $vendorId, ?ReceiptDraftModel $draft = null): Request
     {
         $body = $request->except(['client_uuid', 'draft_id']);

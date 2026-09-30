@@ -599,79 +599,40 @@ class WorkshopVisitController extends Controller
     }
 
     /**
-     * 💰 File the bill the workshop handed over, against the service just recorded.
+     * 💰 File the bill the workshop handed over — ONE bill for every job of the trip.
      *
-     * ⭐⭐ Goes through Request\RequestController::store like every other bill — so it inherits
-     *    the request number, the L1/L2 auto-approval rule (which for a RIDER means it queues
-     *    for a manager, exactly as his own claims do), the ledger posting and the vehicle
-     *    stamping. `service_log_id` ties it to the reading, so the pair is one job and one row.
-     *
+     * ⭐⭐ A thin call to `ServiceRecordService::fileBill`, the ONE bill door the Bikes screen uses
+     *    too (29-Sep-2026). This used to be its own copy, and it titled the claim after the job
+     *    the visit was BOOKED for rather than the jobs actually done.
+     * ⚠ A rider filing his own bill is not "on behalf of" — fileBill decides that from the
+     *   same signed-in user RequestController::store reads.
      * ⚠ Non-fatal by design. The service is already recorded; if the money cannot be filed the
      *   rider is told, and a manager can attach the bill later from the vehicle page.
+     *
+     * ⚠⚠ ONE RECEIPT IS NEVER PAID TWICE (pre-deploy A1, 29-Sep-2026): when any job of this close
+     *    already carries a live bill, none is filed and the message names that bill
+     *    (`billRecordedVisit`) — this used to bill the other jobs for the FULL amount again.
+     *
+     * @param array $recorded the result of recordVisit()
+     * @param bool  $skipped  set true when a live bill already covered the visit
      */
-    private function fileVisitBill(Request $request, array $visit, ?int $logId, float $amount): string
+    private function fileVisitBill(Request $request, array $visit, array $recorded, float $amount, bool &$skipped = false): string
     {
         try {
-            if (!$logId) return '';
-            $category = \App\Models\Request\RequestCategoryModel::where('category_code', 'expense')
-                ->where('is_active', 1)->first();
-            if (!$category) return ' The bill was not filed: the expense category is not set up.';
-
-            $files = [];
-            if ($request->hasFile('bill_image')) $files['attachment_image'] = $request->file('bill_image');
-
-            /**
-             * ⚠⚠ A RIDER FILING HIS OWN BILL MUST NOT LOOK LIKE FILING FOR SOMEONE ELSE.
-             *    `RequestController::store` treats the presence of `requester_user_id` as
-             *    "on behalf of", which needs a permission no rider holds — so sending it here
-             *    refused the rider his own workshop bill outright ("You do not have permission
-             *    to create requests for other users"). Omitted when he IS the requester; store()
-             *    then defaults to the signed-in user, which is the same person.
-             * ⚠ Still sent when a MANAGER completes the visit for him, which is genuinely on
-             *   behalf of, and which he does hold the right for.
-             */
-            /**
-             * ⚠⚠ READ THE SAME USER `store()` READS. It resolves the filer with `auth()->user()`,
-             *    NOT the request's user resolver — so deciding "is this on behalf of someone
-             *    else?" from a different source lets the two disagree: this half would omit
-             *    `requester_user_id` while store() then files the claim for a different person,
-             *    and the link would be refused as belonging to another rider. One source.
-             */
-            $actorId  = (int) (auth()->id() ?: (($request->user())->id ?? 0));
-            $onBehalf = (int) $visit['user_id'] !== $actorId;
-
-            $sub = Request::create('/api/requests/store', 'POST', array_filter([
-                'category_id'        => $category->id,
-                'requester_user_id'  => $onBehalf ? (int) $visit['user_id'] : null,
-                // ⚠ The visit row carries the type ID, not its name — resolve it so the claim
-                //   reads "Oil Change" rather than a generic label on every workshop bill.
-                'title'              => (function () use ($visit) {
-                    $t = app(\App\Services\Riders\MaintenanceTypeService::class)
-                        ->find($visit['maintenance_type_id'] ?? null);
-                    return $t->type_name ?? 'Workshop visit';
-                })(),
-                'description'        => 'Filed with the workshop visit on '
-                                        . substr((string) $visit['visit_date'], 0, 10) . '.',
-                'amount'             => $amount,
-                'expense_category'   => 'Maintenance',
-                // ⚠ The reading, job and date are INHERITED from the service — not resent here.
-                'service_log_id'     => $logId,
+            if (!\App\Services\Riders\ServiceRecordService::normaliseIds($recorded['service_log_ids'] ?? [])) return '';
+            $bill = app(\App\Services\Riders\ServiceRecordService::class)->billRecordedVisit($request, $recorded, [
+                'rider_id'    => (int) $visit['user_id'],
+                'amount'      => $amount,
                 'payment_source_account_id' => $request->input('payment_source_account_id'),
-                // Bikes is Nizami Farms operations — never the other books.
-                'business_unit_id'   => 1,
-            // ⚠ array_filter drops the NULL requester_user_id (and any null pay source) so the
-            //   on-behalf check never sees a key that is not really there.
-            ], fn ($v) => $v !== null), [], $files);
-            $sub->setUserResolver($request->getUserResolver());
-
-            $res  = app(\App\Http\Controllers\Request\RequestController::class)->store($sub);
-            $body = json_decode($res->getContent(), true);
-            if ($res->getStatusCode() < 200 || $res->getStatusCode() >= 300 || empty($body['success'])) {
-                return ' Bill NOT filed: ' . ($body['message'] ?? 'it was refused.');
+                'description' => 'Filed with the workshop visit on ' . substr((string) $visit['visit_date'], 0, 10) . '.',
+            ]);
+            if (!empty($bill['skipped_existing'])) {
+                $skipped = true;
+                return ' ' . $bill['message'];
             }
-            return ' Rs ' . number_format($amount) . ' bill '
-                 . (!empty($body['auto_approved']) ? 'added and approved.' : 'sent for approval.')
-                 . (!empty($files) ? ' Photo attached.' : ' No photo attached.');
+            return $bill['ok']
+                ? ' ' . $bill['message']
+                : ' Bill NOT filed: ' . $bill['message'] . ' A manager can add it from the vehicle page.';
         } catch (\Throwable $e) {
             \Log::error('fileVisitBill failed', ['visit' => $visit['id'] ?? null, 'error' => $e->getMessage()]);
             return ' The bill could not be filed — a manager can add it from the vehicle page.';
@@ -692,6 +653,9 @@ class WorkshopVisitController extends Controller
             //   the same place (and under the same rules) as any other service.
             'meter'               => 'nullable|integer|min:0',
             'maintenance_type_id' => 'nullable|integer',
+            // ⭐ 29-Sep-2026: every job the workshop did on this trip — merged with the scalar
+            //   above, so a phone that sends only one job behaves exactly as before.
+            'maintenance_type_ids'   => 'nullable',
             'service_log_id'      => 'nullable|integer',
             /**
              * 💰 THE BILL, OPTIONAL (owner ruling Q5, 3-Sep). The workshop hands the receipt
@@ -749,8 +713,29 @@ class WorkshopVisitController extends Controller
             return response()->json(['success' => false, 'message' => $err], 422);
         }
 
+        /**
+         * 🔒 C3 (29-Sep-2026): one record-and-bill at a time for the visit's rider — the manager
+         *    closing it on the web and the rider answering "ho gaya?" on his phone at the same
+         *    moment must not record the jobs, or file the bill, twice. Fails open when the lock
+         *    store is unavailable.
+         */
+        $saveLock = \App\Services\Riders\ServiceRecordService::acquireSaveLock((int) ($visit['user_id'] ?? 0));
+        if (!$saveLock['ok']) {
+            return response()->json(['success' => false, 'busy' => true, 'message' => $saveLock['message']], 409);
+        }
+        try {
+            return $this->recordAndClose($request, $id, $data, $user, $visit);
+        } finally {
+            ($saveLock['release'])();
+        }
+    }
+
+    /** The body of done() once the gate has passed and the save lock is held. */
+    private function recordAndClose(Request $request, $id, array $data, $user, array $visit)
+    {
         $recorded = null;
         $billMsg  = null;
+        $billSkipped = false;
         if ($request->filled('meter')) {
             /**
              * ⚠⚠ ORDER MATTERS. The service is recorded FIRST and the visit is closed only
@@ -772,22 +757,24 @@ class WorkshopVisitController extends Controller
             $vKlass = !empty($visit['vehicle_id'])
                 ? (new \App\Services\Riders\VehicleService())->classOf((int) $visit['vehicle_id'])
                 : null;
-            $type = $rec->resolveType($data['maintenance_type_id'] ?? $visit['maintenance_type_id'], $vKlass);
-            if (!$type['ok']) {
-                return response()->json(['success' => false, 'message' => $type['message']], 422);
-            }
             /**
+             * ⭐⭐ EVERY JOB DONE ON THIS TRIP (29-Sep-2026), judged by the one rule — one bad id
+             *    refuses the lot. With none named, the job the visit was BOOKED for, so completing
+             *    a scheduled service still needs no re-picking.
+             *
              * ⭐⭐ AN UNSCHEDULED JOB IS STILL RECORDED, IT JUST RESETS NOTHING (owner ruling,
              *    11-Sep-2026: *"if it's not a regular maintenance, if it's something else, he
              *    should be able to add that as well. In which case, no meter will be reset."*)
-             *
-             * ⚠⚠ THIS IS THE CLOSE THAT USED TO BE IMPOSSIBLE. On prod only two of the four
-             *    types carry a kilometre figure, so `resolveType()` refused the other two and
-             *    a manager who had just paid for brake shoes could not close the visit at all
-             *    — the "only 2 categories" report. He can now, and the countdown stays honest.
+             *    Each job carries `counts_down` for THIS machine.
              */
-            $countsDown = (bool) ($type['counts_down'] ?? true);
-            $recorded = $rec->record([
+            $typeIds = \App\Services\Riders\ServiceRecordService::normaliseIds(
+                $request->input('maintenance_type_ids'), $data['maintenance_type_id'] ?? null);
+            if (!$typeIds && !empty($visit['maintenance_type_id'])) $typeIds = [(int) $visit['maintenance_type_id']];
+            $jobs = $rec->resolveJobs($typeIds, $vKlass);
+            if (!$jobs['ok']) {
+                return response()->json(['success' => false, 'message' => $jobs['message']], 422);
+            }
+            $recorded = $rec->recordVisit([
                 'rider_id'   => (int) $visit['user_id'],
                 /**
                  * ⭐⭐ THE VISIT NAMES THE MACHINE — so the record is stamped with it rather
@@ -796,19 +783,14 @@ class WorkshopVisitController extends Controller
                  *
                  * ⚠⚠ THIS IS THE CASE THE DERIVATION GETS WRONG, and it is the ordinary one:
                  *    the bike goes IN, the manager puts him on a spare for the day, and the
-                 *    registry then answers "the spare". The oil change was credited to a bike
-                 *    that never had one, the visit read done with a `service_log_id`, and the
-                 *    real machine's countdown kept running with nothing saying why. The bike
-                 *    that went to the workshop is right here on the visit; use it.
+                 *    registry then answers "the spare". The bike that went to the workshop is
+                 *    right here on the visit; use it.
                  */
                 'vehicle_id' => !empty($visit['vehicle_id']) ? (int) $visit['vehicle_id'] : null,
                 'meter'      => (int) $data['meter'],
                 'date'       => substr((string) $visit['visit_date'], 0, 10),
-                'type'       => $type['type'],
+                'jobs'       => $jobs['jobs'],
                 'actor_id'   => (int) $user->id,
-                // ⭐ See the ruling above: work is logged, the clock moves only if the job
-                //   actually counts down on THIS machine.
-                'counts_down' => $countsDown,
                 /**
                  * 📷 THE RIDER'S PROOF, kept whether or not he paid (owner ruling, 11-Sep).
                  *    He is handed a receipt at the counter; the manager who enters the amount
@@ -822,21 +804,20 @@ class WorkshopVisitController extends Controller
             if (!$recorded['ok']) {
                 return response()->json(['success' => false, 'message' => $recorded['message']], 422);
             }
-            $data['service_log_id'] = $recorded['service_log_id'];
+            // ⭐ The visit links to its LEAD job (the first oil service, else the first job).
+            //   Remove moves the link to a surviving job of the same visit.
+            $data['service_log_id'] = $rec->leadLogId($recorded['service_log_ids'] ?? []);
 
             /**
-             * 💰 …AND ITS BILL, if the workshop handed one over (owner ruling Q5).
+             * 💰 …AND ITS BILL, if the workshop handed one over (owner ruling Q5) — ONE bill
+             *    for every job of the trip, through the one bill door (`fileBill`).
              *
-             * ⭐ Filed through the SAME door every other bill goes through — the claim carries
-             *   the service's own reading, is linked to it, and inherits the L1/L2 rule, the
-             *   ledger posting and the vehicle stamping. No second copy of any of that.
              * ⚠ ORDER: the service is already recorded above. A bill that fails to file must
              *   NOT lose the reading — the work happened either way — so this only decorates
              *   the receipt message and never changes the outcome of the visit.
              */
             if (!empty($data['amount']) && (float) $data['amount'] > 0) {
-                $billMsg = $this->fileVisitBill($request, $visit, $recorded['service_log_id'] ?? null,
-                                                (float) $data['amount']);
+                $billMsg = $this->fileVisitBill($request, $visit, $recorded, (float) $data['amount'], $billSkipped);
             }
         }
 
@@ -887,7 +868,11 @@ class WorkshopVisitController extends Controller
 
         return response()->json([
             'success'        => true,
-            'service_log_id' => $recorded['service_log_id'] ?? null,
+            'service_log_id'  => $recorded ? ($data['service_log_id'] ?? null) : null,
+            // ⭐ 29-Sep-2026: every job record this close wrote (one per job done).
+            'service_log_ids' => $recorded['service_log_ids'] ?? [],
+            // ⭐ A1: an amount was given, but a live bill already covers this visit — none filed.
+            'bill_skipped_existing' => $billSkipped,
             'tickets_closed' => $closedOk ?? 0,
             'message'        => trim($res['message'] . ' ' . ($recorded['message'] ?? '')
                                      . ' ' . ($billMsg ?? '') . ' ' . $closedNote),

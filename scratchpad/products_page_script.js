@@ -124,7 +124,7 @@ function applyChangeEverywhere(prefix) {
     if (prefix) { body.product_units = {}; body.product_units[document.getElementById('edit_product_id').value] = document.getElementById('edit_unit').value; }
     fetch(CHANGE_UNIT_URL + '/' + p.dataset.ingredient + '/change-unit', {
         method: 'POST',
-        headers: {'Content-Type': 'application/json', 'Accept': 'application/json', 'X-CSRF-TOKEN': 'lMx454A44cIirAvebfypnZSW36ZB7RxAzgegZHhr'},
+        headers: {'Content-Type': 'application/json', 'Accept': 'application/json', 'X-CSRF-TOKEN': 'kaxhjOX1IBvlTVW0Ey8tO8JQYqynp87IJhaEIMyG'},
         body: JSON.stringify(body)
     })
     .then(function (r) { return r.json(); })
@@ -224,7 +224,7 @@ document.getElementById('addProductForm').addEventListener('submit', function(e)
         method: 'POST',
         headers: {
             'Content-Type': 'application/json',
-            'X-CSRF-TOKEN': 'lMx454A44cIirAvebfypnZSW36ZB7RxAzgegZHhr'
+            'X-CSRF-TOKEN': 'kaxhjOX1IBvlTVW0Ey8tO8JQYqynp87IJhaEIMyG'
         },
         body: JSON.stringify(formData)
     })
@@ -308,7 +308,7 @@ document.getElementById('editProductForm').addEventListener('submit', function(e
         method: 'PUT',
         headers: {
             'Content-Type': 'application/json',
-            'X-CSRF-TOKEN': 'lMx454A44cIirAvebfypnZSW36ZB7RxAzgegZHhr'
+            'X-CSRF-TOKEN': 'kaxhjOX1IBvlTVW0Ey8tO8JQYqynp87IJhaEIMyG'
         },
         body: JSON.stringify(formData)
     })
@@ -338,7 +338,7 @@ function toggleStatus(id, currentStatus) {
         method: 'POST',
         headers: {
             'Content-Type': 'application/json',
-            'X-CSRF-TOKEN': 'lMx454A44cIirAvebfypnZSW36ZB7RxAzgegZHhr'
+            'X-CSRF-TOKEN': 'kaxhjOX1IBvlTVW0Ey8tO8JQYqynp87IJhaEIMyG'
         }
     })
     .then(response => response.json())
@@ -371,7 +371,7 @@ function setAsDefault(productId, isCurrentlyDefault) {
         method: 'POST',
         headers: {
             'Content-Type': 'application/json',
-            'X-CSRF-TOKEN': 'lMx454A44cIirAvebfypnZSW36ZB7RxAzgegZHhr'
+            'X-CSRF-TOKEN': 'kaxhjOX1IBvlTVW0Ey8tO8JQYqynp87IJhaEIMyG'
         }
     })
     .then(response => response.json())
@@ -399,7 +399,7 @@ function deleteProduct(id) {
         method: 'DELETE',
         headers: {
             'Content-Type': 'application/json',
-            'X-CSRF-TOKEN': 'lMx454A44cIirAvebfypnZSW36ZB7RxAzgegZHhr'
+            'X-CSRF-TOKEN': 'kaxhjOX1IBvlTVW0Ey8tO8JQYqynp87IJhaEIMyG'
         }
     })
     .then(response => response.json())

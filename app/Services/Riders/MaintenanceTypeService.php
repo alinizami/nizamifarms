@@ -256,8 +256,19 @@ class MaintenanceTypeService
      * What to show on a claim row. Falls back to the bucket label so the 108
      * existing untyped Maintenance rows read exactly as they do today.
      */
-    public function labelFor($typeId, ?string $serviceType): ?string
+    /**
+     * ⭐ `$requestId` (29-Sep-2026): the CLAIM being labelled. One bill can pay for several
+     *   jobs of a visit, and then its label is every job it covers ("Oil + Tuning + Brake
+     *   Shoe"), from `ServiceRecordService::jobLabelsForClaims` — the one place that answers.
+     *   Without it the claim prints only its lead job and looks like it paid for that alone.
+     * ⚠ Optional and trailing on purpose: a caller built before this still gets today's answer.
+     */
+    public function labelFor($typeId, ?string $serviceType, $requestId = null): ?string
     {
+        if ($requestId) {
+            $combined = app(ServiceRecordService::class)->jobLabelsForClaims([(int) $requestId]);
+            if (!empty($combined[(int) $requestId])) return $combined[(int) $requestId];
+        }
         $type = $this->find($typeId);
         return $type ? $type->type_name : MaintenanceTypeModel::bucketLabel($serviceType);
     }

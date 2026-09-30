@@ -1308,6 +1308,19 @@ class FleetFuelService
                         'due_in_km'          => $s['due_in_km'],
                         // Which job is soonest due — the chip can name it.
                         'due_type_name'      => $s['due_type_name'] ?? null,
+                        /**
+                         * ⭐ …and in ITS OWN UNIT (29-Sep-2026). The chip is now the most urgent of
+                         *   EVERY scheduled job, so it can be a time-based one — `due_in_km` is then
+                         *   null and the pill read "overdue 0 km". The engine's own phrase and the
+                         *   time fields ride along (additive; km rows read exactly as before).
+                         */
+                        'basis'              => $s['basis'] ?? 'km',
+                        'is_time_based'      => !empty($s['is_time_based']),
+                        'interval_days'      => $s['interval_days'] ?? null,
+                        'interval_label'     => $s['interval_label'] ?? null,
+                        'due_in_days'        => $s['due_in_days'] ?? null,
+                        'due_at_date'        => $s['due_at_date'] ?? null,
+                        'due_text'           => $s['due_text'] ?? null,
                         'vehicle_id'         => $vid,
                     ];
                     continue;
@@ -1488,6 +1501,13 @@ class FleetFuelService
         // --- attach claims (a claim can land on a day with no attendance row) ---
         // Resolved once for the whole month rather than per claim row.
         $maintTypes = app(\App\Services\Riders\MaintenanceTypeService::class);
+        // ⭐ A bill that pays for several jobs of one visit is labelled with all of them
+        //   (29-Sep-2026). Fetched for the whole month at once so labelFor() below reads a memo.
+        try {
+            $claimIds = [];
+            foreach ($byDay as $list) { foreach ($list as $c) { if (!empty($c->id)) $claimIds[] = (int) $c->id; } }
+            app(ServiceRecordService::class)->jobLabelsForClaims($claimIds);
+        } catch (\Throwable $e) { /* labels fall back to the lead job */ }
         // Plate/name for a stamped claim. Prefers the machines already resolved for
         // his month (no extra query), falling back to the resolver's cached lookup for
         // a machine he did not otherwise ride this month.
@@ -1555,7 +1575,7 @@ class FleetFuelService
                     // The manager's own label for this job ("Brake Shoe"), falling back
                     // to the bucket name on rows filed before types existed.
                     'maintenance_type_id' => $r->maintenance_type_id !== null ? (int) $r->maintenance_type_id : null,
-                    'maintenance_type'    => $maintTypes->labelFor($r->maintenance_type_id ?? null, $r->service_type),
+                    'maintenance_type'    => $maintTypes->labelFor($r->maintenance_type_id ?? null, $r->service_type, $r->id ?? null),
                     // ⭐⭐ WHICH BIKE THIS MONEY WAS FOR. On a day he rode two machines
                     //   his claims rendered identically — two fuel rows, two different
                     //   tanks, one anonymous list. The vehicle lens never had this
@@ -1864,23 +1884,30 @@ class FleetFuelService
                 ->where('r.expense_category', 'Maintenance')
                 ->whereNotIn('r.status', ['cancelled', 'rejected'])
                 ->whereRaw('COALESCE(r.expense_date, DATE(r.created_at)) BETWEEN ? AND ?', [$from, $to])
-                ->groupBy('r.maintenance_type_id', 't.type_name', 'r.service_type')
-                ->selectRaw("COALESCE(t.type_name,
+                ->selectRaw("r.id, r.amount, r.status, COALESCE(t.type_name,
                                 CASE WHEN r.service_type IN ('oil_change','general') THEN 'Regular service'
                                      WHEN r.service_type = 'repair' THEN 'Repair'
-                                     ELSE 'Maintenance' END) AS label,
-                             SUM(r.amount) AS total, COUNT(*) AS n,
-                             SUM(CASE WHEN r.status = 'pending' THEN 1 ELSE 0 END) AS pending_n")
+                                     ELSE 'Maintenance' END) AS label")
                 ->get();
+
+            /**
+             * ⭐⭐ ONE RECEIPT FOR SEVERAL JOBS IS ITS OWN LINE (29-Sep-2026). A bill that paid for
+             *    Oil + Tuning, Brake Shoe and Chain Set in one visit cannot be split into parts
+             *    nobody wrote down, and crediting the whole receipt to its lead job would inflate
+             *    that job's spend. So it is grouped under its combined label — the same label the
+             *    claim list and Daily Closing print — and reads "Oil + Tuning + Brake Shoe".
+             */
+            $combined = app(ServiceRecordService::class)->jobLabelsForClaims(
+                $rows->pluck('id')->map(fn ($v) => (int) $v)->all());
 
             // Untyped rows collapse onto the same bucket label, so merge by label.
             $merged = [];
             foreach ($rows as $r) {
-                $k = $r->label;
+                $k = $combined[(int) $r->id] ?? $r->label;
                 $merged[$k] ??= ['label' => $k, 'total' => 0.0, 'n' => 0, 'pending_n' => 0];
-                $merged[$k]['total']     += (float) $r->total;
-                $merged[$k]['n']         += (int) $r->n;
-                $merged[$k]['pending_n'] += (int) $r->pending_n;
+                $merged[$k]['total']     += (float) $r->amount;
+                $merged[$k]['n']         += 1;
+                $merged[$k]['pending_n'] += $r->status === 'pending' ? 1 : 0;
             }
             usort($merged, fn ($a, $b) => $b['total'] <=> $a['total']);
             return array_values($merged);

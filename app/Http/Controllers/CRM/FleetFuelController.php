@@ -585,18 +585,23 @@ class FleetFuelController extends Controller
              */
             try {
                 if (\Illuminate\Support\Facades\Schema::hasColumn('t_fleet_service_log', 'request_id')) {
-                    $linkedLog = \DB::table('t_fleet_service_log')->where('request_id', $req->id)->first(['id', 'user_id']);
-                    if ($linkedLog) {
+                    // ⚠⚠ EVERY record the bill pays for (29-Sep-2026) — one receipt may cover a
+                    //    whole visit, and those jobs share one odometer. The JOB is mirrored only
+                    //    when the bill pays for exactly one record.
+                    $linkedLogs = \DB::table('t_fleet_service_log')->where('request_id', $req->id)
+                        ->orderBy('id')->get(['id', 'user_id']);
+                    if ($linkedLogs->isNotEmpty()) {
                         $lu = [];
                         if ($req->meter_at_fill !== null && (int) $req->meter_at_fill !== (int) ($before['meter_at_fill'] ?? -1)) {
                             $lu['meter'] = (int) $req->meter_at_fill;
                         }
-                        if ($req->maintenance_type_id && (int) $req->maintenance_type_id !== (int) ($before['maintenance_type_id'] ?? 0)) {
+                        if ($linkedLogs->count() === 1 && $req->maintenance_type_id
+                            && (int) $req->maintenance_type_id !== (int) ($before['maintenance_type_id'] ?? 0)) {
                             $lu['maintenance_type_id'] = (int) $req->maintenance_type_id;
                         }
                         if ($lu) {
-                            \DB::table('t_fleet_service_log')->where('id', $linkedLog->id)->update($lu);
-                            app(\App\Services\Riders\ServiceRecordService::class)->bustCaches((int) $linkedLog->user_id);
+                            \DB::table('t_fleet_service_log')->whereIn('id', $linkedLogs->pluck('id')->all())->update($lu);
+                            app(\App\Services\Riders\ServiceRecordService::class)->bustCaches((int) $linkedLogs->first()->user_id);
                         }
                     }
                 }
@@ -635,7 +640,7 @@ class FleetFuelController extends Controller
                     'meter_at_fill' => $req->meter_at_fill,
                     'expense_date' => $req->expense_date ? \Carbon\Carbon::parse($req->expense_date)->format('Y-m-d') : null,
                     'maintenance_type_id' => $req->maintenance_type_id,
-                    'maintenance_type' => $svcTypes->labelFor($req->maintenance_type_id, $req->service_type),
+                    'maintenance_type' => $svcTypes->labelFor($req->maintenance_type_id, $req->service_type, $req->id),
                     'service_type' => $req->service_type,
                 ],
             ]);
@@ -700,6 +705,14 @@ class FleetFuelController extends Controller
             // type list exists — see the block below.
             'maintenance_type_id' => 'nullable|integer',
             /**
+             * ⭐⭐ SEVERAL JOBS IN ONE VISIT (owner ask, 29-Sep-2026). Qasim ticks Oil + Tuning,
+             *    Brake Shoe and Chain Set for one trip, with one receipt. Merged with the scalar
+             *    above by `ServiceRecordService::normaliseIds`, so an installed APK that sends only
+             *    the scalar behaves exactly as before. No `array` rule: a FormData client that
+             *    stringified the list ("3,4") is accepted rather than refused for its shape.
+             */
+            'maintenance_type_ids'   => 'nullable',
+            /**
              * ⭐⭐ WHICH MACHINE (owner ask, 10-Sep-2026: *"the maintenance records follow the
              *    vehicle"*). Every surface that records a service is looking at a machine —
              *    the vehicle card on the web, the vehicle sheet on the phone — so it says
@@ -715,8 +728,8 @@ class FleetFuelController extends Controller
              * 💰 THE BILL — OPTIONAL (owner ask, 3-Sep). Blank means exactly what it always
              *    meant: the work is recorded, no money moves, and the row reads "no bill".
              *    A figure here files a real maintenance expense against the rider and links
-             *    it to this service record. See recordServiceBill() below for why it is
-             *    filed through RequestController rather than inserted here.
+             *    it to EVERY job of this visit — one receipt, one claim. See
+             *    `ServiceRecordService::fileBill()` for why it goes through RequestController.
              */
             'amount' => 'nullable|numeric|min:1|max:9999999',
             'payment_source_account_id' => 'nullable|integer',
@@ -746,10 +759,9 @@ class FleetFuelController extends Controller
         // brake-shoe job still cannot make an overdue oil change look done.
         // "As conditions" types (Chain Set, Misc) are refused: they have no
         // countdown, so there is nothing here to record against.
-        $recordType   = null;
-        // ⭐ Default TRUE so the pre-type path (no list on this install) behaves exactly as
-        //   it always has; only a resolved unscheduled job turns it off. See record().
-        $countsDown   = true;
+        // ⭐ The jobs to record, each with whether it counts down on THIS machine — resolved
+        //   below by `resolveJobs()` (29-Sep-2026: one visit may hold several jobs).
+        $svcJobs      = null;
         // ⚠ Declared out here because the recording block further down reads it. Both are
         //   guarded on `filled('meter')`, so it is only ever used when it has been resolved —
         //   but PHP's function scope makes that an easy thing to break later, so say it.
@@ -819,17 +831,19 @@ class FleetFuelController extends Controller
                 // than blocking a legitimate recording on a lookup failure.
             }
 
-            $resolved = $rec->resolveType($request->input('maintenance_type_id'), $klass);
-            if (!$resolved['ok']) {
-                return response()->json(['success' => false, 'message' => $resolved['message']], 422);
-            }
-            $recordType = $resolved['type'];
             /**
-             * ⭐ DOES THIS JOB COUNT DOWN ON THIS MACHINE (11-Sep-2026)? Carried from the
-             *   resolver to `record()` so an unscheduled job — an "other repair", or any job
-             *   with no figures for a van — is logged as work done and moves no clock.
+             * ⭐⭐ EVERY TICKED JOB, judged by the one rule (29-Sep-2026). One bad id refuses the
+             *    whole visit. Each job carries whether it counts down on THIS machine
+             *    (11-Sep-2026), so an unscheduled job is logged as work done and moves no clock.
              */
-            $countsDown = (bool) ($resolved['counts_down'] ?? true);
+            $svcJobs = $rec->resolveJobs(
+                \App\Services\Riders\ServiceRecordService::normaliseIds(
+                    $request->input('maintenance_type_ids'), $request->input('maintenance_type_id')),
+                $klass
+            );
+            if (!$svcJobs['ok']) {
+                return response()->json(['success' => false, 'message' => $svcJobs['message']], 422);
+            }
         }
 
         /**
@@ -857,6 +871,14 @@ class FleetFuelController extends Controller
             ], 422);
         }
 
+        // 🔒 C3 (29-Sep-2026): one record-and-bill at a time for this rider, so web and phone
+        //    saving the same visit at the same moment cannot write it — or bill it — twice.
+        //    Fails open when the lock store is unavailable; released in the `finally` below.
+        $saveLock = \App\Services\Riders\ServiceRecordService::acquireSaveLock((int) $data['rider_id']);
+        if (!$saveLock['ok']) {
+            return response()->json(['success' => false, 'busy' => true, 'message' => $saveLock['message']], 409);
+        }
+
         try {
             $exists = \DB::table('t_ops_rider_profile')->where('user_id', $data['rider_id'])->exists();
             if (!$exists) {
@@ -875,27 +897,32 @@ class FleetFuelController extends Controller
              *    places. Two writers is how the pair drifts; the whole point of the extraction
              *    was that they cannot.
              *
-             * ⚠ `$recordType` is null here ONLY when the type table does not exist yet
-             *   (pre-batch-12) — a meter with no type is refused by resolveType() above. The
+             * ⚠ A job with a null type exists ONLY when the type table does not exist yet
+             *   (pre-batch-12) — a meter with no type is refused by resolveJobs() above. The
              *   service then writes no log row but still stamps the profile, exactly as this
              *   endpoint behaved before types existed.
              */
             $recorded = null;
+            $billSaid = null;
+            $billSkipped = null;   // ids of the live bill(s) that already cover this visit (A1)
             if ($request->filled('meter')) {
                 $serviceDate = $data['date'] ?? Carbon::today()->format('Y-m-d');
-                $recorded = app(\App\Services\Riders\ServiceRecordService::class)->record([
+                $svcRec = app(\App\Services\Riders\ServiceRecordService::class);
+                /**
+                 * ⭐⭐ THE WRITE ITSELF LIVES IN ServiceRecordService::recordVisit — the ONE writer
+                 *    the workshop close and the RIDER's "did it get done?" also call. One row per
+                 *    ticked job, all in one transaction, a double tap never inserted twice.
+                 */
+                $recorded = $svcRec->recordVisit([
                     'rider_id'   => (int) $data['rider_id'],
-                    // ⭐ The machine, resolved above and frozen onto the row.
+                    // ⭐ The machine, resolved above and frozen onto every row.
                     'vehicle_id' => $svcVehicleId,
                     'meter'      => (int) $data['meter'],
                     'date'       => $serviceDate,
-                    'type'       => $recordType,
+                    'jobs'       => $svcJobs['jobs'] ?? [['type' => null, 'counts_down' => true]],
                     'actor_id'   => (int) auth()->id(),
-                    // ⭐ Whether a countdown moves — see resolveType(). An unscheduled job is
-                    //   logged as work done and resets nothing.
-                    'counts_down' => $countsDown,
                     // 📷 The proof photo belongs to the WORK: stored even when no amount is
-                    //    given, which is the ordinary workshop case.
+                    //    given, which is the ordinary workshop case. One photo for the visit.
                     'photo_path' => $this->storeServicePhoto($request),
                     'note'       => 'Recorded on the Bikes screen (no bill filed)',
                 ]);
@@ -904,37 +931,44 @@ class FleetFuelController extends Controller
                 }
 
                 /**
-                 * 💰 …AND THE BILL, IF ONE WAS GIVEN.
+                 * 💰 …AND THE BILL, IF ONE WAS GIVEN — ONE bill for every job of the visit.
                  *
                  * ⭐⭐ ORDER MATTERS: THE WORK IS RECORDED FIRST, THE MONEY SECOND.
                  *    The service log is an OBSERVATION — the bike was serviced, and its
-                 *    countdown must reset the moment we are told, not when a bill clears.
+                 *    countdowns must reset the moment we are told, not when a bill clears.
                  *    So if the expense fails to file we keep the service and say the bill
                  *    did not go through; we never lose the reading over a money error.
                  *
-                 * ⚠⚠ AND WHY THE CLAIM IS NOT INSERTED HERE. Filing an expense means a
-                 *    request number, the L1/L2 auto-approval rule, the ledger posting, the
-                 *    BikeServiceClock hook and the vehicle stamping — all of which already
-                 *    live in RequestController::store. A second copy of that would drift,
-                 *    and this codebase has been bitten by exactly that more than once. So
-                 *    the money goes through the real door, not a replica of it.
+                 * ⚠⚠ ONE RECEIPT IS NEVER PAID TWICE (pre-deploy A1, 29-Sep-2026). If ANY job of
+                 *    this save — a double tap's duplicates included — already carries a live bill,
+                 *    no bill is filed and the reply names that bill (`billRecordedVisit`). This
+                 *    used to bill the "rest" for the FULL amount typed. A save whose jobs are all
+                 *    un-billed (even all duplicates, when the first bill never filed) is billed.
                  */
-                $billSaid = null;
                 if (!empty($data['amount']) && (float) $data['amount'] > 0) {
-                    $bill = $this->recordServiceBill($request, $data, $recordType, $serviceDate,
-                                                     $recorded['service_log_id'] ?? null);
+                    $bill = $svcRec->billRecordedVisit($request, $recorded, [
+                        'rider_id'    => (int) $data['rider_id'],
+                        'amount'      => (float) $data['amount'],
+                        'payment_source_account_id' => $data['payment_source_account_id'] ?? null,
+                        'description' => 'Filed with the service recorded on the Bikes screen at '
+                                         . number_format((int) $data['meter']) . ' km.',
+                        'note_after'  => 'Recorded on the Bikes screen with the bill',
+                    ]);
                     if (!$bill['ok']) {
                         return response()->json([
-                            'success'      => true,   // ⚠ the SERVICE stands — see above
-                            'bill_failed'  => true,
-                            'message'      => ($recorded['message'] ?? 'Service recorded.')
-                                . ' But the expense was NOT filed: ' . $bill['message'],
+                            'success'         => true,   // ⚠ the SERVICE stands — see above
+                            'bill_failed'     => true,
+                            'vehicle_id'      => $svcVehicleId,
+                            'service_log_ids' => $recorded['service_log_ids'] ?? [],
+                            'message'         => ($recorded['message'] ?? 'Service recorded.')
+                                . '. But the expense was NOT filed: ' . $bill['message']
+                                . ' Add it later from the vehicle\'s Past services.',
                         ], 200);
                     }
-                    // ⚠ Carried out to the receipt below, which is built from $said — the
-                    //   manager must be told what happened to his money, in the same breath
-                    //   as what happened to the reading.
+                    // ⚠ Carried out to the receipt below — the manager must be told what
+                    //   happened to his money in the same breath as what happened to the reading.
                     $billSaid = $bill['message'];
+                    if (!empty($bill['skipped_existing'])) $billSkipped = $bill['existing_bill_ids'];
                 }
             }
             /**
@@ -995,43 +1029,44 @@ class FleetFuelController extends Controller
                 Cache::forget("fleet_fuel_rider_{$data['rider_id']}_{$m}");
             }
 
-            // Say back what actually changed. "Service recorded" on a schedule
-            // change is what made the two buttons look interchangeable.
+            // Say back what actually changed — the ENGINE's receipt, the same sentence the
+            // workshop close and the rider's "did it get done?" print (29-Sep-2026). This
+            // method used to compose its own, from the raw type alone, and for an unscheduled
+            // job it disagreed with the engine about what had happened.
             $said = [];
             if ($request->filled('meter')) {
-                // Name the job and its next due, and be explicit when it did NOT
-                // move the bike's overall clock — otherwise recording brake shoes
-                // reads as "the bike is serviced", which is the whole confusion
-                // the per-type schedule exists to remove.
-                // ⭐ Say the DATE back when it is not today. A backdated record moves
-                //   the schedule from a day the manager chose, and a receipt that
-                //   omits it reads as "recorded today" — the one thing he needs to
-                //   check before trusting the number.
-                $backdated = $serviceDate !== Carbon::today()->format('Y-m-d');
-                $said[] = ($recordType ? $recordType->type_name : 'Service')
-                    . ' recorded at ' . number_format((int) $data['meter']) . ' km'
-                    . ($backdated ? ' on ' . Carbon::parse($serviceDate)->format('D j M') : '')
-                    . ($recordType && (int) $recordType->interval_km > 0
-                        ? ' — next due at ' . number_format((int) $data['meter'] + (int) $recordType->interval_km) . ' km'
-                        : '');
-                if ($recordType && !$recordType->resets_service_clock) {
-                    $said[] = 'The bike\'s overall service-due clock is unchanged (only an oil service moves that)';
-                }
+                $said[] = rtrim((string) ($recorded['message'] ?? ''), '.');
                 // 💰 What happened to the MONEY, in the same breath as what happened to the
                 //    reading — a manager must never have to go looking for that answer.
-                if (!empty($billSaid)) $said[] = $billSaid;
+                if (!empty($billSaid)) $said[] = rtrim($billSaid, '.');
             }
 
-
-            // ⭐ Say WHICH machine it landed on (10-Sep-2026). The record is stamped now, so
-            //   the caller can show — and a test can assert — the bike the countdown moved on
-            //   rather than trusting that the roster happened to agree.
+            // ⭐ Say WHICH machine it landed on (10-Sep-2026), and which records were written
+            //   (29-Sep-2026) — so the caller can show, and a test can assert, exactly what moved.
             return response()->json(array_filter([
                 'vehicle_id' => $svcVehicleId,
-            ], fn ($v) => $v !== null) + ['success' => true, 'message' => implode('. ', $said)]);
+            ], fn ($v) => $v !== null) + [
+                'success'         => true,
+                'service_log_ids' => $recorded['service_log_ids'] ?? [],
+                'jobs'            => array_map(fn ($j) => [
+                    'type_id'   => $j['type_id'],
+                    'name'      => $j['name'],
+                    'log_id'    => $j['log_id'],
+                    'next_due'  => $j['next_due'] ?? '',
+                    'duplicate' => !empty($j['duplicate']),
+                ], $recorded['jobs'] ?? []),
+                // ⭐ A1: true when an amount was given but a live bill already covers this visit,
+                //   so no second bill was filed (`existing_bill_ids` names it). Older clients
+                //   simply print `message`, which says the same thing in words.
+                'bill_skipped_existing' => $billSkipped !== null,
+                'existing_bill_ids'     => $billSkipped ?? [],
+                'message'         => implode('. ', array_filter($said)) . '.',
+            ]);
         } catch (\Throwable $e) {
             \Log::error('FleetFuel markServiced failed', ['error' => $e->getMessage()]);
             return response()->json(['success' => false, 'message' => 'Could not save the change'], 500);
+        } finally {
+            ($saveLock['release'])();
         }
     }
 
@@ -1054,7 +1089,13 @@ class FleetFuelController extends Controller
             'maintenance_type_id' => 'nullable|integer',
             'meter'               => 'nullable|integer|min:1',
             'date'                => 'nullable|date_format:Y-m-d|before_or_equal:today',
+            // ⭐ 29-Sep-2026: a meter/date fix moves every job of the visit unless this says
+            //   0; and a job forgotten at the time can be added to the same visit.
+            'apply_to_visit'           => 'nullable|boolean',
+            'add_maintenance_type_ids' => 'nullable',
         ]);
+        $data['add_type_ids'] = $request->input('add_maintenance_type_ids');
+        unset($data['add_maintenance_type_ids']);
         $res = app(\App\Services\Riders\ServiceRecordService::class)
             ->amend((int) $id, $data, (int) auth()->id());
         return response()->json(['success' => $res['ok'], 'message' => $res['message']],
@@ -1101,28 +1142,6 @@ class FleetFuelController extends Controller
     }
 
     /**
-     * 💰 File the BILL for a service just recorded, and tie the two together.
-     *
-     * ⭐⭐ THIS DELIBERATELY DOES NOT INSERT A CLAIM. Filing a maintenance expense means a
-     *    request number, the L1/L2 auto-approval rule (which approves instantly for whoever
-     *    holds L1 and queues it for everyone else), the ledger posting, the BikeServiceClock
-     *    hook and the vehicle stamping. All of that already lives in RequestController::store.
-     *    A second copy would drift from it — this codebase has been bitten by exactly that
-     *    more than once — so the money goes through the real door and inherits every rule,
-     *    including ones added later.
-     *
-     * ⚠⚠ ONE JOB = ONE ROW. Both the service log and approved maintenance claims feed the same
-     *    countdown engine, and it keeps the best meter per type. Left unlinked, this pair would
-     *    show TWICE in Past services and — if the two meters ever disagreed — the higher one
-     *    would silently win with nothing saying they were the same job. `request_id` is what
-     *    collapses them back into one, so it is written here and nowhere else.
-     *
-     * ⚠ Failure is NOT fatal to the service. The caller keeps the reading and reports that the
-     *   bill did not file. The work happened either way.
-     *
-     * @return array{ok:bool, message:string, request_id?:int}
-     */
-    /**
      * 📷⭐⭐ THE PROOF PHOTO, SAVED WHETHER OR NOT ANY MONEY MOVED (owner ruling, 11-Sep-2026).
      *
      * ⚠⚠ A PHOTO USED TO REQUIRE AN AMOUNT, because the only place to put one was an expense
@@ -1153,92 +1172,6 @@ class FleetFuelController extends Controller
         }
     }
 
-    private function recordServiceBill(Request $request, array $data, $recordType, string $serviceDate, ?int $logId): array
-    {
-        try {
-            $category = \App\Models\Request\RequestCategoryModel::where('category_code', 'expense')
-                ->where('is_active', 1)->first();
-            if (!$category) {
-                return ['ok' => false, 'message' => 'the expense category is not set up.'];
-            }
-
-            $jobName = $recordType->type_name ?? 'Maintenance';
-
-            /**
-             * 🧾 THE BILL PHOTO rides through to the real request, under the exact field name
-             *    RequestController::store reads (`attachment_image`) — so it is stored, named
-             *    and attached by the same code that handles a rider's own receipt, and shows
-             *    up wherever those already do.
-             *
-             * ⚠ Forwarded as the SAME UploadedFile instance rather than copied: its temp file
-             *   is still a genuine upload, so `isValid()` and the `image` rule still hold. A
-             *   copy would land as an ordinary file and fail that check.
-             */
-            $files = [];
-            if ($request->hasFile('bill_image')) {
-                $files['attachment_image'] = $request->file('bill_image');
-            }
-
-            /**
-             * ⚠⚠ THE BILL INHERITS THE READING FROM THE LOG JUST WRITTEN — it does not resend it
-             *    (review, 3-Sep). Resending meter/type/date made the bill door re-judge a reading
-             *    the service door had just ACCEPTED: a service recorded 2,000 km on landed fine,
-             *    then its own bill was refused as "far above this bike's last reading". Same
-             *    number, two verdicts, in one action. Passing `service_log_id` instead means
-             *    store() inherits the reading, marks it as inherited (so the plausibility check
-             *    stands aside exactly as it does for "Add the bill later"), and LINKS the pair
-             *    itself — one path for every bill, whether filed with the service or after it.
-             */
-            $sub = Request::create('/api/requests/store', 'POST', array_filter([
-                'category_id'        => $category->id,
-                'requester_user_id'  => (int) $data['rider_id'],
-                'title'              => $jobName,
-                'description'        => 'Filed with the service recorded on the Bikes screen'
-                                        . (isset($data['meter']) ? ' at ' . number_format((int) $data['meter']) . ' km' : '') . '.',
-                'amount'             => (float) $data['amount'],
-                'expense_category'   => 'Maintenance',
-                'service_log_id'     => $logId,
-                'payment_source_account_id' => $data['payment_source_account_id'] ?? null,
-                // ⚠ Bikes is Nizami Farms operations — ALWAYS business unit 1, never Khaas.
-                //   Stated explicitly (the same rule the web "New bike expense" modal states) so
-                //   a Khaas-mode manager like Qasim can never file a bike bill into the other
-                //   books, and so a future default change elsewhere cannot quietly move it.
-                'business_unit_id'   => 1,
-            ], fn ($v) => $v !== null), [], $files);
-            // The sub-request must act as the SAME signed-in user — the whole approval
-            // decision hangs on who is filing.
-            $sub->setUserResolver($request->getUserResolver());
-
-            $res  = app(\App\Http\Controllers\Request\RequestController::class)->store($sub);
-            $body = json_decode($res->getContent(), true);
-            if (($res->getStatusCode() < 200 || $res->getStatusCode() >= 300) || empty($body['success'])) {
-                return ['ok' => false, 'message' => $body['message'] ?? 'the request was refused.'];
-            }
-
-            $reqId = (int) ($body['request_id'] ?? 0);
-            // ⭐ The link is made by store() via attachBillToService — the ONE place that does
-            //   it. Only the note is ours, so the row reads as filed-with-bill in the history.
-            if ($reqId && $logId && \Illuminate\Support\Facades\Schema::hasColumn('t_fleet_service_log', 'request_id')) {
-                \DB::table('t_fleet_service_log')->where('id', $logId)
-                    ->update(['note' => 'Recorded on the Bikes screen with the bill']);
-            }
-
-            // ⭐ `auto_approved` is the server's own answer to "did this land in the ledger
-            //   already?" — it is true when the filer holds the approval levels. We echo it
-            //   rather than re-deriving it, so the message can never contradict what happened.
-            $approved = !empty($body['auto_approved']);
-            // ⚠ Say whether the BILL went with it. A manager who meant to attach one and did
-            //   not should learn that here, not weeks later when someone audits the expense.
-            $billed = !empty($files) ? ' Bill attached.' : ' No bill photo attached.';
-            return ['ok' => true, 'request_id' => $reqId, 'message' => 'Rs '
-                . number_format((float) $data['amount']) . ' expense '
-                . ($approved ? 'added and approved.' : 'sent for approval.') . $billed];
-        } catch (\Throwable $e) {
-            \Log::error('recordServiceBill failed', ['error' => $e->getMessage(), 'log' => $logId]);
-            return ['ok' => false, 'message' => 'it could not be filed.'];
-        }
-    }
-
     /**
      * 🧾 THE SERVICES A BILL CAN BE ATTACHED TO — what the picker on every bill form shows.
      *
@@ -1263,6 +1196,10 @@ class FleetFuelController extends Controller
             'rider_id' => $for,
             'services' => app(\App\Services\Riders\ServiceRecordService::class)
                 ->unbilledServicesFor($for, $vehicleId ? (int) $vehicleId : null),
+            // ⭐ 29-Sep-2026: the same jobs grouped into VISITS — one receipt usually pays for
+            //   the whole trip. `services` stays for every installed APK.
+            'visits'   => app(\App\Services\Riders\ServiceRecordService::class)
+                ->unbilledVisitsFor($for, $vehicleId ? (int) $vehicleId : null),
         ]);
     }
 

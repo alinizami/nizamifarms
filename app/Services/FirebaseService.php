@@ -447,6 +447,30 @@ class FirebaseService
     }
 
     /**
+     * 📲 The store timed a rider's route for him (Sep-2026, owner: "yes send the
+     * push"). Without it he rides on the times he last looked at — the Orders
+     * screen only refreshes when he opens it. Roman Urdu: it is for the rider.
+     * Rides the EXISTING 'shift_notifications' channel (a new channel id would
+     * not exist on APKs already in the field); tap → Orders.
+     */
+    public function notifyRiderRouteTimed(int $riderId, string $byName, int $orders, bool $retimed, bool $fromOffice): void
+    {
+        $n = $orders . ' order' . ($orders === 1 ? '' : 's');
+        $title = $retimed ? '⏱ Aap ke delivery times badal gaye' : '🚀 Aap ka dispatch ho gaya';
+        $body = $retimed
+            ? "{$byName} ne aap ka route dobara time kiya ({$n}). Naye times app mein dekhein."
+            : "{$byName} ne aap ke {$n} dispatch kar diye. Delivery times app mein dekhein.";
+        if ($fromOffice) {
+            $body .= ' (Times office se lagaye gaye hain.)';
+        }
+        $this->notifyUser($riderId, ['title' => $title, 'body' => $body], [
+            'type'     => 'route_retimed',
+            'retimed'  => $retimed ? '1' : '0',
+            'orders'   => (string) $orders,
+        ], 'shift_notifications');
+    }
+
+    /**
      * Notify store users that a rider re-timed his OWN route while already
      * part-way through his deliveries.
      *
