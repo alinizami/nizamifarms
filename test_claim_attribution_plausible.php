@@ -173,14 +173,20 @@ foreach (DB::table('t_ops_vehicle')->where('is_active', 1)->get(['id', 'reg_no',
 ok('no machine carries an impossible unstamped claim any more', $bad, []);
 
 // The specific outcome the owner asked for.
-$cenMeters = [];
+// ⚠ 5-Oct-2026: these were literal 28-Aug numbers ("within 2,000 km", "≤ 20,000") and the bike
+//   has since honestly run to 21k — and a stamped claim of 0 exists (a recorded fact). What must
+//   hold for ever is the RULE: no UNSTAMPED guess on CEN-455 from another machine's odometer,
+//   and the 5-Oct regression (the spine grew, Waseem's 24k fills came back) stays shut.
+$cenGuessed = [];
 foreach ($svc->claimsForVehicle(CEN, '2026-01-01', '2026-12-31') as $c) {
-    if (($c['meter'] ?? null) !== null) $cenMeters[] = (int) $c['meter'];
+    if (($c['meter'] ?? null) !== null && empty($c['stamped'])) $cenGuessed[] = (int) $c['meter'];
 }
-ok('CEN-455 no longer spans two odometers',
-   $cenMeters ? (max($cenMeters) - min($cenMeters)) <= VehicleService::MAX_GAP_KM : true, true);
-ok('  …and its readings are all in its own 17,xxx range',
-   $cenMeters ? (min($cenMeters) >= 15000 && max($cenMeters) <= 20000) : true, true);
+ok('CEN-455 carries no unstamped reading from DCR-799\'s 24k range',
+   array_values(array_filter($cenGuessed, fn ($m) => $m >= 24000)), []);
+ok('  …and Waseem\'s 1-Aug 24,153 cannot attach by date (odometer never runs backwards)',
+   $svc->readingPlausibleFor(CEN, 24153, '2026-08-01'), false);
+ok('  …while today\'s real 21,459 still can',
+   $svc->readingPlausibleFor(CEN, 21459, date('Y-m-d')), true);
 
 echo "\n" . str_repeat('─', 60) . "\n";
 echo ($fail === 0 ? "ALL GREEN" : "FAILURES") . " — passed {$pass}, failed {$fail}\n";

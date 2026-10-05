@@ -69,6 +69,8 @@ foreach ($rows as $r) {
     $date = substr((string) $r->attendance_date, 0, 10);
     $isHalf = isset($halfByUser[$uid][$date]);
     if ($isHalf) { continue; }   // every path skips half-days identically
+    // Oct-5 2026 owner ruling: a LEAVE day (full or half) is never late — every path skips it too.
+    if ($svc->leaveKindOn($uid, $date) !== null) { $leaveSkipped = ($leaveSkipped ?? 0) + 1; continue; }
 
     $new = $svc->lateForDay($uid, $date, $r->login_time, $r->late_minutes, $r->expected_shift_start, false);
     $a = $origWith0900($svc, $uid, $date, $r->login_time, $r->late_minutes, $r->expected_shift_start);
@@ -109,9 +111,11 @@ foreach (array_slice(array_unique($rows->pluck('user_id')->all()), 0, 12) as $ui
         if ((int) $r->user_id !== (int) $uid) { continue; }
         $d = substr((string) $r->attendance_date, 0, 10);
         if (isset($halfByUser[$uid][$d])) { continue; }
+        if ($svc->leaveKindOn((int) $uid, $d) !== null) { continue; }   // Oct-5 ruling C
         $sum += $origWith0900($svc, (int) $uid, $d, $r->login_time, $r->late_minutes, $r->expected_shift_start);
     }
-    $ok = ((int) $t['late_minutes'] === $sum) && ((int) $t['late_waived_minutes'] === 0);
+    // Day reviews now exist on the replica: what counts + what was waived = the raw hand sum.
+    $ok = ((int) $t['late_minutes'] + (int) $t['late_waived_minutes']) === $sum;
     if (!$ok) { $bad++; }
     printf("  u%-4d total=%-6d handsum=%-6d waived=%-4d %s\n",
         $uid, $t['late_minutes'], $sum, $t['late_waived_minutes'], $ok ? 'ok' : 'MISMATCH');

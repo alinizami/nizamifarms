@@ -76,6 +76,8 @@ class VehicleService
     private static array $rawReadingsMemo = [];
     /** [vehicleId => [[m,d],…]] machine-KEYED readings (meter log + handover meter). */
     private static array $machineReadMemo = [];
+    /** [vehicleId => {hi, days}] attendance readings STAMPED to the machine — see stampedReadings(). */
+    private static array $stampedReadMemo = [];
     /**
      * [class => Collection] — the scheduled jobs, PER VEHICLE CLASS (Sep-2026).
      * ⚠ Was a single static shared by the whole fleet; keyed by class now, because a
@@ -435,7 +437,7 @@ class VehicleService
                     //   machine with no spine of its own — so a brand-new bike still inherits
                     //   its keeper's history exactly as before.
                     if ($r->meter_at_fill !== null && (int) $r->meter_at_fill > 0
-                        && !$this->readingPlausibleFor($vehicleId, (int) $r->meter_at_fill)) {
+                        && !$this->readingPlausibleFor($vehicleId, (int) $r->meter_at_fill, $rDate)) {
                         continue;
                     }
 
@@ -467,7 +469,7 @@ class VehicleService
                 $combined = [];
             }
 
-            return $rows
+            $shaped = $rows
                 ->sortByDesc(fn ($r) => [substr((string) ($r->expense_date ?: $r->created_at), 0, 10), $r->id])
                 ->values()
                 ->map(function ($r) use ($types, $hasVehicleCol, $combined) {
@@ -510,6 +512,17 @@ class VehicleService
                         'assumed'    => !empty($r->_assumed),
                     ];
                 })->all();
+
+            // ⭐ Meter replaced (Oct-2026): `meter` stays the figure as typed (it is shown);
+            //   `meter_cont` is the same reading on the machine's continuous scale, for anything
+            //   that CHAINS readings (fill-to-fill km, the day walk). Only added for a machine
+            //   with a replacement — every other machine's rows are exactly as before.
+            if (MeterReplacement::has($vehicleId)) {
+                foreach ($shaped as $i => $c) {
+                    $shaped[$i]['meter_cont'] = MeterReplacement::toContinuous($vehicleId, $c['meter'], $c['date']);
+                }
+            }
+            return $shaped;
         } catch (\Throwable $e) {
             Log::warning('claimsForVehicle failed', ['vehicle' => $vehicleId, 'error' => $e->getMessage()]);
             return [];
@@ -617,6 +630,11 @@ class VehicleService
 
             $today = Carbon::today();
 
+            // ⭐ Meter replaced (Oct-2026): the caller's figure is what the meter shows NOW; the
+            //   evidence (`m`) is continuous. Count on one scale, show on the bike's.
+            $curC = $currentMeter !== null
+                ? (int) MeterReplacement::toContinuous($vehicleId, $currentMeter, null) : null;
+
             $out = [];
             foreach ($types as $t) {
                 $l     = $last[(int) $t->id] ?? null;
@@ -634,8 +652,8 @@ class VehicleService
                 // A countdown needs BOTH ends; anything less stays null rather
                 // than inventing one from a made-up reference (same rule as the
                 // rider panel). For a TIME job the two ends are dates, not meters.
-                $dueIn = (!$isTime && $lastM !== null && $currentMeter !== null)
-                    ? $interval - ($currentMeter - $lastM) : null;
+                $dueIn = (!$isTime && $lastM !== null && $curC !== null)
+                    ? $interval - ($curC - $lastM) : null;
 
                 $dueInDays = null;
                 $dueAtDate = null;
@@ -688,7 +706,10 @@ class VehicleService
                     'due_text'       => self::dueText($state, $isTime, $dueIn, $dueInDays),
                     'due_in_days'    => $dueInDays,
                     'due_at_date'    => $dueAtDate,
-                    'last_meter'  => $lastM,
+                    // As it was typed (the old meter's figure if it was done before a replacement).
+                    'last_meter'  => $l !== null ? ($l['raw'] ?? $lastM) : null,
+                    // Km run since, straight through any replacement — for the headline's `since_km`.
+                    'since_km'    => (!$isTime && $lastM !== null && $curC !== null) ? $curC - $lastM : null,
                     'last_at'     => $lastD,
                     'last_by'     => $l['by'] ?? null,
                     'assumed'     => !empty($l['assumed']),
@@ -697,7 +718,9 @@ class VehicleService
                     // Oil + Tuning" so a manager is never left wondering why a type he
                     // has no record of reads as freshly done.
                     'covered_by'  => $l['covered_by'] ?? null,
-                    'due_at_km'   => (!$isTime && $lastM !== null) ? $lastM + $interval : null,
+                    // On the meter fitted NOW — the number the rider will see come up.
+                    'due_at_km'   => (!$isTime && $lastM !== null)
+                        ? MeterReplacement::toRaw($vehicleId, $lastM + $interval, null) : null,
                     'due_in_km'   => $dueIn,
                     // ⭐ ONE state rule — alerts fire off this, so no local ternary.
                     'state'       => $state,
@@ -776,8 +799,11 @@ class VehicleService
                 //   change as the bike ages (see plausibleServiceMeter).
                 if (!$this->plausibleServiceMeter((int) $c['meter'], $vehicleId, $c['date'])) continue;
                 $tid = (int) $c['maintenance_type_id'];
-                if (self::beatsEvidence((int) $c['meter'], $c['date'], $last[$tid] ?? null)) {
-                    $last[$tid] = ['m' => (int) $c['meter'], 'd' => $c['date'],
+                // ⭐ `m` is the CONTINUOUS distance (what every comparison and countdown uses);
+                //   `raw` is the figure as it was typed, for showing. Equal without a replacement.
+                $mc = (int) MeterReplacement::toContinuous($vehicleId, (int) $c['meter'], $c['date']);
+                if (self::beatsEvidence($mc, $c['date'], $last[$tid] ?? null)) {
+                    $last[$tid] = ['m' => $mc, 'raw' => (int) $c['meter'], 'd' => $c['date'],
                                    'by' => $c['by_name'] ?? null, 'assumed' => !empty($c['assumed'])];
                 }
             }
@@ -803,8 +829,9 @@ class VehicleService
                      */
                     if (ServiceRecordService::logVehicleOf($row, $resolver) !== $vehicleId) continue;
                     $tid = (int) $row->maintenance_type_id;
-                    if (self::beatsEvidence((int) $row->meter, $d, $last[$tid] ?? null)) {
-                        $last[$tid] = ['m' => (int) $row->meter, 'd' => $d,
+                    $mc = (int) MeterReplacement::toContinuous($vehicleId, (int) $row->meter, $d);
+                    if (self::beatsEvidence($mc, $d, $last[$tid] ?? null)) {
+                        $last[$tid] = ['m' => $mc, 'raw' => (int) $row->meter, 'd' => $d,
                                        'by' => $row->fullname, 'assumed' => false];
                     }
                 }
@@ -994,6 +1021,9 @@ class VehicleService
     public function plausibleServiceMeter(?int $meter, ?int $vehicleId = null, ?string $onDate = null): bool
     {
         if ($meter === null || $meter <= 0) return false;
+        // ⭐ Meter replaced (Oct-2026): judged on the continuous scale, so 300 km on a NEW meter
+        //   is "the old meter's last + 300", not a dropped digit. Identity without a replacement.
+        if ($vehicleId !== null) $meter = (int) MeterReplacement::toContinuous($vehicleId, $meter, $onDate);
         if ($meter > self::MIN_METER) return true;
         if ($vehicleId === null) return false;
 
@@ -1078,6 +1108,14 @@ class VehicleService
             if ($v && $v->last_service_meter !== null && (int) $v->last_service_meter > 0) {
                 $out[] = ['m' => (int) $v->last_service_meter,
                           'd' => $v->last_service_at ? substr((string) $v->last_service_at, 0, 10) : null];
+            }
+            // ⭐ Meter replaced (Oct-2026): the list is the machine's CONTINUOUS distance, so a new
+            //   meter's first readings sit above the old one's last instead of looking like a
+            //   brand-new bike. ⚠ An UNDATED seed predates any replacement — left as typed.
+            if (MeterReplacement::has($vehicleId)) {
+                foreach ($out as $i => $r) {
+                    if ($r['d'] !== null) $out[$i]['m'] = (int) MeterReplacement::toContinuous($vehicleId, $r['m'], $r['d']);
+                }
             }
         } catch (\Throwable $e) {
             // Partial evidence is still evidence; empty keeps the strict rule.
@@ -1176,6 +1214,8 @@ class VehicleService
         //   re-read inside one request (the meter-log writer): judging a fresh reading
         //   against a spine captured before it was written is the stale-evidence bug.
         self::$machineReadMemo = [];
+        self::$stampedReadMemo = [];
+        MeterReplacement::flush();
     }
 
     /**
@@ -1502,8 +1542,9 @@ class VehicleService
                 'last_service_by'    => $worst['last_by'],
                 // ⚠ Only meaningful against a meter — a time job's "since" is days, and
                 //   it rides along beside rather than overwriting this.
-                'since_km'           => $worst['last_meter'] !== null
-                                          ? $currentMeter - $worst['last_meter'] : null,
+                'since_km'           => array_key_exists('since_km', $worst)
+                                          ? $worst['since_km']
+                                          : ($worst['last_meter'] !== null ? $currentMeter - $worst['last_meter'] : null),
                 'due_in_km'          => $worst['due_in_km'],
                 'due_at_km'          => $worst['due_at_km'],
                 'state'              => $worst['state'],
@@ -1570,7 +1611,8 @@ class VehicleService
                 if (!empty($c['maintenance_type_id']))        continue;   // handled above
                 if ($c['meter'] === null)                     continue;
                 if (!in_array($c['service_type'] ?? null, ['oil_change', 'general'], true)) continue;
-                $consider((int) $c['meter'], $c['date'], $c['by_name'] ?? null, null, 'legacy');
+                $consider((int) MeterReplacement::toContinuous($vehicleId, (int) $c['meter'], $c['date']),
+                          $c['date'], $c['by_name'] ?? null, null, 'legacy');
             }
 
             // 3. The seeded machine row.
@@ -1582,9 +1624,12 @@ class VehicleService
                 }
             }
             if ($vehicleRow && $vehicleRow->last_service_meter !== null) {
-                $consider((int) $vehicleRow->last_service_meter,
-                          $vehicleRow->last_service_at ? substr((string) $vehicleRow->last_service_at, 0, 10) : null,
-                          null, null, 'vehicle_seed');
+                $seedD = $vehicleRow->last_service_at ? substr((string) $vehicleRow->last_service_at, 0, 10) : null;
+                // An undated seed predates any replacement — it is already on the continuous scale.
+                $consider($seedD !== null
+                              ? (int) MeterReplacement::toContinuous($vehicleId, (int) $vehicleRow->last_service_meter, $seedD)
+                              : (int) $vehicleRow->last_service_meter,
+                          $seedD, null, null, 'vehicle_seed');
             }
 
             // 4. The keeper's profile stamp — only if he held THIS machine that day.
@@ -1597,7 +1642,10 @@ class VehicleService
                         $heldIt = $d === null
                             || (new VehicleResolver())->vehicleForDay($keeperUserId, $d) === $vehicleId;
                         if ($heldIt) {
-                            $consider((int) $p->last_service_meter, $d, null, null, 'keeper_profile');
+                            $consider($d !== null
+                                          ? (int) MeterReplacement::toContinuous($vehicleId, (int) $p->last_service_meter, $d)
+                                          : (int) $p->last_service_meter,
+                                      $d, null, null, 'keeper_profile');
                         }
                     }
                 } catch (\Throwable $e) {
@@ -1616,18 +1664,22 @@ class VehicleService
             ->intervalFor($vehicleId, (int) ($best['interval'] ?? 0), $keeperUserId);
         if ($interval <= 0) $interval = $default;
 
+        // ⭐ Meter replaced (Oct-2026): `$last` is continuous; count on that scale and show each
+        //   figure as the meter of its own day read. All identity without a replacement.
         $last  = $best['m'] ?? null;
-        $since = ($currentMeter !== null && $last !== null) ? $currentMeter - $last : null;
+        $curC  = $currentMeter !== null ? (int) MeterReplacement::toContinuous($vehicleId, $currentMeter, null) : null;
+        $since = ($curC !== null && $last !== null) ? $curC - $last : null;
         $dueIn = ($since !== null && $interval > 0) ? $interval - $since : null;
 
         $out = [
             'interval_km'        => $interval,
-            'last_service_meter' => $last,
+            'last_service_meter' => ($last !== null && ($best['d'] ?? null) !== null)
+                                        ? MeterReplacement::toRaw($vehicleId, $last, $best['d']) : $last,
             'last_service_at'    => $best['d'] ?? null,
             'last_service_by'    => $best['by'] ?? null,
             'since_km'           => $since,
             'due_in_km'          => $dueIn,
-            'due_at_km'          => $last !== null ? $last + $interval : null,
+            'due_at_km'          => $last !== null ? MeterReplacement::toRaw($vehicleId, $last + $interval, null) : null,
             'state'              => ServiceIntervalResolver::stateFor($dueIn),
             // Same keys as the scheduled branch — a caller must never have to check
             // which path produced its payload. Null here means "no named job".
@@ -1727,10 +1779,19 @@ class VehicleService
      *
      * @return array{meter:int,date:?string,interval:?int}|null
      */
-    public function lastServicePointBefore(int $vehicleId, int $meter, ?int $claimTypeInterval = null): ?array
+    public function lastServicePointBefore(int $vehicleId, int $meter, ?int $claimTypeInterval = null,
+                                           ?string $onDate = null): ?array
     {
         if (!$this->available()) return null;
         try {
+            // ⭐ Meter replaced (Oct-2026): "strictly below" is asked on the machine's continuous
+            //   scale (`$onDate` = the day `$meter` was read; null = the meter fitted now). The
+            //   point is handed back in the CALLER's scale, so `$meter - point['meter']` is the
+            //   true distance between the two services whichever side of a replacement each
+            //   falls on. `$shift` is 0 — and all of this a no-op — without a replacement.
+            $rawMeter = $meter;
+            $meter    = (int) MeterReplacement::toContinuous($vehicleId, $meter, $onDate);
+            $shift    = $meter - $rawMeter;
             $types = [];
             try {
                 if (self::hasTbl('t_fleet_maintenance_types')) {
@@ -1762,7 +1823,9 @@ class VehicleService
             //   a new bike's three-figure service is a real reference point, and it
             //   must STAY one however far the bike later runs.
             $consider = function (int $m, ?string $d, ?int $interval) use ($meter, $vehicleId, &$best) {
-                if (!$this->plausibleServiceMeter($m, $vehicleId, $d) || $m >= $meter) return;
+                if (!$this->plausibleServiceMeter($m, $vehicleId, $d)) return;
+                if ($d !== null) $m = (int) MeterReplacement::toContinuous($vehicleId, $m, $d);
+                if ($m >= $meter) return;
                 if ($best !== null && ($m < $best['meter']
                     || ($m === $best['meter'] && (string) $d <= (string) $best['date']))) return;
                 $best = ['meter' => $m, 'date' => $d, 'interval' => $interval];
@@ -1813,6 +1876,7 @@ class VehicleService
                 }
             }
 
+            if ($best !== null && $shift !== 0) $best['meter'] -= $shift;
             return $best;
         } catch (\Throwable $e) {
             Log::warning('lastServicePointBefore failed', ['vehicle' => $vehicleId, 'error' => $e->getMessage()]);
@@ -2407,7 +2471,12 @@ class VehicleService
 
             $existingStart = $row && $row->meter_start !== null ? (int) $row->meter_start : null;
             $existingEnd   = $row && $row->meter_end   !== null ? (int) $row->meter_end   : null;
-            $end           = $existingEnd !== null ? max($existingEnd, $meter) : $meter;
+            // "The later reading wins" is asked on the continuous scale, so on the day a meter is
+            // replaced the NEW meter's close is kept (identity for a machine never replaced).
+            $end = ($existingEnd !== null
+                    && MeterReplacement::toContinuous($vehicleId, $existingEnd, $date)
+                       > MeterReplacement::toContinuous($vehicleId, $meter, $date))
+                ? $existingEnd : $meter;
 
             if ($shared) {
                 Log::info('meter log now covers more than one driver — the day belongs to the machine', [
@@ -3015,6 +3084,18 @@ class VehicleService
         // Memoised with the rest of the service derivation: the card, the schedule
         // and the alert sweep each want this machine's odometer in one render, and
         // it is a multi-window reconstruction every time.
+        // ⭐ Meter replaced (Oct-2026): the memo holds the CONTINUOUS distance; what leaves here
+        //   is what the meter on the bike shows today. Identical for a machine never replaced.
+        return MeterReplacement::toRaw($vehicleId, $this->currentMeterContinuous($vehicleId), null);
+    }
+
+    /**
+     * The machine's odometer on its continuous scale — total distance, straight through any
+     * meter replacement. For ARITHMETIC against other continuous readings (countdowns, spans);
+     * `currentMeterFor()` is the one to show a person.
+     */
+    public function currentMeterContinuous(int $vehicleId): ?int
+    {
         if (array_key_exists($vehicleId, self::$meterMemo)) return self::$meterMemo[$vehicleId];
         return self::$meterMemo[$vehicleId] = $this->computeCurrentMeter($vehicleId);
     }
@@ -3041,6 +3122,14 @@ class VehicleService
                 ? self::readingHighExprSql($vehicleId)
                 : 'GREATEST(COALESCE(meter_end,0), COALESCE(meter_home,0), COALESCE(meter_start,0))';
 
+            // ⭐ Meter replaced (Oct-2026): every reading below is taken on the machine's
+            //   CONTINUOUS scale, so the MAX is its true total distance — not the old meter's
+            //   last figure for ever. Both lines are no-ops for a machine never replaced.
+            $rowSql   = self::effSql($rowSql, $vehicleId);
+            $highExpr = self::effSql($highExpr, $vehicleId);
+            $fillExpr = self::fillSql($vehicleId);
+            $firstReset = MeterReplacement::rowsFor($vehicleId)[0]['d'] ?? null;
+
             // 1. The machine's own rows (Phase B onwards).
             $byVehicle = (int) DB::table('t_ops_attendance')
                 ->where('vehicle_id', $vehicleId)
@@ -3052,7 +3141,8 @@ class VehicleService
                 ->where('vehicle_id', $vehicleId)
                 ->whereNotNull('meter_at_fill')
                 ->whereNotIn('status', ['cancelled', 'rejected'])
-                ->max('meter_at_fill');
+                ->selectRaw('MAX(' . $fillExpr . ') AS m')
+                ->value('m');
 
             /**
              * ⭐ A RECORDED SERVICE IS A READING TOO (owner ruling Q4, 3-Sep — found NOT built
@@ -3074,10 +3164,15 @@ class VehicleService
                                 ->get(array_merge(['user_id', 'meter', 'service_date'],
                                                   ServiceRecordService::logVehicleCols())) as $sl) {
                         $d = substr((string) $sl->service_date, 0, 10);
+                        // Readings off a replaced meter are added below, on the continuous scale.
+                        if ($firstReset !== null && $d >= $firstReset) continue;
                         // ⭐ Stamp first — a reading belongs to the machine it was taken on.
                         if (ServiceRecordService::logVehicleOf($sl, $res) !== $vehicleId) continue;
                         $byService = (int) $sl->meter;
                         break;   // ordered by meter desc — the first row on THIS machine is its highest
+                    }
+                    foreach ($this->serviceLogsOnNewMeter($vehicleId) as $nl) {
+                        $byService = max($byService, $nl['m']);
                     }
                 }
             } catch (\Throwable $e) {
@@ -3119,14 +3214,15 @@ class VehicleService
                     ->when(self::hasCol('t_req_master', 'vehicle_id'),
                         fn ($q) => $q->whereNull('vehicle_id'))
                     ->whereNotNull('meter_at_fill')
-                    ->where('meter_at_fill', '>', $floor)
+                    ->whereRaw($fillExpr . ' > ?', [$floor])
                     ->whereNotIn('status', ['cancelled', 'rejected'])
                     ->whereRaw('COALESCE(expense_date, DATE(created_at)) >= ?', [$w['from']])
                     ->when($w['to'], fn ($q) => $q->whereRaw('COALESCE(expense_date, DATE(created_at)) <= ?', [$w['to']]))
                     ->when($skip, fn ($q) => $q->whereRaw(
                         'COALESCE(expense_date, DATE(created_at)) NOT IN (' . implode(',', array_fill(0, count($skip), '?')) . ')',
                         $skip))
-                    ->max('meter_at_fill');
+                    ->selectRaw('MAX(' . $fillExpr . ') AS m')
+                    ->value('m');
 
                 $best = max($best, $att, $fill);
             }
@@ -3198,8 +3294,8 @@ class VehicleService
             }
             $out['fuel_rs'] = round($fuel, 2);
 
-            $before = $this->meterWindowFor($vehicleId, $start->format('Y-m-d'));
-            $after  = $this->meterWindowFor($vehicleId, $end->copy()->addDay()->format('Y-m-d'));
+            $before = $this->meterWindowContinuousFor($vehicleId, $start->format('Y-m-d'));
+            $after  = $this->meterWindowContinuousFor($vehicleId, $end->copy()->addDay()->format('Y-m-d'));
             $lo = $before['floor'] ?? null;
             $hi = $after['floor'] ?? null;
 
@@ -3286,8 +3382,8 @@ class VehicleService
             $uid   = (int) $a->user_id;
             $days  = max(1, Carbon::parse($since)->diffInDays(Carbon::today()) + 1);
 
-            $startWin = $this->meterWindowFor($vehicleId, $since);
-            $endWin   = $this->meterWindowFor($vehicleId, Carbon::tomorrow()->format('Y-m-d'));
+            $startWin = $this->meterWindowContinuousFor($vehicleId, $since);
+            $endWin   = $this->meterWindowContinuousFor($vehicleId, Carbon::tomorrow()->format('Y-m-d'));
             $base = $startWin['floor'] ?? $startWin['ceil'] ?? null;   // handover meter, or first reading in the stint
             $now  = $endWin['floor'] ?? null;
 
@@ -3470,26 +3566,33 @@ class VehicleService
             ksort($rows);
 
             // --- walk the chain forward, anchored where the money figure is anchored ---
-            $openWin = $this->meterWindowFor($vehicleId, $from);
+            // ⭐ Meter replaced (Oct-2026): the chain is walked on the machine's CONTINUOUS scale
+            //   (`$ms`/`$me`/`$mh` and `meter_cont`), so the day a new meter starts at 0 is an
+            //   ordinary day instead of "the meter went backwards". The rows still SHOW the
+            //   figures as typed. All identity for a machine never replaced.
+            $openWin = $this->meterWindowContinuousFor($vehicleId, $from);
             $prev    = $openWin['floor'] ?? null;      // the reading this month opens on
             $prevDay = null;
             $dirty   = false;                          // a worked-but-unmetered day is behind us
 
             $days = [];
             foreach ($rows as $d => $r) {
-                $sane = $r['meter_start'] !== null && $r['meter_end'] !== null
-                    && $r['meter_start'] > self::MIN_METER
-                    && $r['meter_end'] >= $r['meter_start']
-                    && ($r['meter_end'] - $r['meter_start']) <= self::MAX_DAY_KM;
+                $ms = MeterReplacement::toContinuous($vehicleId, $r['meter_start'], $d);
+                $me = MeterReplacement::toContinuous($vehicleId, $r['meter_end'], $d);
+                $mh = MeterReplacement::toContinuous($vehicleId, $r['meter_home'], $d);
+                $sane = $ms !== null && $me !== null
+                    && $ms > self::MIN_METER
+                    && $me >= $ms
+                    && ($me - $ms) <= self::MAX_DAY_KM;
 
                 // The reading this day OPENS on: the check-in, or (no attendance) the
                 // day's highest claim meter — the only reading that day leaves behind.
                 $claimMeters = array_values(array_filter(array_map(
-                    fn ($c) => $c['meter'] ?? null, $r['claims']),
+                    fn ($c) => $c['meter_cont'] ?? ($c['meter'] ?? null), $r['claims']),
                     fn ($m) => $m !== null && $m > self::MIN_METER));
-                $opensAt = $sane ? $r['meter_start'] : ($claimMeters ? min($claimMeters) : null);
+                $opensAt = $sane ? $ms : ($claimMeters ? min($claimMeters) : null);
                 $closesAt = $sane
-                    ? max($r['meter_end'], $r['meter_home'] ?? 0)
+                    ? max($me, $mh ?? 0)
                     : ($claimMeters ? max($claimMeters) : null);
 
                 $before = null; $beforeKind = null; $anomaly = null;
@@ -3504,10 +3607,10 @@ class VehicleService
                 }
 
                 // The ride home after the office close is outside the shift.
-                $homeKm = ($sane && $r['meter_home'] !== null && $r['meter_home'] > $r['meter_end'])
-                    ? min($r['meter_home'] - $r['meter_end'], self::MAX_DAY_KM) : 0;
+                $homeKm = ($sane && $mh !== null && $mh > $me)
+                    ? min($mh - $me, self::MAX_DAY_KM) : 0;
 
-                $work = $sane ? $r['meter_end'] - $r['meter_start'] : null;
+                $work = $sane ? $me - $ms : null;
 
                 // Only a day he WORKED can be "missing" a reading — leave is a state,
                 // not a failure, and it must not poison the next gap.
@@ -3554,7 +3657,7 @@ class VehicleService
             // --- the tail: from the last reading of the month to where the next month
             //     opens. Without it the rows would fall short of the headline figure on
             //     any month whose last movement was never read until the 1st. ---
-            $closeWin = $this->meterWindowFor($vehicleId, $end->copy()->addDay()->format('Y-m-d'));
+            $closeWin = $this->meterWindowContinuousFor($vehicleId, $end->copy()->addDay()->format('Y-m-d'));
             $closesOn = $closeWin['floor'] ?? null;
             if ($prev !== null && $closesOn !== null && $closesOn > $prev
                 && ($closesOn - $prev) <= self::MAX_GAP_KM) {
@@ -4309,6 +4412,60 @@ class VehicleService
     }
 
     /**
+     * ⭐⭐ METER REPLACED (5-Oct-2026) — an attendance-reading SQL fragment, re-read on the
+     *    machine's CONTINUOUS scale (see `MeterReplacement`). Every `meter_start` / `meter_end`
+     *    / `meter_home` VALUE in the fragment becomes "the reading + what the old meter(s) had
+     *    already run"; the `_vehicle_id` stamp columns are left alone (`\b` does not match
+     *    inside `meter_start_vehicle_id`).
+     *
+     * ⭐ Returns the fragment UNCHANGED for a machine with no replacement on record — so every
+     *   existing query is byte-identical for the whole fleet until someone records one.
+     */
+    private static function effSql(string $sql, ?int $vehicleId, string $dateExpr = 'attendance_date'): string
+    {
+        if (!MeterReplacement::has($vehicleId)) return $sql;
+        return preg_replace_callback('/\bmeter_(start|end|home)\b/',
+            fn ($m) => MeterReplacement::sql($vehicleId, $m[0], $dateExpr), $sql);
+    }
+
+    /** A claim's `meter_at_fill` on the machine's continuous scale (the bare column without a replacement). */
+    private static function fillSql(?int $vehicleId): string
+    {
+        return MeterReplacement::sql($vehicleId, 'meter_at_fill', 'COALESCE(expense_date, DATE(created_at))');
+    }
+
+    /**
+     * Service-log readings taken on a REPLACED meter, on the continuous scale — the rows the
+     * shared `meter > MIN_METER` scans cannot see while the new meter is still under 1,000.
+     * Empty for a machine with no replacement, so those scans stay exactly as they were.
+     * @return array<int, array{id:int, m:int, d:string}>
+     */
+    private function serviceLogsOnNewMeter(int $vehicleId, $ignoreIds = null): array
+    {
+        $first = MeterReplacement::rowsFor($vehicleId)[0] ?? null;
+        if (!$first || !self::hasTbl('t_fleet_service_log')) return [];
+        $out = [];
+        try {
+            $resolver = new VehicleResolver();
+            $skip = ServiceRecordService::normaliseIds($ignoreIds);
+            foreach (DB::table('t_fleet_service_log')
+                        ->whereNotNull('meter')->where('meter', '>', 0)
+                        ->where('service_date', '>=', $first['d'])
+                        ->when($skip, fn ($q, $ids) => $q->whereNotIn('id', $ids))
+                        ->get(array_merge(['id', 'user_id', 'meter', 'service_date'],
+                                          ServiceRecordService::logVehicleCols())) as $sl) {
+                if (ServiceRecordService::logVehicleOf($sl, $resolver) !== $vehicleId) continue;
+                $d = substr((string) $sl->service_date, 0, 10);
+                $out[] = ['id' => (int) $sl->id, 'd' => $d,
+                          'm' => (int) MeterReplacement::toContinuous($vehicleId, (int) $sl->meter, $d)];
+            }
+        } catch (\Throwable $e) {
+            return [];
+        }
+        return $out;
+    }
+
+    /**
      * ⭐ Could this reading be of THIS machine? Rule P's question, asked at WRITE time.
      *
      * Used before a meter reading is stamped, so that a rider typing his own bike's 6,606 while
@@ -4318,15 +4475,52 @@ class VehicleService
      *
      * ⭐ FAILS OPEN — no spine, or any error, means "can't tell", which must never block a write.
      */
-    public function readingPlausibleFor(int $vehicleId, int $value): bool
+    public function readingPlausibleFor(int $vehicleId, int $value, ?string $date = null,
+                                        bool $dateCeiling = true): bool
     {
         try {
+            // ⭐ Meter replaced (Oct-2026): the reading is judged on the machine's continuous
+            //   scale — a new meter's 147 is "the old meter's last + 147". With no date it is
+            //   taken as a reading of the meter fitted NOW. Identity without a replacement.
+            $value = (int) MeterReplacement::toContinuous($vehicleId, $value, $date);
+            /**
+             * ⚠⚠ AN ODOMETER NEVER RUNS BACKWARDS — asked whenever the reading has a DATE
+             *    (5-Oct-2026). Growing the spine (below) widened the window enough to let
+             *    Waseem's DCR-799 fills of 1-Aug (24,153–24,588) back onto EGL-682 by the
+             *    first-keeper window guess — the exact Aug-28 CEN-455 incident — and every
+             *    later fill of Danish's read "meter vs last fill doesn't add up". A reading
+             *    dated 1-Aug cannot be above what the same machine showed on 29-Aug (17,198).
+             *    MAX_GAP_KM of slack, so a slightly-off later reading never refuses a real one.
+             */
+            if ($dateCeiling && $date !== null && ($ceil = $this->lowestMachineReadingAfter($vehicleId, substr($date, 0, 10))) !== null
+                && $value > $ceil + self::MAX_GAP_KM) {
+                return false;
+            }
             $spine = [];
             foreach ($this->machineKeyedReadings($vehicleId) as $r) {
                 if ((int) $r['m'] > self::MIN_METER) $spine[] = (int) $r['m'];
             }
+            /**
+             * ⚠⚠ THE SPINE MUST GROW WITH THE BIKE (5-Oct-2026 prod incident, EGL-682).
+             *    Its only keyed reading was a 29-Aug meter log at 17,198, so the window topped out
+             *    at 17,198 + 20% = 20,638 for ever. Once the bike honestly ran past that, every
+             *    reading of it was "implausible": its attendance stamps silently stopped (28-Sep
+             *    close onward) and the service door refused 21,459 while printing "it was last
+             *    seen at 21,459 km" — and with the service refused, the workshop visit could not
+             *    be closed.
+             *
+             * ⭐ So readings already STAMPED to this machine join the spine. Each one was accepted
+             *   by this very rule (or typed by a manager on the machine's own editor), so the
+             *   chain extends a day at a time and a daily run can never outgrow it.
+             * ⚠ Deliberately NOT `currentMeterFor()`: that is a MAX over the keeper's UNSTAMPED
+             *   rows too, so one wrong-machine reading in it would widen the window and let the
+             *   next wrong reading be stamped — the one mistake this rule exists to prevent.
+             */
+            // ⚠ Only the HIGH end: the low anchor stays the keyed readings, so this never
+            //   widens the window downward (the van-vs-own-bike direction).
+            if (($stHi = $this->stampedReadings($vehicleId)['hi']) !== null) $spine[] = $stHi;
             if (!$spine) {
-                $cur = $this->currentMeterFor($vehicleId);
+                $cur = $this->currentMeterContinuous($vehicleId);
                 if ($cur !== null && $cur > self::MIN_METER) $spine[] = (int) $cur;
             }
             if (!$spine) return true;
@@ -4335,6 +4529,61 @@ class VehicleService
         } catch (\Throwable $e) {
             return true;
         }
+    }
+
+    /**
+     * Attendance readings STAMPED to this machine (`<col>_vehicle_id`): the highest overall
+     * (Rule P's moving end) and the lowest per day (for the date ceiling). Memoised: Rule P
+     * runs once per claim in `claimsForVehicle`. ⚠ Fails soft (empty = "no stamped evidence").
+     *
+     * @return array{hi:?int, days:array<string,int>}
+     */
+    private function stampedReadings(int $vehicleId): array
+    {
+        if (array_key_exists($vehicleId, self::$stampedReadMemo)) {
+            return self::$stampedReadMemo[$vehicleId];
+        }
+        $out = ['hi' => null, 'days' => []];
+        try {
+            if (self::stampsAvailable()) {
+                foreach (['meter_start', 'meter_end', 'meter_home'] as $c) {
+                    if (!self::hasCol('t_ops_attendance', $c . '_vehicle_id')) continue;
+                    // Continuous scale (identity without a meter replacement).
+                    $cx = self::effSql($c, $vehicleId);
+                    foreach (DB::table('t_ops_attendance')
+                                ->where($c . '_vehicle_id', $vehicleId)
+                                ->whereRaw($cx . ' > ' . self::MIN_METER)
+                                ->groupBy('attendance_date')
+                                ->selectRaw('attendance_date AS d, MIN(' . $cx . ') AS lo, MAX(' . $cx . ') AS hi')
+                                ->get() as $r) {
+                        $d = substr((string) $r->d, 0, 10);
+                        $out['hi'] = max((int) $out['hi'], (int) $r->hi);
+                        $out['days'][$d] = isset($out['days'][$d]) ? min($out['days'][$d], (int) $r->lo) : (int) $r->lo;
+                    }
+                }
+            }
+        } catch (\Throwable $e) {
+            $out = ['hi' => null, 'days' => []];
+        }
+        return self::$stampedReadMemo[$vehicleId] = $out;
+    }
+
+    /**
+     * The lowest reading this machine is RECORDED at on any day strictly after `$date` — its
+     * own meter log / handover readings and attendance readings stamped to it. Null = none.
+     */
+    private function lowestMachineReadingAfter(int $vehicleId, string $date): ?int
+    {
+        $low = null;
+        foreach ($this->machineKeyedReadings($vehicleId) as $r) {
+            if (!empty($r['d']) && $r['d'] > $date && (int) $r['m'] > self::MIN_METER) {
+                $low = $low === null ? (int) $r['m'] : min($low, (int) $r['m']);
+            }
+        }
+        foreach ($this->stampedReadings($vehicleId)['days'] as $d => $m) {
+            if ($d > $date) $low = $low === null ? $m : min($low, $m);
+        }
+        return $low;
     }
 
     /**
@@ -4417,6 +4666,130 @@ class VehicleService
     }
 
     /** The month's figures are DERIVED — drop every memo that just went stale. */
+    /**
+     * ⭐⭐ RECORD "THIS MACHINE'S METER WAS REPLACED" (5-Oct-2026) — the one writer.
+     *
+     * `$oldReading` = the last figure the OLD meter showed; `$newReading` = what the NEW one
+     * showed when it was fitted (usually 0). From `$date` on, every rule reads this machine's
+     * new readings as `reading + (old - new)` — see `MeterReplacement`.
+     *
+     * ⚠ One row per machine per day (saving again CORRECTS it). Callers own the permission.
+     * ⚠ Refuses a pair that changes nothing (old = new) — that is not a replacement, and an
+     *   empty row would only make the next reader wonder what it was for.
+     *
+     * @return array{ok:bool, message:string, id:?int}
+     */
+    public function saveMeterReplacement(int $vehicleId, string $date, int $oldReading, int $newReading,
+                                         ?string $note, int $enteredBy): array
+    {
+        $date = substr($date, 0, 10);
+        $fail = fn (string $m) => ['ok' => false, 'message' => $m, 'id' => null];
+        try {
+            if (!MeterReplacement::available()) {
+                return $fail('Meter replacement is not set up on this server yet (SQL pending).');
+            }
+            if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $date) || $date > date('Y-m-d')) {
+                return $fail('Choose the day the meter was replaced — today or earlier.');
+            }
+            if ($oldReading <= 0) return $fail('Enter the last reading the OLD meter showed.');
+            if ($newReading < 0)  return $fail('The new meter\'s reading cannot be negative.');
+            if ($oldReading === $newReading) {
+                return $fail('The old and new readings are the same — that is not a replacement.');
+            }
+
+            $existing = DB::table(MeterReplacement::TABLE)
+                ->where('vehicle_id', $vehicleId)->where('reset_date', $date)->first();
+            $row = [
+                'vehicle_id'  => $vehicleId,
+                'reset_date'  => $date,
+                'old_reading' => $oldReading,
+                'new_reading' => $newReading,
+                'note'        => $note !== null && trim($note) !== '' ? mb_substr(trim($note), 0, 255) : null,
+                'entered_by'  => $enteredBy,
+                'updated_at'  => now(),
+            ];
+            if ($existing) {
+                DB::table(MeterReplacement::TABLE)->where('id', $existing->id)->update($row);
+                $id = (int) $existing->id;
+            } else {
+                $row['created_at'] = now();
+                $id = (int) DB::table(MeterReplacement::TABLE)->insertGetId($row);
+            }
+            $this->flushAfterMeterReplacement($vehicleId, $date);
+
+            try {
+                \App\Services\AuditLogger::log(
+                    $existing ? 'vehicle_meter_replacement_corrected' : 'vehicle_meter_replaced',
+                    'vehicle', $vehicleId, $this->find($vehicleId)['name'] ?? ('vehicle ' . $vehicleId),
+                    ['reset_date' => $date, 'old_reading' => $oldReading, 'new_reading' => $newReading],
+                    null, $row['note']
+                );
+            } catch (\Throwable $e) { /* auditing must never break the action */ }
+
+            return ['ok' => true, 'id' => $id,
+                    'message' => 'Meter replacement recorded — readings from ' . $date
+                        . ' on are read on the new meter.'];
+        } catch (\Throwable $e) {
+            Log::warning('saveMeterReplacement failed', ['vehicle' => $vehicleId, 'error' => $e->getMessage()]);
+            return $fail('Could not record the meter replacement.');
+        }
+    }
+
+    /** Take back a meter replacement recorded by mistake. */
+    public function removeMeterReplacement(int $vehicleId, int $resetId): array
+    {
+        try {
+            if (!MeterReplacement::available()) return ['ok' => false, 'message' => 'Nothing to remove.'];
+            $r = DB::table(MeterReplacement::TABLE)->where('id', $resetId)->where('vehicle_id', $vehicleId)->first();
+            if (!$r) return ['ok' => false, 'message' => 'That replacement is no longer on record.'];
+            DB::table(MeterReplacement::TABLE)->where('id', $resetId)->delete();
+            $this->flushAfterMeterReplacement($vehicleId, substr((string) $r->reset_date, 0, 10));
+            try {
+                \App\Services\AuditLogger::log('vehicle_meter_replacement_removed', 'vehicle', $vehicleId,
+                    $this->find($vehicleId)['name'] ?? ('vehicle ' . $vehicleId),
+                    ['reset_date' => substr((string) $r->reset_date, 0, 10),
+                     'old_reading' => (int) $r->old_reading, 'new_reading' => (int) $r->new_reading]);
+            } catch (\Throwable $e) { /* never break the action */ }
+            return ['ok' => true, 'message' => 'Meter replacement removed.'];
+        } catch (\Throwable $e) {
+            Log::warning('removeMeterReplacement failed', ['vehicle' => $vehicleId, 'error' => $e->getMessage()]);
+            return ['ok' => false, 'message' => 'Could not remove it.'];
+        }
+    }
+
+    /** The replacements on record for one machine, newest first — for the Meter editor. */
+    public function meterReplacementsFor(int $vehicleId): array
+    {
+        $out = [];
+        foreach (array_reverse(MeterReplacement::rowsFor($vehicleId)) as $r) {
+            $out[] = ['id' => $r['id'], 'date' => $r['d'], 'old_reading' => $r['old'],
+                      'new_reading' => $r['new'], 'note' => $r['note'],
+                      'entered_by_name' => $r['entered_by']
+                          ? DB::table('t_sys_user')->where('id', $r['entered_by'])->value('fullname') : null];
+        }
+        return $out;
+    }
+
+    /**
+     * Everything derived from this machine's readings changes when a replacement is recorded:
+     * the in-process memos, the cross-request service cache, the rider legs, and the cached
+     * month engine for EVERY month from the replacement to now.
+     */
+    private function flushAfterMeterReplacement(int $vehicleId, string $date): void
+    {
+        try {
+            self::bumpServiceEvidence($vehicleId);       // also flushes the memos + MeterReplacement
+            VehicleResolver::flush();
+            RiderDayLegs::flush();
+            $eng = new MachineAttribution();
+            $m = Carbon::parse($date)->startOfMonth();
+            $now = Carbon::today()->startOfMonth();
+            for ($i = 0; $m->lte($now) && $i < 36; $i++, $m->addMonth()) {
+                $eng->flush($m->format('Y-m'));
+            }
+        } catch (\Throwable $e) { /* a stale cache must never fail a saved record */ }
+    }
+
     private function flushAfterMeterLog(string $date): void
     {
         try {
@@ -4498,6 +4871,26 @@ class VehicleService
      */
     public function meterWindowFor(int $vehicleId, string $date, $ignoreServiceLogId = null): ?array
     {
+        $w = $this->meterWindowContinuousFor($vehicleId, $date, $ignoreServiceLogId);
+        if ($w === null || !MeterReplacement::has($vehicleId)) return $w;
+        // ⭐ Meter replaced (Oct-2026): the window is built on the machine's continuous scale;
+        //   what leaves here is in the figures of the meter fitted on `$date`, i.e. what a
+        //   person looking at the bike that day would read. A floor at or below zero on a new
+        //   meter is "the new meter had not started" — no constraint.
+        $floor = $w['floor'] !== null ? MeterReplacement::toRaw($vehicleId, (int) $w['floor'], $date) : null;
+        $ceil  = $w['ceil']  !== null ? MeterReplacement::toRaw($vehicleId, (int) $w['ceil'],  $date) : null;
+        return ['floor' => ($floor !== null && $floor > 0) ? $floor : null,
+                'ceil'  => ($ceil  !== null && $ceil  > 0) ? $ceil  : null];
+    }
+
+    /**
+     * The same window on the machine's CONTINUOUS scale (see `MeterReplacement`) — for callers
+     * that do arithmetic with it (a span across a month, a typed reading converted with
+     * `MeterReplacement::toContinuous`). Identical to `meterWindowFor` for a machine whose
+     * meter was never replaced.
+     */
+    public function meterWindowContinuousFor(int $vehicleId, string $date, $ignoreServiceLogId = null): ?array
+    {
         if (!$this->available()) return null;
 
         // ⚠⚠ MEMOISED, AND IT MUST BE — same reasoning as `machineKeyedReadings()`
@@ -4531,6 +4924,14 @@ class VehicleService
             $lowExpr = $readingLevel
                 ? self::readingLowExprSql($vehicleId)
                 : 'COALESCE(NULLIF(meter_start,0), NULLIF(meter_end,0), NULLIF(meter_home,0))';
+
+            // ⭐ Meter replaced (Oct-2026): every reading on the continuous scale. No-ops for a
+            //   machine never replaced.
+            $sane     = self::effSql($sane, $vehicleId);
+            $highExpr = self::effSql($highExpr, $vehicleId);
+            $lowExpr  = self::effSql($lowExpr, $vehicleId);
+            $fillExpr = self::fillSql($vehicleId);
+            $firstReset = MeterReplacement::rowsFor($vehicleId)[0]['d'] ?? null;
 
             // ⭐⭐ TWO CLASSES OF EVIDENCE, AND THEY ARE NOT EQUALLY TRUSTWORTHY (Aug-22 2026).
             //
@@ -4600,15 +5001,15 @@ class VehicleService
                         ->where('requester_user_id', $w['user_id'])
                         ->whereNull('vehicle_id')
                         ->whereNotNull('meter_at_fill')
-                        ->where('meter_at_fill', '>', self::MIN_METER)
+                        ->whereRaw($fillExpr . ' > ' . self::MIN_METER)
                         ->whereNotIn('status', ['cancelled', 'rejected'])
                         ->whereRaw('COALESCE(expense_date, DATE(created_at)) >= ?', [$w['from']])
                         ->when($w['to'], fn ($q) => $q->whereRaw(
                             'COALESCE(expense_date, DATE(created_at)) <= ?', [$w['to']]))
                         ->when($skipSql, fn ($q) => $q->whereRaw($skipSql, $skip));
-                    $lb = $legacyQ()->whereRaw('COALESCE(expense_date, DATE(created_at)) < ?', [$date])->max('meter_at_fill');
+                    $lb = $legacyQ()->whereRaw('COALESCE(expense_date, DATE(created_at)) < ?', [$date])->selectRaw('MAX(' . $fillExpr . ') AS m')->value('m');
                     if ((int) $lb > 0) $riskFloorC[] = (int) $lb;
-                    $la = $legacyQ()->whereRaw('COALESCE(expense_date, DATE(created_at)) > ?', [$date])->min('meter_at_fill');
+                    $la = $legacyQ()->whereRaw('COALESCE(expense_date, DATE(created_at)) > ?', [$date])->selectRaw('MIN(' . $fillExpr . ') AS m')->value('m');
                     if ((int) $la > self::MIN_METER) $riskCeilC[] = (int) $la;
                 }
             }
@@ -4640,11 +5041,11 @@ class VehicleService
                 $stampedQ = fn () => DB::table('t_req_master')
                     ->where('vehicle_id', $vehicleId)
                     ->whereNotNull('meter_at_fill')
-                    ->where('meter_at_fill', '>', self::MIN_METER)
+                    ->whereRaw($fillExpr . ' > ' . self::MIN_METER)
                     ->whereNotIn('status', ['cancelled', 'rejected']);
-                $sb = $stampedQ()->whereRaw('COALESCE(expense_date, DATE(created_at)) < ?', [$date])->max('meter_at_fill');
+                $sb = $stampedQ()->whereRaw('COALESCE(expense_date, DATE(created_at)) < ?', [$date])->selectRaw('MAX(' . $fillExpr . ') AS m')->value('m');
                 if ((int) $sb > 0) $floorC[] = (int) $sb;
-                $sa = $stampedQ()->whereRaw('COALESCE(expense_date, DATE(created_at)) > ?', [$date])->min('meter_at_fill');
+                $sa = $stampedQ()->whereRaw('COALESCE(expense_date, DATE(created_at)) > ?', [$date])->selectRaw('MIN(' . $fillExpr . ') AS m')->value('m');
                 if ((int) $sa > self::MIN_METER) $ceilC[] = (int) $sa;
             }
 
@@ -4672,11 +5073,19 @@ class VehicleService
                                 ->get(array_merge(['id', 'user_id', 'meter', 'service_date'],
                                                   ServiceRecordService::logVehicleCols())) as $sl) {
                         $d = substr((string) $sl->service_date, 0, 10);
+                        // Readings off a replaced meter are added below, on the continuous scale.
+                        if ($firstReset !== null && $d >= $firstReset) continue;
                         // ⭐ Stamp first — same rule as every other per-machine reader.
                         if (ServiceRecordService::logVehicleOf($sl, $resolver) !== $vehicleId) continue;
                         if ($d < $date) { if ((int) $sl->meter > $svcBefore) $svcBefore = (int) $sl->meter; }
                         elseif ($d > $date) {
                             if ($svcAfter === null || (int) $sl->meter < $svcAfter) $svcAfter = (int) $sl->meter;
+                        }
+                    }
+                    foreach ($this->serviceLogsOnNewMeter($vehicleId, $ignoreServiceLogId) as $nl) {
+                        if ($nl['d'] < $date) { if ($nl['m'] > $svcBefore) $svcBefore = $nl['m']; }
+                        elseif ($nl['d'] > $date) {
+                            if ($svcAfter === null || $nl['m'] < $svcAfter) $svcAfter = $nl['m'];
                         }
                     }
                     if ($svcBefore > 0) $floorC[] = $svcBefore;
@@ -4793,6 +5202,13 @@ class VehicleService
                 }
             }
         } catch (\Throwable $e) { /* column not migrated → nothing to add */ }
+        // ⭐ Meter replaced (Oct-2026): on the machine's continuous scale, like every other
+        //   reading the window and Rule P weigh these against. No-op without a replacement.
+        if (MeterReplacement::has($vehicleId)) {
+            foreach ($out as $i => $r) {
+                $out[$i]['m'] = (int) MeterReplacement::toContinuous($vehicleId, $r['m'], $r['d']);
+            }
+        }
         return self::$machineReadMemo[$vehicleId] = $out;
     }
 

@@ -7272,7 +7272,110 @@ function flvMeterForm(res) {
     + ' placeholder="e.g. lunchtime delivery run" style="width:100%;border:1px solid #d1d5db;border-radius:8px;padding:7px 9px;font-size:13px;"></div>';
 
     return attBlock + logBlock
-      + '<div id="flvMeterHint" class="fl-muted" style="font-size:11.5px;margin-top:7px;"></div>';
+      + '<div id="flvMeterHint" class="fl-muted" style="font-size:11.5px;margin-top:7px;"></div>'
+      + flvMeterReplacementBlock(res);
+}
+
+/**
+ * 🔁 "THE METER ON THIS MACHINE WAS REPLACED" (5-Oct-2026).
+ *
+ * A new odometer starts near zero, and every rule here assumed a machine's reading only
+ * goes up — so the new meter's figures were refused as "lower than this bike's 9,133". This
+ * records the swap ONCE (the day, the old meter's last figure, the new one's first) and the
+ * server then reads the machine as one continuous distance. Kept folded away: it is a
+ * once-in-years action and must not sit open beside the daily readings.
+ * ⚠ Its own Save button on purpose — it is not a reading and must not ride the day's Save.
+ */
+function flvMeterReplacementBlock(res) {
+    const list = res.replacements || [];
+    const rows = list.map(r =>
+        '<div class="fl-mrow" style="background:#fffbeb;margin-top:6px;">'
+      +   '<span class="fl-dc-k">replaced</span><b>' + flEsc(flDate(r.date)) + '</b>'
+      +   '<span class="fl-muted">old meter ended ' + flNum(r.old_reading)
+      +   ' · new meter started ' + flNum(r.new_reading)
+      +   (r.entered_by_name ? ' · by ' + flEsc(r.entered_by_name) : '')
+      +   (r.note ? ' · ' + flEsc(r.note) : '') + '</span>'
+      +   '<button type="button" class="fl-vbtn" style="margin-left:auto;" onclick="flvRemoveMeterReplacement(' + r.id + ')"'
+      +   ' title="Recorded by mistake? Remove it">remove</button>'
+      + '</div>').join('');
+
+    const floor = (res.window && res.window.floor) ? res.window.floor : '';
+    const inp = 'width:100%;border:1px solid #d1d5db;border-radius:8px;padding:7px 9px;font-size:13px;';
+    const form = !res.replacement_ready
+      ? '<div class="fl-muted" style="font-size:11.5px;margin-top:6px;">Not set up on this server yet (SQL pending).</div>'
+      : '<div class="fl-muted" style="font-size:11.5px;margin-top:6px;">'
+      +   'Only when the odometer itself was changed. Set the <b>date above</b> to the day it was replaced, then:'
+      + '</div>'
+      + '<div style="display:flex;gap:9px;margin-top:6px;">'
+      +   '<div style="flex:1;"><label class="fl-dc-k">old meter — last reading</label>'
+      +     '<input type="number" id="flvMeterReplOld" value="' + floor + '" style="' + inp + '"></div>'
+      +   '<div style="flex:1;"><label class="fl-dc-k">new meter — first reading</label>'
+      +     '<input type="number" id="flvMeterReplNew" value="0" style="' + inp + '"></div>'
+      + '</div>'
+      + '<div style="margin-top:7px;"><input type="text" id="flvMeterReplNote" maxlength="255"'
+      +   ' placeholder="note (optional) — e.g. meter cable broke, new unit fitted" style="' + inp + '"></div>'
+      + '<div style="margin-top:8px;display:flex;align-items:center;gap:9px;">'
+      +   '<button type="button" class="fl-vbtn" id="flvMeterReplSave" onclick="flvSaveMeterReplacement()">🔁 Record replacement</button>'
+      +   '<span id="flvMeterReplMsg" style="font-size:11.5px;"></span>'
+      + '</div>';
+
+    return '<details style="margin-top:12px;border-top:1px dashed #d1d5db;padding-top:9px;"' + (list.length ? ' open' : '') + '>'
+      + '<summary style="cursor:pointer;font-size:12.5px;font-weight:600;color:#374151;">🔁 Meter replaced on this machine?'
+      + (list.length ? ' <span class="fl-muted" style="font-weight:400;">(' + list.length + ' on record)</span>' : '')
+      + '</summary>' + rows + form + '</details>';
+}
+
+function flvMeterReplacementPost(fd, btn) {
+    const csrf = document.querySelector('meta[name="csrf-token"]')?.getAttribute('content') || '';
+    if (btn) btn.disabled = true;
+    return fetch(FLV_BASE + '/' + flvMeterVehicle + '/meter-save', {
+        method: 'POST', headers: {'Accept': 'application/json', 'X-CSRF-TOKEN': csrf}, body: fd
+    })
+    .then(r => r.json())
+    .then(j => {
+        if (!j.success) throw new Error(j.message || 'Could not save');
+        // Every figure on the page is derived from the readings — redraw them all.
+        Object.keys(flvDaysCache).forEach(k => delete flvDaysCache[k]);
+        flvLoadMeterDay();
+        flvLoad();
+        if (typeof flLoad === 'function') flLoad();
+        if (flvOpenId) flvOpen(flvOpenId);
+    })
+    .catch(e => {
+        const msg = document.getElementById('flvMeterReplMsg');
+        if (msg) { msg.style.color = '#b91c1c'; msg.textContent = e.message || 'Could not save'; }
+        else { alert(e.message || 'Could not save'); }
+        if (btn) btn.disabled = false;
+    });
+}
+
+function flvSaveMeterReplacement() {
+    const oldV = parseInt(document.getElementById('flvMeterReplOld').value, 10);
+    const newV = parseInt(document.getElementById('flvMeterReplNew').value, 10);
+    const msg = document.getElementById('flvMeterReplMsg');
+    const date = document.getElementById('flvMeterDate').value;
+    if (isNaN(oldV) || oldV <= 0) { msg.style.color = '#b91c1c'; msg.textContent = 'Enter the last reading the OLD meter showed.'; return; }
+    if (isNaN(newV) || newV < 0)  { msg.style.color = '#b91c1c'; msg.textContent = 'Enter what the NEW meter showed when fitted (usually 0).'; return; }
+    if (!confirm('Record that the meter on this machine was replaced on ' + flDate(date) + '?\n\n'
+        + 'Old meter ended at ' + flNum(oldV) + ' km, new meter started at ' + flNum(newV) + ' km.\n'
+        + 'Readings from that day on will be read on the new meter.')) return;
+    const fd = new FormData();
+    fd.append('date', date);
+    fd.append('target', 'replacement');
+    fd.append('old_reading', oldV);
+    fd.append('new_reading', newV);
+    const note = document.getElementById('flvMeterReplNote').value.trim();
+    if (note) fd.append('note', note);
+    flvMeterReplacementPost(fd, document.getElementById('flvMeterReplSave'));
+}
+
+function flvRemoveMeterReplacement(id) {
+    if (!confirm('Remove this meter replacement? The readings of this machine will be read as one meter again.')) return;
+    const fd = new FormData();
+    fd.append('date', document.getElementById('flvMeterDate').value);
+    fd.append('target', 'replacement_remove');
+    fd.append('replacement_id', id);
+    flvMeterReplacementPost(fd, null);
 }
 
 function flvMeterClearLog() {

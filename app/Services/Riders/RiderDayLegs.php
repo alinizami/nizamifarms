@@ -168,7 +168,7 @@ class RiderDayLegs
                     ];
                 }
 
-                $merged = $this->merge($legs, $vehicles, $userId);
+                $merged = $this->merge($legs, $vehicles, $userId, $d);
                 if ($merged) $out[$d] = $merged;
 
                 $cursor->addDay();
@@ -206,6 +206,9 @@ class RiderDayLegs
         $ms = ($att->meter_start ?? null) !== null && (float) $att->meter_start > 0 ? (int) $att->meter_start : null;
         $me = ($att->meter_end   ?? null) !== null && (float) $att->meter_end   > 0 ? (int) $att->meter_end   : null;
         if ($ms === null && $me === null) return [];
+        // The day the readings were taken — lets Rule P refuse a machine whose odometer was
+        // already LOWER on a later day (an odometer never runs backwards).
+        $attDate = !empty($att->attendance_date) ? substr((string) $att->attendance_date, 0, 10) : null;
 
         $sV = $hasStamp && !empty($att->meter_start_vehicle_id) ? (int) $att->meter_start_vehicle_id : null;
         $eV = $hasStamp && !empty($att->meter_end_vehicle_id)   ? (int) $att->meter_end_vehicle_id   : null;
@@ -213,22 +216,27 @@ class RiderDayLegs
         if ($me === null) $eV = null;
 
         if ($ms !== null && $me !== null) {
-            $sameMachine = ($me >= $ms) && (($me - $ms) <= self::SAME_MACHINE_SPAN_KM);
+            // (on the continuous scale of the machine in question — a swapped meter mid-day
+            //  is still ONE machine; identical without a replacement)
+            $spanVid = $sV ?: ($eV ?: $derived);
+            $cms = MeterReplacement::toContinuous($spanVid, $ms, $attDate);
+            $cme = MeterReplacement::toContinuous($spanVid, $me, $attDate);
+            $sameMachine = ($cme >= $cms) && (($cme - $cms) <= self::SAME_MACHINE_SPAN_KM);
             if ($sV && !$eV) {
-                $d  = $this->deriveFor($derived, $me, $ownIds, $svc);
+                $d  = $this->deriveFor($derived, $me, $ownIds, $svc, $attDate);
                 $eV = $sameMachine ? $sV : (($d && $d !== $sV) ? $d : null);
             } elseif ($eV && !$sV) {
-                $d  = $this->deriveFor($derived, $ms, $ownIds, $svc);
+                $d  = $this->deriveFor($derived, $ms, $ownIds, $svc, $attDate);
                 $sV = $sameMachine ? $eV : (($d && $d !== $eV) ? $d : null);
             } elseif (!$sV && !$eV) {
-                $sV = $this->deriveFor($derived, $ms, $ownIds, $svc);
+                $sV = $this->deriveFor($derived, $ms, $ownIds, $svc, $attDate);
                 $eV = $sameMachine
-                    ? ($sV ?: $this->deriveFor($derived, $me, $ownIds, $svc))
-                    : $this->deriveFor($derived, $me, $ownIds, $svc);
+                    ? ($sV ?: $this->deriveFor($derived, $me, $ownIds, $svc, $attDate))
+                    : $this->deriveFor($derived, $me, $ownIds, $svc, $attDate);
             }
         } else {
-            if ($ms !== null && !$sV) $sV = $this->deriveFor($derived, $ms, $ownIds, $svc);
-            if ($me !== null && !$eV) $eV = $this->deriveFor($derived, $me, $ownIds, $svc);
+            if ($ms !== null && !$sV) $sV = $this->deriveFor($derived, $ms, $ownIds, $svc, $attDate);
+            if ($me !== null && !$eV) $eV = $this->deriveFor($derived, $me, $ownIds, $svc, $attDate);
         }
 
         $aid = (int) $att->id;
@@ -275,16 +283,16 @@ class RiderDayLegs
      *   the own bike with no SQL and no backfill. Ambiguity (none, or more than one) is
      *   left UNATTRIBUTED — which means "no opinion", which means today's behaviour.
      */
-    private function deriveFor(?int $derived, ?int $reading, array $ownIds, VehicleService $svc): ?int
+    private function deriveFor(?int $derived, ?int $reading, array $ownIds, VehicleService $svc, ?string $date = null): ?int
     {
         if ($reading === null) return $derived;
         try {
-            if ($derived && $svc->readingPlausibleFor($derived, $reading)) return $derived;
+            if ($derived && $svc->readingPlausibleFor($derived, $reading, $date)) return $derived;
 
             $hits = [];
             foreach ($ownIds as $vid) {
                 if ((int) $vid === (int) $derived) continue;
-                if ($svc->readingPlausibleFor((int) $vid, $reading)) $hits[] = (int) $vid;
+                if ($svc->readingPlausibleFor((int) $vid, $reading, $date)) $hits[] = (int) $vid;
             }
             if (count($hits) === 1) return $hits[0];
 
@@ -333,7 +341,7 @@ class RiderDayLegs
      * manager-entered afternoon run) are one leg whose km is the sum — the rider is owed
      * for both, and a single machine appearing twice on his screen would read as a bug.
      */
-    private function merge(array $legs, array $vehicles, int $userId): array
+    private function merge(array $legs, array $vehicles, int $userId, ?string $date = null): array
     {
         $byVehicle = [];
         foreach ($legs as $l) {
@@ -341,10 +349,16 @@ class RiderDayLegs
             $v   = $vehicles[$vid] ?? null;
             if (!$v) continue;                       // a machine we cannot describe is not a leg
 
+            // ⭐ Meter replaced (Oct-2026): distances and "which reading is the later one" are
+            //   asked on the machine's continuous scale (`$cs`/`$ce`), so the day a meter is
+            //   swapped (in at 21,400, out at 35) still has its real km. The leg keeps the
+            //   figures as typed. `$cs`/`$ce` ARE those figures without a replacement.
+            $cs = MeterReplacement::toContinuous($vid, $l['meter_start'], $date);
+            $ce = MeterReplacement::toContinuous($vid, $l['meter_end'], $date);
+
             $km = null;
-            if ($l['meter_start'] !== null && $l['meter_end'] !== null
-                && $l['meter_end'] >= $l['meter_start']) {
-                $km = (float) ($l['meter_end'] - $l['meter_start']);
+            if ($cs !== null && $ce !== null && $ce >= $cs) {
+                $km = (float) ($ce - $cs);
             }
 
             if (!isset($byVehicle[$vid])) {
@@ -379,11 +393,13 @@ class RiderDayLegs
             // Readings still describe the day's span when they are coherent; two stints
             // on one machine keep the outermost pair.
             if ($l['meter_start'] !== null
-                && ($cur['meter_start'] === null || $l['meter_start'] < $cur['meter_start'])) {
+                && ($cur['meter_start'] === null
+                    || $cs < MeterReplacement::toContinuous($vid, $cur['meter_start'], $date))) {
                 $cur['meter_start'] = $l['meter_start'];
             }
             if ($l['meter_end'] !== null
-                && ($cur['meter_end'] === null || $l['meter_end'] > $cur['meter_end'])) {
+                && ($cur['meter_end'] === null
+                    || $ce > MeterReplacement::toContinuous($vid, $cur['meter_end'], $date))) {
                 $cur['meter_end'] = $l['meter_end'];
             }
             if ($cur['attendance_id'] === null) $cur['attendance_id'] = $l['attendance_id'];

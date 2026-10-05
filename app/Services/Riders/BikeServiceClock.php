@@ -215,7 +215,8 @@ class BikeServiceClock
                             (int) $vid,
                             $meter,
                             $claimType && (int) $claimType->interval_km > 0
-                                ? (int) $claimType->interval_km : null
+                                ? (int) $claimType->interval_km : null,
+                            $date   // the claim's own day — see the meter-replaced note there
                         );
                         // ⚠ "No valid reference" IS an answer. When the machine's
                         //   history holds nothing that could have included this job,

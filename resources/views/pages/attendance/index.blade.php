@@ -1590,8 +1590,12 @@ function renderAttendanceTable(data) {
     // Prefer server-computed late/overtime (per-date + frozen-snapshot aware). Fall
     // back to local calc only if the server didn't send them (older cached responses).
     const fmtMins = (n) => { const h = Math.floor(n / 60), m = n % 60; return h > 0 ? `${h}h ${m}m` : `${m}m`; };
+    // ⭐ 5-Oct-2026: `late_minutes` is what COUNTS (net of a waive, the payroll figure);
+    //   the day is still a late day on the raw figure. Fully waived → "Late · waived".
+    const lateRaw = (r.late_raw_minutes != null) ? Number(r.late_raw_minutes) : Number(r.late_minutes);
     const lateBy = (r.late_minutes != null)
-      ? { isLate: r.late_minutes > 0, duration: r.late_minutes > 0 ? fmtMins(r.late_minutes) : '-' }
+      ? { isLate: lateRaw > 0,
+          duration: Number(r.late_minutes) > 0 ? fmtMins(Number(r.late_minutes)) : (lateRaw > 0 ? 'waived' : '-') }
       : calculateLateBy(r.login_time, r.shift_start);
     const overtime = (r.overtime_minutes != null)
       ? { hasOvertime: r.overtime_minutes > 0, duration: r.overtime_minutes > 0 ? fmtMins(r.overtime_minutes) : '-' }
@@ -1819,12 +1823,12 @@ function attInlineContext(r) {
     bits.push(`<span data-leave-chip="1" title="Leave request ${st} — click to view / undo" onclick="event.stopPropagation(); openLeaveActions(${r.user_id}, '${(r.fullname || '').replace(/'/g, "\\'")}')" style="cursor:pointer;display:inline-flex;align-items:center;gap:3px;font-size:11px;font-weight:600;color:${fg};background:${bg};border:1px solid ${bd};border-radius:5px;padding:1px 6px;">${typeLabel} · ${st}</span>`);
   }
   const mlate = Number(r.month_late_minutes) || 0;
-  if (mlate > 0) {
-    const h = Math.floor(mlate / 60), m = mlate % 60;
-    const txt = h > 0 ? `${h}h ${m}m` : `${m}m`;
+  const mwaived = Number(r.month_late_waived_minutes) || 0;   // Oct-2026: forgiven this month
+  if (mlate > 0 || mwaived > 0) {
+    const fm = (x) => { const h = Math.floor(x / 60), m = x % 60; return h > 0 ? `${h}h ${m}m` : `${m}m`; };
     // Month context is background info, not a today-alert — quiet gray text, no chip. Colour is
     // reserved for things that need attention now (leave state, a year-absence threshold below).
-    bits.push(`<span title="Total late so far this month" style="font-size:11px;color:#9CA3AF;">⏰ ${txt} late this mo</span>`);
+    bits.push(`<span title="Late so far this month that still counts${mwaived > 0 ? ' (after ' + fm(mwaived) + ' waived)' : ''}" style="font-size:11px;color:#9CA3AF;">⏰ ${fm(mlate)} late this mo${mwaived > 0 ? ' · ' + fm(mwaived) + ' waived' : ''}</span>`);
   }
   // ⭐ Sep-6 2026 — has TODAY's lateness / overtime already been looked at? A quiet marker,
   // not an alarm: the bulb is what asks for the work, this only says where it stands so the
@@ -3684,7 +3688,7 @@ function updateSummaryCards(data) {
       // Half-day already handled above (never late / never OT). Fall back to the shift compare
       // only when the snapshot is absent (older cached response).
       const tLate = (r.late_minutes != null)
-        ? (Number(r.late_minutes) > 0)
+        ? (Number(r.late_raw_minutes != null ? r.late_raw_minutes : r.late_minutes) > 0)   // late DAY = raw
         : (r.login_time > ((r.expected_shift_start ? String(r.expected_shift_start).slice(0, 5) : null) || r.shift_start || '09:00'));
       if (tLate) { late++; } else { onTime++; }
 
@@ -4907,7 +4911,9 @@ function renderEmployeeDetailRows() {
       // fall back to the login/leave heuristic for older responses.
       const isOnLeave = day.leave_request_id && (day.leave_status === 'approved' || day.leave_status === 'pending');
       const isPresent = day.login_time && day.login_time !== '-';
-      const isLate = isPresent && day.late_minutes > 0;
+      const lateRaw = Number(day.late_raw_minutes != null ? day.late_raw_minutes : day.late_minutes) || 0;
+      const lateWaived = Number(day.late_waived_minutes) || 0;
+      const isLate = isPresent && lateRaw > 0;
       const st = day.status || (isOnLeave ? 'on_leave' : (isLate ? 'late' : (isPresent ? 'present' : 'absent')));
       const statusMap = {
         present:  ['Present',  '#dcfce7', '#166534'],
@@ -4932,7 +4938,11 @@ function renderEmployeeDetailRows() {
             : `<div style="font-size:10px;font-weight:700;color:#B45309;margin-top:2px;white-space:nowrap;" title="Checkout used a manager bypass and no orders were delivered this day — nothing past the shift is counted.">🔓 nothing counted</div>`)
         : '';
       const hours = day.hours_worked ? day.hours_worked.toFixed(1) + 'h' : '-';
-      const lateBy = day.late_minutes > 0 ? day.late_minutes + ' min' : '-';
+      // ⭐ 5-Oct-2026: the figure that COUNTS (payroll's), with the waive spelled out under it.
+      const lateBy = day.late_minutes > 0 ? day.late_minutes + ' min' : (lateRaw > 0 ? '0 min' : '-');
+      const lateSub = lateWaived > 0
+        ? `<div style="font-size:10px;font-weight:600;color:#047857;margin-top:2px;white-space:nowrap;" title="${lateRaw} min late, ${lateWaived} min waived by a manager — ${day.late_minutes || 0} min count.">✔ ${lateWaived} of ${lateRaw} waived</div>`
+        : '';
       const overtime = day.overtime_minutes > 0 ? day.overtime_minutes + ' min' : '-';
 
       const ordersDelivered = day.total_orders_delivered || 0;
@@ -5030,7 +5040,7 @@ function renderEmployeeDetailRows() {
           <td style="padding: 12px 16px; font-size: 13px; color: #111827; border-bottom: 1px solid #e5e7eb;">${loginTime}</td>
           <td style="padding: 12px 16px; font-size: 13px; color: #111827; border-bottom: 1px solid #e5e7eb;">${logoutTime}${countedSub}</td>
           <td style="padding: 12px 16px; font-size: 13px; color: #111827; text-align: center; border-bottom: 1px solid #e5e7eb;">${hours}</td>
-          <td style="padding: 12px 16px; font-size: 13px; color: ${day.late_minutes > 0 ? '#dc2626' : '#9ca3af'}; font-weight: ${day.late_minutes > 0 ? '600' : '400'}; text-align: center; border-bottom: 1px solid #e5e7eb;">${lateBy}</td>
+          <td style="padding: 12px 16px; font-size: 13px; color: ${day.late_minutes > 0 ? '#dc2626' : '#9ca3af'}; font-weight: ${day.late_minutes > 0 ? '600' : '400'}; text-align: center; border-bottom: 1px solid #e5e7eb;">${lateBy}${lateSub}</td>
           <td style="padding: 12px 16px; font-size: 13px; color: ${day.overtime_minutes > 0 ? '#16a34a' : '#9ca3af'}; font-weight: ${day.overtime_minutes > 0 ? '600' : '400'}; text-align: center; border-bottom: 1px solid #e5e7eb;">${overtime}</td>
           <td style="padding: 12px 16px; font-size: 13px; color: ${ordersDelivered > 0 ? '#2563eb' : '#9ca3af'}; font-weight: ${ordersDelivered > 0 ? '700' : '400'}; text-align: center; border-bottom: 1px solid #e5e7eb;">
             ${ordersDelivered > 0 ? '📦 ' + ordersDelivered : '-'}

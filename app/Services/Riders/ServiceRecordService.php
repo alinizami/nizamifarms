@@ -1286,7 +1286,10 @@ class ServiceRecordService
         if ($vehicleId) {
             try {
                 $veh = new VehicleService();
-                if (!$veh->readingPlausibleFor($vehicleId, $meter)) {
+                // The service DATE rides along only so a reading off a since-replaced meter is
+                // read on the right scale; the date-anchored bounds are `odometerObjection`'s
+                // job just below (and its refusals name the record that set them).
+                if (!$veh->readingPlausibleFor($vehicleId, $meter, $date, false)) {
                     $cur  = $veh->currentMeterFor($vehicleId);
                     $name = $veh->find($vehicleId)['name'] ?? 'that machine';
                     return $fail(number_format($meter) . ' km does not fit ' . $name . '\'s own readings'

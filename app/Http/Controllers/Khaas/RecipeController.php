@@ -9,8 +9,11 @@ use App\Services\Khaas\ConsumptionService;
 use App\Services\Khaas\FrozenCostingService;
 use App\Services\Khaas\FrozenMonthService;
 use App\Services\Khaas\IngredientPriceService;
+use App\Services\Khaas\IngredientReplaceService;
+use App\Services\Khaas\IngredientStockService;
 use App\Services\Khaas\RecipeService;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\DB;
 
 /**
  * Ingredients, recipes and what they cost — one controller, both surfaces.
@@ -49,6 +52,17 @@ class RecipeController extends Controller
     {
         $user = auth()->user();
         return $user ? $user->hasMobilePermission('manage_khaas_recipes') : false;
+    }
+
+    /**
+     * ❄ Sep-30: may SET the stock figure (a start, or an adjustment). Granted at first to the
+     * same four roles as recipes; the owner "locks manual adjustments" by unticking it on the
+     * khaas role. Without it a weigh-in is still recorded — as a check that moves nothing.
+     */
+    private function canAdjustStock(): bool
+    {
+        $user = auth()->user();
+        return $user ? $user->hasMobilePermission('adjust_khaas_stock') : false;
     }
 
     private function canSeeCost(): bool
@@ -264,6 +278,9 @@ class RecipeController extends Controller
             //   recipe sheet — Frozen vendors whose bills are entered line by line (a by-total
             //   vendor's bills have no lines, so a link there would never price anything).
             'link_vendors' => $this->linkVendors($bu),
+            // ❄🧂 Sep-30: what is on the shelf, per ingredient id — beside each recipe line.
+            //   Only tracked, non-meat ingredients appear; the rest are simply absent.
+            'on_shelf'     => (object) array_filter($this->onShelfFor($bu)),
         ] + $this->pricedRecipe($bu, $recipe));
     }
 
@@ -501,49 +518,230 @@ class RecipeController extends Controller
     //  OPENING STOCK AND COUNTS
     // =================================================================
 
+    /**
+     * ⚠ The older one-ingredient door (the web page's pop-up, before Sep-30). Kept so nothing
+     *   that still posts here breaks, but it now goes through the SAME rules as the sheet: the
+     *   server picks start / adjust / weigh-in from the person's permission, not the client.
+     */
     public function saveOpening(Request $request)
     {
         if (!$this->canManage()) {
-            return $this->deny('Only Taimur, Shabib or Qasim can set opening stock.');
+            return $this->deny('Only Taimur, Shabib or Qasim can enter stock.');
         }
 
-        $ingredientId = (int) $request->input('ingredient_id');
-        $ingredient   = IngredientModel::where('id', $ingredientId)
-            ->where('business_unit_id', $this->businessUnitId($request))
-            ->first();
-        if (!$ingredient) {
-            return response()->json(['success' => false, 'message' => 'Which ingredient?'], 404);
-        }
-
-        $qty  = (float) $request->input('qty', 0);
-        $unit = (string) $request->input('unit', $ingredient->base_unit);
-        $base = IngredientModel::toBase($qty, $unit);
-
-        if ($base < 0) {
-            return response()->json(['success' => false, 'message' => 'Stock cannot be negative.'], 422);
-        }
-
-        $kind = $request->input('kind') === IngredientOpeningModel::KIND_COUNT
-            ? IngredientOpeningModel::KIND_COUNT
-            : IngredientOpeningModel::KIND_OPENING;
-
-        IngredientOpeningModel::create([
-            'ingredient_id' => $ingredientId,
-            'kind'          => $kind,
-            'counted_on'    => $request->input('counted_on') ?: now()->toDateString(),
-            'qty_base'      => $base,
-            'rupees'        => $request->input('rupees') !== null ? (float) $request->input('rupees') : null,
-            'note'          => $request->input('note') ? mb_substr($request->input('note'), 0, 255) : null,
-            'created_by'    => auth()->id(),
-            'created_at'    => now(),
+        $request->merge([
+            'entries' => [[
+                'ingredient_id' => (int) $request->input('ingredient_id'),
+                'qty'           => $request->input('qty'),
+                'unit'          => $request->input('unit'),
+                'note'          => $request->input('note'),
+            ]],
+            'date' => $request->input('counted_on') ?: now()->toDateString(),
         ]);
+
+        return $this->saveStock($request);
+    }
+
+    // =================================================================
+    //  ❄🧂 INGREDIENT STOCK (Sep-30) — start + bought − used = left
+    // =================================================================
+
+    /** The whole sheet: every non-meat ingredient, its figure and its last weigh-in. */
+    public function stockSheet(Request $request)
+    {
+        if (!$this->canAccess()) {
+            return $this->deny('Frozen mode access is needed.');
+        }
+        $bu = $this->businessUnitId($request);
+
+        try {
+            $sheet = (new IngredientStockService())->sheet($bu, $this->stockPrices($bu));
+        } catch (\Throwable $e) {
+            \Log::error('Frozen stock: sheet failed', ['error' => $e->getMessage()]);
+            return response()->json(['success' => false, 'message' => 'Could not load the stock sheet. Try again in a moment.'], 500);
+        }
 
         return response()->json([
-            'success' => true,
-            'message' => $kind === IngredientOpeningModel::KIND_COUNT
-                ? "Counted {$ingredient->phrase($base)} of {$ingredient->name}."
-                : "Opening stock set to {$ingredient->phrase($base)} of {$ingredient->name}.",
+            'success'      => true,
+            'can_manage'   => $this->canManage(),
+            'can_adjust'   => $this->canAdjustStock(),
+            'can_see_cost' => $this->canSeeCost(),
+            'units'        => IngredientModel::DISPLAY_UNITS,
+        ] + $sheet);
+    }
+
+    /** Every weigh-in for one ingredient, newest first, with the gap each one showed. */
+    public function stockHistory(Request $request, $id)
+    {
+        if (!$this->canAccess()) {
+            return $this->deny('Frozen mode access is needed.');
+        }
+        $bu  = $this->businessUnitId($request);
+        $ing = IngredientModel::where('id', (int) $id)->where('business_unit_id', $bu)->first();
+        if (!$ing) {
+            return response()->json(['success' => false, 'message' => 'That ingredient is not on the Frozen list.'], 404);
+        }
+        $prices = $this->stockPrices($bu);
+
+        return response()->json([
+            'success'    => true,
+            'ingredient' => $ing->shape(),
+            'history'    => (new IngredientStockService())->history($bu, $ing, $prices[(int) $ing->id] ?? null),
         ]);
+    }
+
+    /**
+     * Save a sheet — all or nothing. {date: today|yesterday, entries: [{ingredient_id, qty, unit, note}]}
+     * The KIND is decided on the server from `adjust_khaas_stock`.
+     */
+    public function saveStock(Request $request)
+    {
+        if (!$this->canManage()) {
+            return $this->deny('Only Taimur, Shabib or Qasim can enter stock.');
+        }
+        $bu      = $this->businessUnitId($request);
+        $entries = $request->input('entries');
+        if (!is_array($entries)) {
+            return response()->json(['success' => false, 'message' => 'Nothing to save.'], 422);
+        }
+
+        $result = (new IngredientStockService())->save(
+            $bu, $entries, $request->input('date'), (int) auth()->id(), $this->canAdjustStock()
+        );
+
+        return response()->json([
+            'success' => $result['ok'],
+            'message' => $result['message'],
+            'errors'  => (object) $result['errors'],
+            'saved'   => $result['saved'],
+        ], $result['ok'] ? 200 : 422);
+    }
+
+    /** Bring a hidden ingredient back. */
+    public function activateIngredient(Request $request, $id)
+    {
+        if (!$this->canManage()) {
+            return $this->deny('Only Taimur, Shabib or Qasim can change the ingredient list.');
+        }
+        $ing = IngredientModel::where('id', (int) $id)->where('business_unit_id', $this->businessUnitId($request))->first();
+        if (!$ing) {
+            return response()->json(['success' => false, 'message' => 'That ingredient no longer exists.'], 404);
+        }
+        $ing->is_active = 1;
+        $ing->save();
+
+        return response()->json(['success' => true, 'message' => "\"{$ing->name}\" is back on the list."]);
+    }
+
+    /**
+     * 🔁 What "replace X with Y" would change. Y is an existing ingredient (?to=ID), or a new
+     * one about to be made (?new_unit=g|ml|pcs) — then only the unit matters for the preview.
+     */
+    public function replaceImpact(Request $request, $id)
+    {
+        if (!$this->canManage()) {
+            return $this->deny('Only Taimur, Shabib or Qasim can change the ingredient list.');
+        }
+        $bu   = $this->businessUnitId($request);
+        $from = IngredientModel::where('id', (int) $id)->where('business_unit_id', $bu)->first();
+        if (!$from) {
+            return response()->json(['success' => false, 'message' => 'That ingredient no longer exists.'], 404);
+        }
+        $to = $request->filled('to')
+            ? IngredientModel::where('id', (int) $request->input('to'))->where('business_unit_id', $bu)->first()
+            : null;
+        if ($request->filled('to') && !$to) {
+            return response()->json(['success' => false, 'message' => 'That ingredient no longer exists.'], 404);
+        }
+        $newUnit = in_array($request->input('new_unit'), IngredientModel::BASE_UNITS, true) ? $request->input('new_unit') : null;
+
+        return response()->json(['success' => true]
+            + (new IngredientReplaceService())->impact($from, $to, $newUnit));
+    }
+
+    /**
+     * 🔁 Do it. Either {to: ID} or {new_name, new_unit, new_kind?} for a brand-new ingredient —
+     * when the new name is the old one's (Chicken Powder → Chicken Powder, in grams), the old
+     * one is renamed "… (old)" first so the list never shows two of the same name.
+     */
+    public function replaceIngredient(Request $request, $id)
+    {
+        if (!$this->canManage()) {
+            return $this->deny('Only Taimur, Shabib or Qasim can change the ingredient list.');
+        }
+        $bu   = $this->businessUnitId($request);
+        $from = IngredientModel::where('id', (int) $id)->where('business_unit_id', $bu)->first();
+        if (!$from) {
+            return response()->json(['success' => false, 'message' => 'That ingredient no longer exists.'], 404);
+        }
+
+        try {
+            $result = DB::transaction(function () use ($request, $bu, $from) {
+                if ($request->filled('to')) {
+                    $to = IngredientModel::where('id', (int) $request->input('to'))->where('business_unit_id', $bu)->first();
+                    if (!$to) {
+                        throw new \InvalidArgumentException('That ingredient no longer exists.');
+                    }
+                } else {
+                    $name = trim((string) $request->input('new_name'));
+                    $unit = (string) $request->input('new_unit');
+                    if ($name === '') {
+                        throw new \InvalidArgumentException('Give the new ingredient a name.');
+                    }
+                    if (!in_array($unit, IngredientModel::BASE_UNITS, true)) {
+                        throw new \InvalidArgumentException('Unit must be grams, millilitres or pieces.');
+                    }
+                    if (mb_strtolower($name) === mb_strtolower($from->name)) {
+                        $from->name = mb_substr($from->name . ' (old)', 0, 120);
+                        $from->save();
+                    }
+                    $to = $this->recipes->saveIngredient([
+                        'name'      => $name,
+                        'base_unit' => $unit,
+                        'kind'      => $request->input('new_kind') ?: $from->kind,
+                    ], (int) auth()->id(), $bu);
+                }
+
+                return (new IngredientReplaceService())->apply(
+                    $from->fresh(), $to->fresh(),
+                    array_map('floatval', (array) $request->input('recipe_qty', [])),
+                    array_map('floatval', (array) $request->input('product_sizes', [])),
+                    (int) auth()->id()
+                );
+            });
+        } catch (\InvalidArgumentException $e) {
+            return response()->json(['success' => false, 'message' => $e->getMessage()], 422);
+        } catch (\Throwable $e) {
+            \Log::error('Frozen recipes: replace failed', ['error' => $e->getMessage()]);
+            return response()->json(['success' => false, 'message' => 'Could not replace it. Nothing was changed.'], 500);
+        }
+
+        return response()->json(['success' => true, 'message' => $result['message']]);
+    }
+
+    /** ingredient id => {qty, text} | null for every active non-meat ingredient. Never throws. */
+    private function onShelfFor(int $bu): array
+    {
+        try {
+            $ids = IngredientModel::where('business_unit_id', $bu)->where('is_active', 1)
+                ->whereNull('storage_product_id')->pluck('id')->all();
+            return (new IngredientStockService())->onShelfShaped($bu, $ids);
+        } catch (\Throwable $e) {
+            return [];
+        }
+    }
+
+    /** Latest bill prices, only for someone allowed to see rupees. @return array<int,array>|null */
+    private function stockPrices(int $bu): ?array
+    {
+        if (!$this->canSeeCost()) {
+            return null;
+        }
+        try {
+            return (new IngredientPriceService())->latest($bu);
+        } catch (\Throwable $e) {
+            return null;
+        }
     }
 
     /** The whole ingredient panel for a month, for the phone and the page alike. */
@@ -563,7 +761,7 @@ class RecipeController extends Controller
 
         if (!$this->canSeeCost()) {
             foreach ($data['rows'] as $i => $row) {
-                foreach (['bought_cost', 'used_value', 'rate_per_base', 'rate_text'] as $k) {
+                foreach (['bought_cost', 'used_value', 'rate_per_base', 'rate_text', 'adjusted_value', 'last_check_value'] as $k) {
                     $data['rows'][$i][$k] = null;
                 }
             }

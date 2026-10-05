@@ -328,8 +328,41 @@
 
     async function wtLoadProducts(){
         if(products!==null) return;
-        try{ var r=await fetch('/finance/vendors/'+VID+'/products/list',{headers:{'Accept':'application/json'}}); var j=await r.json(); products=(j.products||[]); }
+        try{ var r=await fetch('/finance/vendors/'+VID+'/products/list',{headers:{'Accept':'application/json'}}); var j=await r.json(); products=(j.products||[]); wtSupportsIng = j.supports_ingredients === true; }
         catch(e){ products=[]; }
+    }
+    // ❄🧂 Sep-30: under each line, what it COUNTS AS for Frozen stock — or that it will not count.
+    //   The pack size is set once on the product (Products → Edit), never per purchase.
+    var wtSupportsIng = false;
+    function wtBaseText(q, base){
+        q = Number(q) || 0;
+        if(base === 'g' && q >= 1000) return (Math.round(q/10)/100) + ' kg';
+        if(base === 'ml' && q >= 1000) return (Math.round(q/10)/100) + ' L';
+        return (Math.round(q*1000)/1000) + ' ' + (base === 'pcs' ? 'pcs' : (base || ''));
+    }
+    function wtNote(row){
+        var el = row.querySelector('.wt-note'); if(!el) return;
+        var sel = row.querySelector('.wt-prod');
+        var p = wtSupportsIng && sel.value ? (products||[]).filter(function(x){ return String(x.id) === String(sel.value); })[0] : null;
+        if(!p){ el.textContent = ''; el.style.display = 'none'; return; }
+        var container = p.unit_code === 'pack' || p.unit_code === 'box';
+        var t;
+        if(p.ingredient_id){
+            t = '❄ counts towards ' + (p.ingredient_name || 'its ingredient');
+            if(container && Number(p.pack_qty_base) > 0){
+                t += ' · ' + wtBaseText(p.pack_qty_base, p.ingredient_base_unit) + ' in one ' + p.unit_code;
+                var q = parseFloat(row.querySelector('.wt-qty').value) || 0;
+                if(q > 0) t += ' = ' + wtBaseText(q * Number(p.pack_qty_base), p.ingredient_base_unit);
+            }
+            if(p.on_shelf_text) t += ' · 🧂 ' + p.on_shelf_text + ' on the shelf now';
+            el.style.color = '#065F46';
+        } else {
+            // ⚠ The Hub's own Products window has no ingredient field — send them to the FULL page.
+            t = '⚠ Not linked to a recipe ingredient, so this line will not count as bought. If it goes into a recipe: Products → "full page ↗" → Edit → pick the ingredient' +
+                (container ? ' and type how much is in one ' + p.unit_code : '') + '.';
+            el.style.color = '#B45309';
+        }
+        el.textContent = t; el.style.display = '';
     }
     function wtSetMode(editing){
         wtEditId = editing || null;
@@ -416,7 +449,8 @@
             '<input class="wt-qty" type="number" step="0.001" min="0.001" placeholder="qty" oninput="hubWtTotal()">'+
             '<input class="wt-rate" type="number" step="0.01" placeholder="rate" oninput="hubWtTotal()">'+
             '<span class="wt-lt num">0.00</span>'+
-            '<button class="hubmodal-x" type="button" title="Remove this line" onclick="this.parentNode.remove();hubWtTotal()" style="font-size:15px;margin:0;padding:2px 4px">✕</button>';
+            '<button class="hubmodal-x" type="button" title="Remove this line" onclick="this.parentNode.remove();hubWtTotal()" style="font-size:15px;margin:0;padding:2px 4px">✕</button>'+
+            '<div class="wt-note" style="grid-column:1 / -1;font-size:11.5px;margin-top:-2px;display:none"></div>';
         document.getElementById('hubWtLines').appendChild(row);
         var sel = row.querySelector('.wt-prod');
         if(preset){
@@ -439,6 +473,7 @@
         document.querySelectorAll('#hubWtLines .wt-line').forEach(function(r){
             var q=parseFloat(r.querySelector('.wt-qty').value)||0, rate=parseFloat(r.querySelector('.wt-rate').value)||0;
             var lt=q*rate; r.querySelector('.wt-lt').textContent=fmt2(lt); sum+=lt; if(r.querySelector('.wt-prod').value&&q>0)n++;
+            wtNote(r);
         });
         var adj=parseFloat(document.getElementById('hubWtAdj').value)||0;
         var grand=sum+adj;

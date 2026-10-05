@@ -575,6 +575,32 @@ class MachineAttribution
         $boundary = $this->boundaryDates($vehicleId);
         $out['boundary_dates'] = array_keys($boundary);
 
+        /**
+         * ⭐⭐ METER REPLACED (5-Oct-2026). This walk orders readings by odometer and reads
+         *    every stretch as a difference, so a new meter starting at 0 looked like "the meter
+         *    went backwards" and the month stopped adding up. For a machine with a replacement
+         *    on record every reading is lifted onto its CONTINUOUS scale before the walk (see
+         *    `MeterReplacement`) and each displayed figure is put back as it was typed at the
+         *    end (`showAsTyped`). `$replaced` is false — and nothing here runs — otherwise.
+         */
+        $replaced = MeterReplacement::has($vehicleId);
+        if ($replaced) {
+            $lift = fn ($v, $d) => MeterReplacement::toContinuous($vehicleId, $v, $d);
+            foreach ($rows as $i => $r) {
+                foreach (['meter_start', 'meter_end', 'meter_home'] as $k) {
+                    $rows[$i][$k] = $lift($r[$k] ?? null, $r['date']);
+                }
+            }
+            foreach ($handoverByDate as $hd => $hm) {
+                $handoverByDate[$hd] = $lift($hm, $hd);
+            }
+            foreach ($logByDate as $ld => $lr) {
+                foreach (['meter_start', 'meter_end'] as $k) {
+                    $logByDate[$ld][$k] = $lift($lr[$k] ?? null, $ld);
+                }
+            }
+        }
+
         $claims = $vs->claimsForVehicle($vehicleId, $from, $to);
 
         // ⭐ WHAT THIS MACHINE COST, AND WHO FILED IT. Kept here rather than left to
@@ -606,7 +632,7 @@ class MachineAttribution
 
         // --- where the month opens: the last reading before it, else the first
         //     reading inside it (a machine's FIRST month has nothing behind it) ---
-        $win  = $vs->meterWindowFor($vehicleId, $from);
+        $win  = $vs->meterWindowContinuousFor($vehicleId, $from);
         $prev = $win['floor'] ?? null;
         $prevOwner = null;
         $prevDate  = null;
@@ -616,7 +642,8 @@ class MachineAttribution
         //   same-rider / handover / custody questions as every other stretch.
         //   Unknown ⇒ both stay null ⇒ exactly the old behaviour.
         if ($prev !== null && $isCompany && self::custodyOn()) {
-            $opener = $this->readingOwner($vehicleId, (int) $prev, $from);
+            // (looked up by the figure as it was typed)
+            $opener = $this->readingOwner($vehicleId, (int) MeterReplacement::toRawByValue($vehicleId, (int) $prev), $from);
             if ($opener) { $prevOwner = $opener['user_id']; $prevDate = $opener['date']; }
         }
         $dirty = false;
@@ -682,7 +709,7 @@ class MachineAttribution
             if (!$points && $dayClaims) {
                 $withMeter = [];
                 foreach ($dayClaims as $c) {
-                    $m = $this->reading($c['meter'] ?? null);
+                    $m = $this->reading($c['meter_cont'] ?? ($c['meter'] ?? null));
                     if ($m !== null) $withMeter[] = ['m' => $m, 'c' => $c];
                 }
                 if ($withMeter) {
@@ -861,7 +888,7 @@ class MachineAttribution
         }
 
         // --- the tail: last reading of the month → where the next month opens ---
-        $closeWin = $vs->meterWindowFor($vehicleId, Carbon::parse($to)->addDay()->format('Y-m-d'));
+        $closeWin = $vs->meterWindowContinuousFor($vehicleId, Carbon::parse($to)->addDay()->format('Y-m-d'));
         $closesOn = $closeWin['floor'] ?? null;
         if ($prev !== null && $closesOn !== null && $closesOn > $prev
             && ($closesOn - $prev) <= self::MAX_GAP_KM) {
@@ -893,6 +920,35 @@ class MachineAttribution
         $out['keepers'] = $this->keepersOf($days);
         $out['events']  = $this->handoverEvents($vehicleId, $from, $to, $days);
         $out['day_cards'] = $this->dayCards($days, $legs, $out['events']);
+        return $replaced ? $this->showAsTyped($vehicleId, $out) : $out;
+    }
+
+    /**
+     * Put every DISPLAYED odometer figure of a walked month back as the meter showed it. The
+     * kilometres (legs, gaps, totals, span) are differences and are already right; only the
+     * readings themselves were lifted onto the continuous scale for the walk.
+     */
+    private function showAsTyped(int $vehicleId, array $out): array
+    {
+        $typed = fn ($v) => $v === null ? null : MeterReplacement::toRawByValue($vehicleId, (int) $v);
+        foreach (['opens_at', 'closes_at'] as $k) $out[$k] = $typed($out[$k] ?? null);
+        foreach ($out['legs'] as $i => $l) {
+            foreach (['from_meter', 'to_meter'] as $k) {
+                if (array_key_exists($k, $l)) $out['legs'][$i][$k] = $typed($l[$k]);
+            }
+        }
+        foreach ($out['days'] as $i => $d) {
+            foreach (['meter_start', 'meter_end', 'meter_home'] as $k) {
+                if (array_key_exists($k, $d)) $out['days'][$i][$k] = $typed($d[$k]);
+            }
+        }
+        foreach ($out['day_cards'] as $ci => $card) {
+            foreach ($card['lines'] as $li => $line) {
+                if (in_array($line['type'] ?? null, ['meter_start', 'meter_end'], true) && isset($line['value'])) {
+                    $out['day_cards'][$ci]['lines'][$li]['value'] = $typed($line['value']);
+                }
+            }
+        }
         return $out;
     }
 
@@ -1044,7 +1100,7 @@ class MachineAttribution
             foreach ($rows as $r) {
                 foreach ($r['claims'] as $c) {
                     $lines[] = [
-                        'pos'  => $this->claimPos($c['meter'] ?? null, $open, $close, $openPos, $closePos),
+                        'pos'  => $this->claimPos($c['meter_cont'] ?? ($c['meter'] ?? null), $open, $close, $openPos, $closePos),
                         'rank' => 2, 'type' => 'claim',
                         'kind' => $c['kind'], 'amount' => $c['amount'], 'meter' => $c['meter'] ?? null,
                         'who'  => $c['by_name'] ?? null, 'pending' => !empty($c['is_pending']),

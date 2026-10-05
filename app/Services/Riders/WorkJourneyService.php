@@ -67,15 +67,14 @@ class WorkJourneyService
      *   rider's old bike — silence beats comparing against the wrong odometer,
      *   which is the very failure being fixed.
      */
-    public function continuityBaseline(int $userId, string $beforeDate): ?array
+    public function continuityBaseline(int $userId, string $beforeDate, ?int $forReading = null): ?array
     {
         try {
             $resolver = new VehicleResolver();
             if ($resolver->rulesEnabled() && $resolver->available()) {
                 $vid = $resolver->currentVehicleFor($userId, $beforeDate);
                 if ($vid) {
-                    $win   = (new VehicleService())->meterWindowFor($vid, $beforeDate);
-                    $floor = $win['floor'] ?? null;
+                    $floor = $this->machineFloorFor((int) $vid, $beforeDate, $forReading);
                     return $floor === null ? null : [
                         'value'  => (int) $floor,
                         'date'   => null,
@@ -426,7 +425,7 @@ class WorkJourneyService
         //
         // ⚠ DATE-scoped (`vehicleForDay`), because a report judges history — the
         //   live gates use `currentVehicleFor` for the opposite reason.
-        $base = $this->closingBaseline($userId, $date);
+        $base = $this->closingBaseline($userId, $date, (int) $start);
         // He held nothing that day: there is no machine to check against.
         if ($base['holds_nothing'] || $base['value'] === null) {
             return null;
@@ -492,7 +491,28 @@ class WorkJourneyService
      *   chain, so a brand-new bike does not silently hide a real overnight gap. Nothing here
      *   blocks, locks or refuses anything — every caller prints a chip with it.
      */
-    public function closingBaseline(int $userId, string $date): array
+    /**
+     * ⭐ METER REPLACED (5-Oct-2026) — the machine's last reading before `$date`, expressed in the
+     *   figures of the meter the NEW reading (`$forReading`) was taken on, so every caller's
+     *   `reading - baseline` is the true distance even across the day a meter was replaced
+     *   (a new meter's first 1 km is "+1 km", not "9,132 km backwards"). `$forReading` only
+     *   matters on a replacement day (which of the two meters it came off); without it the
+     *   reading is taken as the new meter's. Exactly `meterWindowFor()['floor']` — the call this
+     *   replaced — for a machine whose meter was never replaced.
+     */
+    private function machineFloorFor(int $vehicleId, string $date, ?int $forReading = null): ?int
+    {
+        $vs = new VehicleService();
+        if (!MeterReplacement::has($vehicleId)) {
+            $win = $vs->meterWindowFor($vehicleId, $date);
+            return $win['floor'] ?? null;
+        }
+        $win = $vs->meterWindowContinuousFor($vehicleId, $date);
+        if (($win['floor'] ?? null) === null) return null;
+        return max(0, (int) $win['floor'] - MeterReplacement::offset($vehicleId, $date, $forReading));
+    }
+
+    public function closingBaseline(int $userId, string $date, ?int $forReading = null): array
     {
         $date = substr($date, 0, 10);
         $out = ['value' => null, 'date' => null, 'label' => null, 'vtype' => null,
@@ -509,8 +529,7 @@ class WorkJourneyService
                     //   matches what `workIssueDays` and `DayChecksService` already
                     //   do for the same days; this surface simply never learned it.
                     $out['transfer_day'] = $resolver->isTransferDay($vid, $date);
-                    $win   = (new VehicleService())->meterWindowFor($vid, $date);
-                    $floor = $win['floor'] ?? null;
+                    $floor = $this->machineFloorFor((int) $vid, $date, $forReading);
                     if ($floor !== null) {
                         $out['value']  = (int) $floor;
                         $out['label']  = $resolver->labelFor($vid);
@@ -758,11 +777,15 @@ class WorkJourneyService
             // each day's own meter_home/meter_end is already in the row).
             $prevByUser = [];
             foreach ($rows as $r) {
+                // Meter replaced (Oct-2026): the chain is followed on the machine's continuous
+                // scale (the same object comes back unless a reading is off a replaced meter).
+                $r = MeterReplacement::liftRow($r);
                 $uid = (int) $r->user_id;
                 $date = substr((string) $r->attendance_date, 0, 10);
                 if (!array_key_exists($uid, $prevByUser)) {
                     $seed = $this->lastClosingMeter($uid, $date);
-                    $prevByUser[$uid] = $seed ? $seed['value'] : null;
+                    $prevByUser[$uid] = $seed
+                        ? MeterReplacement::liftValue($uid, (int) $seed['value'], $seed['date'] ?? null) : null;
                 }
                 // ⭐ THE DATE-SCOPED TEST the stale flag used to stand in for: did he hold
                 //   a COMPANY machine on THIS day?

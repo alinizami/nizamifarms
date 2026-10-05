@@ -1550,7 +1550,11 @@
     const n = DR_ROWS.filter(d => d.review && d.review.status === 'pending' && !d.review.not_ready).length;
     const stale = DR_ROWS.filter(d => d.review && d.review.stale).length;
     if (!DR_ROWS.length) return '';
-    return '<div class="pr-la-note">'
+    // Oct-2026 (owner ruling): a processed month can still be reviewed — but said up front.
+    const paid = (DR_ROWS.find(d => d.review && d.review.pay_processed) || {}).review;
+    return (paid ? '<div class="pr-la-note" style="color:#b91c1c;border-color:#fecaca;background:#fef2f2;">💰 '
+        + esc(paid.pay_processed) + '</div>' : '')
+      + '<div class="pr-la-note">'
       + (n ? '<b>' + n + '</b> ' + (n === 1 ? 'day still needs' : 'days still need') + ' a look. '
            : 'Every day here has been looked at. ')
       + (stale ? '<span style="color:#b45309;">' + stale + ' changed after being reviewed.</span> ' : '')
@@ -1576,6 +1580,8 @@
   async function recordDayReview(row, verdict) {
     const rv = row.review || {};
     const body = { user_id: DR_UID, date: row.date, kind: DR_KIND, verdict: verdict };
+    if (verdict !== 'verified' && rv.pay_processed
+        && !confirm('⚠ PAY ALREADY PROCESSED\n\n' + rv.pay_processed + '\n\nGo ahead anyway?')) return;
     if (verdict === 'adjusted') {
       const v = prompt('How many minutes of overtime did he really do on ' + row.date + '?\n\n'
         + 'The system counted ' + hm(rv.minutes || 0) + '.', String(rv.minutes || 0));
@@ -1607,6 +1613,7 @@
       });
       const j = await res.json();
       if (!j.success) throw new Error(j.message || 'Failed');
+      if (j.warning) alert('Saved.\n\n⚠ ' + j.warning);
       // The month's figures can have moved (an adjustment or a waive), so reload the grid
       // behind the sheet, then redraw the drill from the server.
       await load();
@@ -2093,6 +2100,11 @@
       if (d.late_deduction > 0) html += line('Late (' + lt + ')', '− ' + fmt(d.late_deduction), true);
       else if (d.late_leave_deduct > 0) html += line('Late (' + lt + ')', '−' + d.late_leave_deduct + ' leave');
       else html += line('Late (' + lt + ')', 'free buffer');
+    }
+    // Oct-2026 — the late figure above is NET of a manager's waive; the receipt says so.
+    if (d.late_waived_minutes > 0) {
+      const raw = (d.late_minutes || 0) + d.late_waived_minutes;
+      html += line('Late waived', hm(d.late_waived_minutes) + ' of ' + hm(raw));
     }
     if (d.advance_total > 0) html += line('Advances settled', '− ' + fmt(d.advance_total), true);
     if (d.bonus_leaves > 0) html += line('Overtime bonus', '+' + d.bonus_leaves + ' leave' + (d.bonus_leaves > 1 ? 's' : ''));

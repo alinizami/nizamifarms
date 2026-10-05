@@ -34,6 +34,11 @@ class IngredientOpeningModel extends Model
 
     public const KIND_OPENING = 'opening';
     public const KIND_COUNT   = 'count';
+    /**
+     * ❄ Sep-30: a weigh-in that is RECORDED (its gap is shown) but does not move the figure.
+     * Saved for someone without `adjust_khaas_stock`. Never an anchor — see IngredientStockService.
+     */
+    public const KIND_CHECK   = 'check';
 
     protected $fillable = [
         'ingredient_id',

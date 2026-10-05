@@ -818,6 +818,7 @@ const vendorName = '{{ $vendor->vendor_name }}';
 
 // Vendor Products Data (fetched from server)
 let vendorProducts = [];
+let vendorSupportsIng = false;
 let lineItemCounter = 0;
 
 // Fetch vendor products on page load
@@ -830,6 +831,7 @@ function fetchVendorProducts() {
         .then(response => response.json())
         .then(data => {
             vendorProducts = data.products || [];
+            vendorSupportsIng = data.supports_ingredients === true;
         })
         .catch(error => {
             console.error('Error fetching vendor products:', error);
@@ -981,6 +983,7 @@ function addLineItem(isInitialLoad = false) {
                             class="w-full px-3 py-2 text-sm border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-orange-500 focus:border-transparent">
                         ${productOptions}
                     </select>
+                    <div class="line-shelf text-[11px] mt-1" style="color:#065F46;"></div>
                 </div>
                 <div class="col-span-2">
                     <label class="text-xs font-medium text-gray-600 mb-1 block">Qty</label>
@@ -1031,7 +1034,32 @@ function updateLineItem(id) {
     const nameInput = row.querySelector('input[name*="[product_name]"]');
     
     const selectedOption = productSelect.options[productSelect.selectedIndex];
-    
+
+    // ❄🧂 Sep-30: what is on the shelf now (Frozen by-weight vendors, tracked ingredients only)
+    //   …and what the line COUNTS AS, or that it will not count (the pack size lives on the product).
+    const shelfEl = row.querySelector('.line-shelf');
+    if (shelfEl) {
+        const vp = selectedOption && selectedOption.value
+            ? vendorProducts.find(p => String(p.id) === String(selectedOption.value)) : null;
+        let t = '';
+        shelfEl.style.color = '#065F46';
+        if (vp && vendorSupportsIng) {
+            const container = vp.unit_code === 'pack' || vp.unit_code === 'box';
+            if (vp.ingredient_id) {
+                t = '❄ counts towards ' + (vp.ingredient_name || 'its ingredient') +
+                    (container && Number(vp.pack_qty_base) > 0 ? ' · ' + Number(vp.pack_qty_base) + ' ' + (vp.ingredient_base_unit || '') + ' in one ' + vp.unit_code : '');
+            } else {
+                t = '⚠ Not linked to a recipe ingredient, so this line will not count as bought. If it goes into a recipe: Products → Edit → pick the ingredient' +
+                    (container ? ' and type how much is in one ' + vp.unit_code : '') + '.';
+                shelfEl.style.color = '#B45309';
+            }
+        }
+        if (vp && vp.on_shelf_text) {
+            t += (t ? ' · ' : '') + '🧂 ' + vp.on_shelf_text + ' of ' + (vp.ingredient_name || 'it') + ' on the shelf now';
+        }
+        shelfEl.textContent = t;
+    }
+
     if (selectedOption && selectedOption.value) {
         const rate = parseFloat(selectedOption.getAttribute('data-rate')) || 0;
         const unit = selectedOption.getAttribute('data-unit') || '';

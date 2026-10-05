@@ -158,7 +158,10 @@ $logId = (int) $done['service_log_id'];
 ok('closes the ticket', $vt->close($q, $tid, 'done')['ok'], true);
 
 // ✏️ And can correct his own record afterwards — the log-8 lesson.
-ok('can CORRECT a service record he entered', $rec->amend($logId, ['meter' => 90002], (int) $q->id)['ok'], true);
+// ⚠ 5-Oct-2026: was a hard-coded 90,002 — refused, rightly, by the same plausibility guard the
+//   note above describes. A correction is a few km from what was recorded, so derive it.
+ok('can CORRECT a service record he entered',
+   $rec->amend($logId, ['meter' => (int) ($meterNow ?? 0) + 6], (int) $q->id)['ok'], true);
 ok('  …and remove one', $rec->remove($logId, (int) $q->id)['ok'], true);
 
 // ─────────────────────────────────────────────────────────────────────────────

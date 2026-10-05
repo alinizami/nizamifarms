@@ -333,6 +333,60 @@ class SalarySlipModel extends BaseModel
     /**
      * Get detailed breakdown for display
      */
+    /**
+     * ⭐ The late split to FREEZE on a new slip (Oct-2026) — the server's answer, used by the
+     * web form and the phone alike, so neither client can save a split that contradicts itself.
+     *
+     *   · raw / waived come from the client when it sent them (the calculate endpoint gave
+     *     them to the form); an older APK sends neither, so for a whole-month slip the server
+     *     reads them from the engine itself — the same attendanceSummary the calculation uses.
+     *     A weekly / extra slip (allow_multiple) covers part of a month, so the month's split
+     *     would be wrong for it: raw = net, waived 0, exactly as before.
+     *   · waived is clamped to [0, raw].
+     *   · `late_minutes` itself is never changed here: a manager who typed a different figure
+     *     keeps it. lateNote() then says "set by hand" instead of a sum that doesn't add up.
+     *
+     * @return array{raw:int,waived:int}
+     */
+    public static function lateSplitForNewSlip(int $userId, string $salaryMonth, $net, $postedRaw, $postedWaived, bool $partOfMonth = false): array
+    {
+        $net = (int) round((float) ($net ?? 0));
+        if ($postedRaw === null && !$partOfMonth) {
+            try {
+                $att = (new \App\Services\HR\SalaryCalculationService())->attendanceSummary($userId, $salaryMonth);
+                if (isset($att['late_raw_minutes'])) {
+                    $postedRaw = (int) $att['late_raw_minutes'];
+                    $postedWaived = (int) ($att['late_waived_minutes'] ?? 0);
+                }
+            } catch (\Throwable $e) { /* fall through to raw = net */ }
+        }
+        $raw = $postedRaw !== null ? max(0, (int) $postedRaw) : $net;
+        $waived = max(0, min($raw, (int) ($postedWaived ?? 0)));
+        return ['raw' => $raw, 'waived' => $waived];
+    }
+
+    /**
+     * The one line that explains a slip's late figure, or null when the figure explains itself.
+     * Same wording on the web slip page and (via getDetailedBreakdown) the phone.
+     */
+    public static function lateNote($net, $raw, $waived): ?string
+    {
+        if ($raw === null) { return null; }                       // slip older than the split
+        $net = (int) round((float) $net); $raw = (int) $raw; $waived = (int) ($waived ?? 0);
+        if ($raw - $waived === $net) {
+            return $waived > 0 ? $raw . ' mins late · ' . $waived . ' waived by a manager' : null;
+        }
+        return $raw . ' mins late' . ($waived > 0 ? ' · ' . $waived . ' waived by a manager' : '')
+            . ' · set to ' . $net . ' by hand on this slip';
+    }
+
+    /** Does this slip have any lateness worth a line, even with no money taken for it? */
+    public function hasLateness(): bool
+    {
+        return (float) $this->late_minutes > 0 || (int) ($this->late_raw_minutes ?? 0) > 0
+            || (float) $this->late_deduction > 0;
+    }
+
     public function getDetailedBreakdown(): array
     {
         return [
@@ -357,6 +411,12 @@ class SalarySlipModel extends BaseModel
             // Deductions
             'deductions' => [
                 'late_minutes' => $this->late_minutes,
+                // Oct-2026 — the day-review split frozen on the slip (null on slips made before
+                // the columns existed; the phone then shows the net figure alone, as before).
+                'late_waived_minutes' => $this->late_waived_minutes,
+                'late_raw_minutes' => $this->late_raw_minutes,
+                // Oct-2026 — the explanation line, worded once here for every surface.
+                'late_note' => self::lateNote($this->late_minutes, $this->late_raw_minutes, $this->late_waived_minutes),
                 'late_deduction' => $this->late_deduction,
                 'absent_days' => $this->absent_days,
                 'absent_deduction' => $this->absent_deduction,

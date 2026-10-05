@@ -776,7 +776,10 @@ class OperationsController extends Controller
 
                 // Stamp the shift snapshot for the imported day (non-fatal).
                 try {
-                    (new \App\Services\ShiftResolutionService())->stampAttendanceSnapshot($user->id, $attendanceDate);
+                    $srs = new \App\Services\ShiftResolutionService();
+                    $srs->stampAttendanceSnapshot($user->id, $attendanceDate);
+                    // Oct-2026: an import that rewrote a reviewed day retires that review.
+                    $srs->supersedeReviewsIfChanged($user->id, $attendanceDate, 'the day was overwritten by a CSV import');
                 } catch (\Exception $snapErr) {
                     \Log::warning('CSV attendance import: snapshot failed (non-fatal)', [
                         'user_id' => $user->id, 'date' => $attendanceDate, 'error' => $snapErr->getMessage(),

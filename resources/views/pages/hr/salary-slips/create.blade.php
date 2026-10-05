@@ -993,7 +993,9 @@ function showSalaryAttendanceModal(employee) {
             const loginTime = day.login_time || '-';
             const logoutTime = day.logout_time || '-';
             const hours = isAbsent ? '-' : salaryCalculateHours(day.login_time, day.logout_time);
-            const lateBy = isAbsent ? { duration: '-', isLate: false } : salaryCalculateLateBy(day.login_time, day.shift_start);
+            // ⭐ 5-Oct-2026: the server's ONE-engine figure (frozen snapshot + manager waive).
+            const lateBy = isAbsent ? { duration: '-', isLate: false }
+                : (day.late_minutes != null ? salaryServerLateBy(day) : salaryCalculateLateBy(day.login_time, day.shift_start));
             const overtime = isAbsent ? { duration: '-', hasOvertime: false } : salaryCalculateOvertime(day.logout_time, day.shift_end);
             const status = isAbsent ? 'Absent' : salaryGetStatus(day.login_time, day.shift_start);
             
@@ -1053,6 +1055,16 @@ function salaryCalculateHours(login, logout) {
     if (end < start) end.setDate(end.getDate() + 1);
     const diff = (end - start) / 1000 / 60 / 60;
     return diff.toFixed(1) + 'h';
+}
+
+// A day's lateness as the server's engine gave it: what COUNTS, with any waive named.
+function salaryServerLateBy(day) {
+    const n = Number(day.late_minutes) || 0;
+    const raw = (day.late_raw_minutes != null) ? Number(day.late_raw_minutes) : n;
+    const w = Number(day.late_waived_minutes) || 0;
+    const f = (m) => { const h = Math.floor(m / 60), mm = m % 60; return h > 0 ? `${h}h ${mm}m` : `${mm}m`; };
+    if (raw <= 0) return { isLate: false, duration: '-' };
+    return { isLate: true, duration: f(n) + (w > 0 ? ` (${f(w)} waived)` : '') };
 }
 
 function salaryCalculateLateBy(login, shiftStart) {

@@ -341,6 +341,10 @@ class AttendanceController extends Controller
             }
         } catch (\Throwable $e) { /* not deployed → no chips */ }
 
+        // Oct-2026: lateForDay() treats a leave day as never late — load every rider's leave
+        // days for the month in ONE query, instead of one per row on this busy board.
+        $shiftService->primeLeaveDays($rows->pluck('user_id')->filter()->all(), $selectedDate, $selectedDate);
+
         foreach ($rows as $row) {
             // Resolve the shift FOR THE SELECTED DATE (not today) so past dates show the
             // shift that was actually in effect then.
@@ -363,17 +367,19 @@ class AttendanceController extends Controller
              */
             $row->workshop = $workshopByUser[$row->user_id . '|' . $selectedDate] ?? null;
 
-            // Per-row late/overtime minutes — prefer the frozen snapshot, else compute
-            // for the selected date. The frontend should DISPLAY these, not recompute.
-            if (!$row->login_time) {
-                $row->late_minutes = 0;
-            } elseif (!is_null($row->late_minutes)) {
-                $row->late_minutes = (int) $row->late_minutes;
-            } else {
-                $s = strtotime($selectedDate . ' ' . $shiftData['shift_start'] . ':00');
-                $l = strtotime($selectedDate . ' ' . $row->login_time);
-                $row->late_minutes = ($l > $s) ? (int) (($l - $s) / 60) : 0;
-            }
+            // Per-row late minutes through the ONE engine (lateForDay) — the same figure payroll
+            // counts. ⚠⚠ This was inline arithmetic on the raw snapshot until 5-Oct-2026, so a
+            // waived day still read "Late 1h 43m" here while the month total beside it was net.
+            // `late_minutes` = what COUNTS; `late_raw_minutes` = what the day was (a late DAY
+            // stays a late day on the raw figure); `late_waived_minutes` = forgiven.
+            $lateDay = $shiftService->lateForDay(
+                (int) $row->user_id, $selectedDate, $row->login_time ?: null, $row->late_minutes,
+                $row->expected_shift_start ?: (!empty($shiftData['shift_start']) ? $shiftData['shift_start'] . ':00' : null),
+                false, ['default_shift' => null]
+            );
+            $row->late_minutes        = $lateDay['minutes'];
+            $row->late_raw_minutes    = $lateDay['raw'];
+            $row->late_waived_minutes = $lateDay['waived'];
             if (!$row->logout_time || empty($shiftData['shift_end'])) {
                 // No checkout, or a start-only shift (no end) → no overtime.
                 $row->overtime_minutes = 0;
@@ -732,7 +738,8 @@ class AttendanceController extends Controller
             $base = null;
             if ($row->company_bike === 1) {
                 try {
-                    $base = $wjBase->closingBaseline((int) $row->user_id, $selectedDate);
+                    $base = $wjBase->closingBaseline((int) $row->user_id, $selectedDate,
+                        !empty($row->meter_start) ? (int) $row->meter_start : null);
                 } catch (\Throwable $e) { $base = null; } // never a 500 over a chip
             }
             if ($base !== null) {
@@ -808,6 +815,8 @@ class AttendanceController extends Controller
             $row->is_half_day = isset($halfDayToday[$row->user_id]);
             if ($row->is_half_day) {
                 $row->late_minutes = 0;
+                $row->late_raw_minutes = 0;
+                $row->late_waived_minutes = 0;
                 $row->overtime_minutes = 0;
             }
 
@@ -815,7 +824,9 @@ class AttendanceController extends Controller
             try {
                 $lo = $shiftService->sumLateOvertimeMinutes((int) $row->user_id, $monthStart, $selectedDate);
                 $row->month_late_minutes = (int) ($lo['late_minutes'] ?? 0);
-            } catch (\Throwable $e) { $row->month_late_minutes = 0; }
+                // Oct-2026 — what was forgiven this month, so the chip can say so.
+                $row->month_late_waived_minutes = (int) ($lo['late_waived_minutes'] ?? 0);
+            } catch (\Throwable $e) { $row->month_late_minutes = 0; $row->month_late_waived_minutes = 0; }
 
             // Absent-this-year — only when this row is genuinely absent for the selected
             // day (working day, no login, not on approved/pending leave).
@@ -2831,6 +2842,8 @@ class AttendanceController extends Controller
                     'a.picture_end',
                     'a.meter_start',
                     'a.meter_end',
+                    'a.late_minutes as snap_late_minutes',
+                    'a.expected_shift_start',
                     DB::raw('COALESCE(rp.shift_start, "09:00") as legacy_shift_start'),
                     DB::raw('COALESCE(rp.shift_end, "17:00") as legacy_shift_end'),
                     'lr.id as leave_request_id',
@@ -2985,7 +2998,20 @@ class AttendanceController extends Controller
                 // duplicate day rows. Last write wins — by then the leave/half maps for this
                 // date are complete, so its status is the most informed one.
                 $dayShift = $shiftService->getUserShift($record->user_id, $record->attendance_date);
+                // ⭐ 5-Oct-2026: the day's lateness from the ONE engine (frozen snapshot +
+                //   manager waive), so the Reports drill shows what payroll counts instead of
+                //   re-deriving it in the browser from login vs shift (which saw neither).
+                $lateDay = ($status === 'half_day' || $status === 'on_leave' || !$record->login_time)
+                    ? ['minutes' => 0, 'raw' => 0, 'waived' => 0]
+                    : $shiftService->lateForDay(
+                        (int) $record->user_id, substr((string) $record->attendance_date, 0, 10),
+                        $record->login_time, $record->snap_late_minutes,
+                        $record->expected_shift_start ?: null, false, ['default_shift' => null]
+                    );
                 $byUser[$record->user_id]['daily'][$record->attendance_date] = [
+                    'late_minutes'        => $lateDay['minutes'],
+                    'late_raw_minutes'    => $lateDay['raw'],
+                    'late_waived_minutes' => $lateDay['waived'],
                     'attendance_date' => $record->attendance_date,
                     'login_time' => $record->login_time,
                     'logout_time' => $record->logout_time,
@@ -3285,33 +3311,24 @@ class AttendanceController extends Controller
         $byUser = [];
         $shiftService = new ShiftResolutionService();
 
-        // HALF-DAY dates in range (all users, one query): those days count on-time, never late.
-        $halfDayByUserDate = [];
-        try {
-            $hdRows = DB::table('t_req_master as r')
-                ->join('t_req_category as c', 'c.id', '=', 'r.category_id')
-                ->where('c.category_code', 'leave')
-                ->where('r.leave_type', 'half_day')
-                ->whereIn('r.status', ['approved', 'pending'])
-                ->where('r.leave_start_date', '<=', $end)
-                ->where('r.leave_end_date', '>=', $start)
-                ->get(['r.requester_user_id', 'r.leave_start_date']);
-            foreach ($hdRows as $h) {
-                $halfDayByUserDate[$h->requester_user_id . '|' . substr((string) $h->leave_start_date, 0, 10)] = true;
-            }
-        } catch (\Throwable $e) { /* none */ }
+        // ⭐ Oct-2026: a late DAY on these cards is the SAME test every other screen uses —
+        // ShiftResolutionService::lateForDay, counted on RAW (frozen minutes, shift in effect
+        // that day, no lateness on a half-day or a leave day). This used to be its own string
+        // compare at second precision, so a 09:00:30 check-in was "late" here and 0 everywhere
+        // else, and a leave day with a check-in counted. One query primes the leave days.
+        $shiftService->primeLeaveDays($records->pluck('user_id')->unique()->all(), $start, $end);
 
         foreach ($records as $r) {
-            $isHalf = isset($halfDayByUserDate[$r->user_id . '|' . substr((string) $r->attendance_date, 0, 10)]);
-            // Effective shift start for THIS date: prefer the frozen check-in snapshot,
-            // else resolve the shift that was in effect on that date (not today's, not
-            // the legacy rider-profile column).
-            $shiftStart = $r->expected_shift_start
-                ?: (($shiftService->getUserShift($r->user_id, $r->attendance_date)['shift_start'] ?? '09:00') . ':00');
+            $lateDay = $r->login_time
+                ? $shiftService->lateForDay(
+                    (int) $r->user_id, substr((string) $r->attendance_date, 0, 10), $r->login_time,
+                    $r->late_minutes, $r->expected_shift_start ?: null, false, ['apply_review' => false])
+                : ['raw' => 0];
+            $isLateDay = $lateDay['raw'] > 0;
 
             if (!$r->login_time) {
                 $absent++;
-            } elseif (!$isHalf && $r->login_time > $shiftStart) {
+            } elseif ($isLateDay) {
                 $late++;
             } else {
                 $onTime++; // on time, or a half-day (no lateness counted)
@@ -3333,7 +3350,7 @@ class AttendanceController extends Controller
                 $byUser[$r->user_id]['absent']++;
             } else {
                 $byUser[$r->user_id]['present']++;
-                if (!$isHalf && $r->login_time > $shiftStart) {
+                if ($isLateDay) {
                     $byUser[$r->user_id]['late']++;
                 }
             }
@@ -3477,6 +3494,7 @@ class AttendanceController extends Controller
                     // Frozen snapshot (preferred over recomputation)
                     'a.late_minutes as snap_late_minutes',
                     'a.overtime_minutes as snap_overtime_minutes',
+                    'a.expected_shift_start',
                     'lr.leave_request_id',
                     'lr.leave_status',
                     'lr.leave_type',
@@ -3642,25 +3660,19 @@ class AttendanceController extends Controller
                     continue;
                 }
 
-                // Per-day late/overtime — prefer the FROZEN snapshot; else resolve the
-                // shift in effect ON THIS DATE and compute (truncate seconds). This keeps
-                // per-day rows consistent with the snapshot-preferring monthly totals + salary.
-                if (!$record->login_time) {
-                    $record->late_minutes = 0;
-                } elseif (!is_null($record->snap_late_minutes)) {
-                    $record->late_minutes = (int) $record->snap_late_minutes;
-                    if ($record->late_minutes > 0) { $lateDays++; }
-                } else {
-                    $dayStart = $shiftService->getUserShift($userId, $record->attendance_date)['shift_start'] ?? null;
-                    $shiftStart = $dayStart ? strtotime($record->attendance_date . ' ' . $dayStart) : null;
-                    $actualLogin = strtotime($record->attendance_date . ' ' . $record->login_time);
-                    if ($shiftStart && $actualLogin > $shiftStart) {
-                        $lateDays++;
-                        $record->late_minutes = (int) (($actualLogin - $shiftStart) / 60);
-                    } else {
-                        $record->late_minutes = 0;
-                    }
-                }
+                // Per-day late through the ONE engine (lateForDay) — the figure payroll counts.
+                // ⚠⚠ Was inline arithmetic on the raw snapshot until 5-Oct-2026: Kanan's 4-Oct
+                // read "103 min" here after Shabib had waived 90 of it. `late_minutes` = what
+                // COUNTS; `late_raw_minutes` / `late_waived_minutes` let the cell say why. A late
+                // DAY is still counted on the raw figure (the waive forgives minutes, not the fact).
+                $lateDay = $shiftService->lateForDay(
+                    $userId, $recDate, $record->login_time ?: null, $record->snap_late_minutes,
+                    $record->expected_shift_start ?: null, false, ['default_shift' => null]
+                );
+                $record->late_minutes        = $lateDay['minutes'];
+                $record->late_raw_minutes    = $lateDay['raw'];
+                $record->late_waived_minutes = $lateDay['waived'];
+                if ($lateDay['raw'] > 0) { $lateDays++; }
 
                 // Target-based overtime for THIS day, straight from the map built above. The
                 // service already drops half-days and days without a checkout, so a missing
@@ -3712,7 +3724,7 @@ class AttendanceController extends Controller
                 $onLeave = $r->leave_request_id && in_array(strtolower((string) $r->leave_status), ['approved', 'pending']);
                 if ($isHalf && $r->login_time)                 $r->status = 'half_day';
                 elseif ($onLeave)                              $r->status = 'on_leave';
-                elseif ($r->login_time && $r->late_minutes > 0) $r->status = 'late';
+                elseif ($r->login_time && ($r->late_raw_minutes ?? $r->late_minutes) > 0) $r->status = 'late';
                 elseif ($r->login_time)                        $r->status = 'present';
                 else                                           $r->status = 'absent';
                 $byDate[$r->attendance_date] = $r;

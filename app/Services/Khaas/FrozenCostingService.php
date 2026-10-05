@@ -91,6 +91,8 @@ class FrozenCostingService
         $rates     = $this->ratesFor($businessUnitId, $ids, $month);
         $meat      = $this->meatByStorageProduct($businessUnitId, $start, $end);
         $remaining = $this->remainingByIngredient($businessUnitId, $ids, $end);
+        // ❄ Sep-30: start · adjusted · latest weigh-in, from the same stock engine.
+        $stock     = (new IngredientStockService())->monthColumns($businessUnitId, $ids, $start, $end);
 
         $rows   = [];
         $totals = $this->emptyTotals();
@@ -168,10 +170,47 @@ class FrozenCostingService
                 'has_movement'    => ($boughtQty > 0 || $usedQty > 0),
             ];
 
+            // ❄ Sep-30 — start + bought − used ± adjusted = left (a full month). Meat is
+            //   Storage's and gets none of these.
+            $st = (!$isMeat && isset($stock[$id])) ? $stock[$id] : null;
+            $startQty = $st['start_qty'] ?? null;
+            $row['start_qty']      = $startQty;
+            $row['start_text']     = $startQty === null ? null : $ing->phrase($startQty);
+            $row['started_on']     = $st['started_on'] ?? null;
+            $row['started_text']   = ($st && $st['started_on'])
+                ? 'started ' . Carbon::parse($st['started_on'])->format('j M') . ' at ' . $ing->phrase((float) $st['started_qty'])
+                : null;
+            $row['partial']        = (bool) ($st['partial'] ?? false);
+            $row['adjusted_qty']   = $st ? $st['adjusted'] : null;
+            $row['adjusted_text']  = ($st && abs($st['adjusted']) >= 0.0005)
+                ? ($st['adjusted'] > 0 ? '+' : '−') . $ing->phrase(abs($st['adjusted']))
+                : null;
+            $row['adjusted_value'] = ($st && $rate > 0) ? round($st['adjusted'] * $rate, 2) : null;
+            $row['last_check']     = null;
+            $row['last_check_value'] = null;
+            if ($st && $st['last_check']) {
+                $chk = $st['last_check'];
+                $gap = $chk['gap']['gap'] ?? null;
+                $row['last_check'] = [
+                    'date_text' => Carbon::parse($chk['entry']['date'])->format('j M'),
+                    'qty_text'  => $ing->phrase($chk['entry']['qty']),
+                    'gap'       => $gap,
+                    'gap_text'  => $gap === null ? null : (new IngredientStockService())->gapText($ing, $gap),
+                ];
+                $row['last_check_value'] = ($gap !== null && $rate > 0) ? round($gap * $rate, 2) : null;
+            }
+            // A weigh-in or an adjustment IS something that happened this month — never fold it away.
+            if ($row['adjusted_text'] !== null || $row['last_check'] !== null) {
+                $row['has_movement'] = true;
+            }
+
             // ⚠ Used more than was bought is SHOWN, never clamped: a negative is the
             //   signal that a purchase was not tagged to this ingredient, and hiding it
             //   would hide the very thing the owner needs to fix.
-            $row['short'] = $usedQty > 0 && $boughtQty > 0 && $usedQty > $boughtQty && !$isMeat;
+            // ⚠ Sep-30: the STARTING stock counts too — 1 kg on the shelf + 200 g bought
+            //   covers 500 g used, and saying "a purchase is probably untagged" was false.
+            $startCovers = (float) ($startQty ?? ($st['started_qty'] ?? 0));
+            $row['short'] = $usedQty > 0 && $boughtQty > 0 && $usedQty > $boughtQty + max(0.0, $startCovers) && !$isMeat;
             if ($row['short']) {
                 $notes[] = sprintf(
                     'More %s was used than bought this month. A purchase of it is probably untagged.',
@@ -582,103 +621,18 @@ class FrozenCostingService
     }
 
     /**
-     * What should still be on the shelf, per ingredient.
+     * What should still be on the shelf, per ingredient, at the end of $asOf.
      *
-     * Cumulative from the ingredient's opening line (or its latest physical count):
-     * everything bought since, minus everything used since. Without an opening row the
-     * answer is null — "not tracked" — rather than a number that looks exact and is not.
+     * ⭐ Sep-30: ONE engine — IngredientStockService. The same figure the stock sheet, the
+     * recipe editor and the purchase sheet show, so Month Review can never disagree with
+     * them. Rules unchanged: from the latest start/adjust, strictly after its day; a
+     * weigh-in "check" never moves it; no start = null ("not tracked").
      *
      * @return array<int,float|null>
      */
     private function remainingByIngredient(int $bu, array $ingredientIds, Carbon $asOf): array
     {
-        $out = [];
-
-        if (!$ingredientIds) {
-            return $out;
-        }
-
-        try {
-            // The latest opening/count row on or before the month end anchors each one.
-            $anchors = DB::table('t_crm_khaas_ingredient_opening as o')
-                ->whereIn('o.ingredient_id', $ingredientIds)
-                ->whereDate('o.counted_on', '<=', $asOf->toDateString())
-                ->orderBy('o.ingredient_id')
-                ->orderByDesc('o.counted_on')
-                ->orderByDesc('o.id')
-                ->get(['o.ingredient_id', 'o.counted_on', 'o.qty_base']);
-
-            $anchor = [];
-            foreach ($anchors as $a) {
-                $anchor[(int) $a->ingredient_id] ??= [
-                    'from' => $a->counted_on,
-                    'qty'  => (float) $a->qty_base,
-                ];
-            }
-
-            if (!$anchor) {
-                foreach ($ingredientIds as $id) {
-                    $out[(int) $id] = null;
-                }
-                return $out;
-            }
-
-            $anchorIds = array_keys($anchor);
-            $earliest  = min(array_column($anchor, 'from'));
-
-            $bought = DB::table('t_fin_vendor_purchase_items as i')
-                ->join('t_fin_ledger as l', 'l.id', '=', 'i.ledger_id')
-                ->where('l.business_unit_id', $bu)
-                ->where('l.transaction_type', LedgerModel::TYPE_VENDOR_PURCHASE)
-                ->whereIn('l.approval_status', self::POSTED_STATUSES)
-                ->whereIn('i.ingredient_id', $anchorIds)
-                ->whereNotNull('i.qty_base')
-                ->whereBetween('l.transaction_date', [$earliest, $asOf->toDateString()])
-                ->select('i.ingredient_id', 'l.transaction_date',
-                    DB::raw('SUM(i.qty_base) as qty'))
-                ->groupBy('i.ingredient_id', 'l.transaction_date')
-                ->get();
-
-            $consumed = DB::table('t_crm_khaas_batch_consumption')
-                ->where('business_unit_id', $bu)
-                ->whereIn('ingredient_id', $anchorIds)
-                ->whereBetween('made_on', [$earliest, $asOf->toDateString()])
-                ->select('ingredient_id', 'made_on', DB::raw('SUM(qty_base) as qty'))
-                ->groupBy('ingredient_id', 'made_on')
-                ->get();
-
-            foreach ($anchorIds as $id) {
-                $out[(int) $id] = $anchor[$id]['qty'];
-            }
-
-            // ⚠⚠ STRICTLY AFTER the anchor date, never on it.
-            //    A count taken on the 15th already reflects everything that happened on
-            //    the 15th — it is a look at the shelf, not a statement about the morning.
-            //    Adding that day's purchase on top double-counted it (10 kg in, counted
-            //    5 kg, reported 15 kg), and subtracting that day's usage charged it
-            //    twice. The same slip in both directions, from the same `>=`.
-            foreach ($bought as $b) {
-                $id = (int) $b->ingredient_id;
-                if (isset($anchor[$id]) && $b->transaction_date > $anchor[$id]['from']) {
-                    $out[$id] += (float) $b->qty;
-                }
-            }
-
-            foreach ($consumed as $c) {
-                $id = (int) $c->ingredient_id;
-                if (isset($anchor[$id]) && $c->made_on > $anchor[$id]['from']) {
-                    $out[$id] -= (float) $c->qty;
-                }
-            }
-
-            foreach ($ingredientIds as $id) {
-                $out[(int) $id] ??= null;
-            }
-        } catch (\Throwable $e) {
-            Log::warning('Frozen costing: remaining failed', ['error' => $e->getMessage()]);
-        }
-
-        return $out;
+        return (new IngredientStockService())->onShelf($bu, $ingredientIds, $asOf->toDateString());
     }
 
     private function rateText(IngredientModel $ing, float $ratePerBase): string

@@ -83,8 +83,11 @@ class SalaryCalculationService
                 'absent_days' => $attendanceData['absent_days'],
                 'leave_days' => $attendanceData['leave_days'],
                 'late_minutes' => $attendanceData['late_minutes'],
+                // Oct-2026 — beside it, so the phone's slip form can show and freeze the waive.
+                'late_waived_minutes' => (int) ($attendanceData['late_waived_minutes'] ?? 0),
+                'late_raw_minutes' => (int) ($attendanceData['late_raw_minutes'] ?? $attendanceData['late_minutes']),
                 'overtime_minutes' => $attendanceData['overtime_minutes'],
-                
+
                 // Top-level deduction fields
                 'late_deduction' => $deductions['late_deduction'],
                 'absent_deduction' => $deductions['absent_deduction'],

@@ -468,8 +468,10 @@
                 <thead>
                     <tr>
                         <th>Ingredient</th>
+                        <th>Start</th>
                         <th>Bought</th>
                         <th>Used</th>
+                        <th>Adjusted</th>
                         <th>Left</th>
                         @if($canSeeIngredientCost)
                             <th>Rate</th>
@@ -484,16 +486,44 @@
                             {{ $row['name'] }}
                             <div class="mr-ing-kind">{{ $row['kind_label'] }}@if($row['is_meat']) · from storage @endif</div>
                         </td>
+                        {{-- ❄🧂 Sep-30: start + bought − used ± adjusted = left (a full month) --}}
+                        <td>
+                            @if(($row['start_text'] ?? null) !== null)
+                                {{ $row['start_text'] }}
+                            @elseif(!empty($row['started_text']))
+                                <span class="mr-ing-kind">{{ $row['started_text'] }}</span>
+                            @else
+                                <span class="mr-ing-untracked">—</span>
+                            @endif
+                        </td>
                         <td>{{ $row['bought_text'] }}</td>
                         <td class="{{ $row['short'] ? 'mr-ing-short' : '' }}">
                             {{ $row['used_text'] }}
-                            @if($row['short'])<br><span class="mr-ing-kind">more than was bought</span>@endif
+                            @if($row['short'])<br><span class="mr-ing-kind">more than there was</span>@endif
+                        </td>
+                        <td>
+                            @if(!empty($row['adjusted_text']))
+                                <span class="{{ ($row['adjusted_qty'] ?? 0) < 0 ? 'mr-ing-short' : '' }}">{{ $row['adjusted_text'] }}</span>
+                                @if($canSeeIngredientCost && ($row['adjusted_value'] ?? null) !== null && abs($row['adjusted_value']) >= 1)
+                                    <div class="mr-ing-kind">Rs {{ number_format(abs($row['adjusted_value'])) }}</div>
+                                @endif
+                            @else
+                                <span class="mr-ing-untracked">—</span>
+                            @endif
                         </td>
                         <td>
                             @if($row['tracked'])
                                 {{ $row['remaining_text'] }}
                             @else
                                 <span class="mr-ing-untracked">not tracked</span>
+                            @endif
+                            @if(!empty($row['last_check']))
+                                <div class="mr-ing-kind">
+                                    weighed {{ $row['last_check']['qty_text'] }} on {{ $row['last_check']['date_text'] }}@if($row['last_check']['gap_text']) · {{ $row['last_check']['gap_text'] }}@endif
+                                    @if($canSeeIngredientCost && ($row['last_check_value'] ?? null) !== null && abs($row['last_check_value']) >= 1)
+                                        (Rs {{ number_format(abs($row['last_check_value'])) }})
+                                    @endif
+                                </div>
                             @endif
                         </td>
                         @if($canSeeIngredientCost)
@@ -524,6 +554,9 @@
                 Meat is different: it is bought and consumed through the storage ledger, so its figures are
                 the real ones. "Not tracked" means no opening stock was ever entered for that ingredient,
                 which is honest rather than a number that looks exact and is not.
+                <br><b>Start + Bought − Used ± Adjusted = Left</b> for a full month. Bought is by-weight Frozen bills only.
+                Adjusted is what weigh-ins changed (a minus is stock that was not there); a "weighed" line under
+                Left was recorded but not applied.
             </div>
         </div>
     </details>

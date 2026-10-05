@@ -431,6 +431,16 @@ class ShiftResolutionService
         if ($isHalfDay || $loginTime === null || $loginTime === '') {
             return $out;
         }
+        // ⭐⭐ A LEAVE DAY IS NEVER LATE (owner ruling 5-Oct-2026). A check-in on a day he is on
+        //    leave (full or half, approved or pending — the same test every per-day screen uses
+        //    to print "Leave") carries no lateness. It lives HERE, in the one rule, so the month
+        //    total, the late-day count, the review queue and every per-day row agree: before
+        //    this the rows printed 0 for such a day while the month total (the money) still
+        //    counted it. Read-time only — the frozen row is never touched, so cancelling the
+        //    leave brings the real figure straight back.
+        if (empty($opts['ignore_leave']) && $this->leaveKindOn($userId, $date) !== null) {
+            return $out;
+        }
         $out['login'] = $this->hmOf($loginTime);
 
         $default = array_key_exists('default_shift', $opts) ? $opts['default_shift'] : '09:00';
@@ -469,6 +479,106 @@ class ShiftResolutionService
         }
         $out['minutes'] = max(0, $out['raw'] - $out['waived']);
         return $out;
+    }
+
+    /**
+     * user|Y-m => ['full' => [date => true], 'half' => [date => true]]. Per-request.
+     * ⚠ Loaded per user-MONTH, never per day: lateForDay() runs inside per-day loops on the
+     * payroll grid, and a query per day there would undo the N+1 work on that page.
+     */
+    private static array $leaveMemo = [];
+
+    /** Drop the leave memo (a leave was just approved / cancelled inside this request). */
+    public static function forgetLeaveDays(?int $userId = null): void
+    {
+        if ($userId === null) { self::$leaveMemo = []; return; }
+        foreach (array_keys(self::$leaveMemo) as $k) {
+            if (strpos($k, $userId . '|') === 0) { unset(self::$leaveMemo[$k]); }
+        }
+    }
+
+    /**
+     * Load the leave days of MANY users for the months a range touches, in ONE query.
+     * For boards that list every rider (the Today board, the store daily board), so that
+     * lateForDay() does not ask once per rider.
+     */
+    public function primeLeaveDays(array $userIds, string $from, string $to): void
+    {
+        $userIds = array_values(array_unique(array_map('intval', $userIds)));
+        if (!$userIds) { return; }
+        $from = substr($from, 0, 7) . '-01';
+        $to   = date('Y-m-t', strtotime(substr($to, 0, 7) . '-01'));
+        $months = [];
+        for ($m = $from; $m <= $to; $m = date('Y-m-01', strtotime($m . ' +1 month'))) {
+            $months[] = substr($m, 0, 7);
+        }
+        $fresh = [];
+        foreach ($userIds as $u) {
+            foreach ($months as $ym) {
+                if (!isset(self::$leaveMemo[$u . '|' . $ym])) {
+                    $fresh[$u . '|' . $ym] = ['full' => [], 'half' => []];
+                }
+            }
+        }
+        if (!$fresh) { return; }
+        foreach ($this->leaveRows($userIds, $from, $to) as $lv) {
+            $isHalf = strtolower((string) ($lv->leave_type ?? '')) === 'half_day';
+            $ls = max($from, substr((string) $lv->leave_start_date, 0, 10));
+            $le = min($to, substr((string) $lv->leave_end_date, 0, 10));
+            for ($c = new \DateTime($ls); $c <= new \DateTime($le); $c->modify('+1 day')) {
+                $d = $c->format('Y-m-d');
+                $k = (int) $lv->requester_user_id . '|' . substr($d, 0, 7);
+                if (isset($fresh[$k])) { $fresh[$k][$isHalf ? 'half' : 'full'][$d] = true; }
+            }
+        }
+        self::$leaveMemo = $fresh + self::$leaveMemo;
+    }
+
+    /**
+     * 'full' | 'half' | null — is this user on leave that day? Same definition as the per-day
+     * screens (RiderController monthly history, AttendanceController monthlyReport): a leave
+     * request, approved OR pending, covering the date; leave_type 'half_day' is a half.
+     */
+    public function leaveKindOn(int $userId, string $date): ?string
+    {
+        $date = substr($date, 0, 10);
+        $k = $userId . '|' . substr($date, 0, 7);
+        if (!isset(self::$leaveMemo[$k])) {
+            $this->primeLeaveDays([$userId], $date, $date);
+        }
+        $m = self::$leaveMemo[$k] ?? ['full' => [], 'half' => []];
+        if (isset($m['full'][$date])) { return 'full'; }
+        if (isset($m['half'][$date])) { return 'half'; }
+        return null;
+    }
+
+    private function leaveRows(array $userIds, string $from, string $to): array
+    {
+        try {
+            return DB::table('t_req_master as r')
+                ->join('t_req_category as c', 'c.id', '=', 'r.category_id')
+                ->where('c.category_code', 'leave')
+                ->whereIn('r.requester_user_id', $userIds)
+                ->whereIn('r.status', ['approved', 'pending'])
+                ->whereNotNull('r.leave_start_date')->whereNotNull('r.leave_end_date')
+                ->where('r.leave_start_date', '<=', $to)
+                ->where('r.leave_end_date', '>=', $from)
+                ->get(['r.requester_user_id', 'r.leave_start_date', 'r.leave_end_date', 'r.leave_type'])
+                ->all();
+        } catch (\Throwable $e) {
+            return [];
+        }
+    }
+
+    /** Day-review supersede check after a path rewrote a day's figures. Never throws. */
+    public function supersedeReviewsIfChanged(int $userId, string $date, string $note): void
+    {
+        try {
+            if (self::$reviewSvc === null) {
+                self::$reviewSvc = app(\App\Services\HR\DayReviewService::class);
+            }
+            self::$reviewSvc->supersedeIfChanged($userId, $date, $note);
+        } catch (\Throwable $e) { /* never break the write that triggered this */ }
     }
 
     /** First H:MM in a stored time ('09:00:00' or a full datetime) → 'H:i'; null if unreadable. */
@@ -748,6 +858,11 @@ class ShiftResolutionService
         $count = 0;
         foreach ($dates as $d) {
             $this->stampAttendanceSnapshot($userId, substr((string) $d, 0, 10));
+            // ⭐ Oct-2026: a re-stamp can move a reviewed day's lateness / overtime. Retire any
+            // verdict the day no longer matches, so it comes back into the queue saying why,
+            // instead of quietly standing (or quietly vanishing) behind the new figure.
+            $this->supersedeReviewsIfChanged($userId, substr((string) $d, 0, 10),
+                'the shift for this day was changed and the day was re-stamped');
             $count++;
         }
 

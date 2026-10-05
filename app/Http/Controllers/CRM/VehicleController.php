@@ -1941,6 +1941,11 @@ class VehicleController extends Controller
                 'drivers'    => $this->allActiveUsers(),
                 'suggested_driver' => $suggested,
                 'window'     => $svc->meterWindowFor((int) $id, $date),
+                // 🔁 Meter replaced (Oct-2026): what is on record for this machine, whether the
+                //   feature exists on this server yet, and the figure to offer as "the old
+                //   meter's last reading" (the machine's reading just before this date).
+                'replacements'      => $svc->meterReplacementsFor((int) $id),
+                'replacement_ready' => \App\Services\Riders\MeterReplacement::available(),
             ]);
         } catch (\Throwable $e) {
             Log::error('meterDay failed', ['vehicle' => $id, 'error' => $e->getMessage()]);
@@ -1963,7 +1968,12 @@ class VehicleController extends Controller
             // ⚠ meters are recorded, never forecast — a future date would plant a
             //   phantom point in the machine's chain that no reading can ever match.
             'date'           => 'required|date|before_or_equal:today',
-            'target'         => 'required|in:attendance,log',
+            // `replacement` / `replacement_remove` (Oct-2026) ride this endpoint on purpose: the
+            // same screen, the same permission, and no new route to upload.
+            'target'         => 'required|in:attendance,log,replacement,replacement_remove',
+            'old_reading'    => 'nullable|integer|min:0',
+            'new_reading'    => 'nullable|integer|min:0',
+            'replacement_id' => 'nullable|integer',
             'attendance_id'  => 'nullable|integer',
             'meter_start'    => 'nullable|integer|min:0',
             'meter_end'      => 'nullable|integer|min:0',
@@ -1973,6 +1983,21 @@ class VehicleController extends Controller
         $date = \Carbon\Carbon::parse($data['date'])->format('Y-m-d');
 
         try {
+            /**
+             * 🔁 "THE METER ON THIS MACHINE WAS REPLACED" (5-Oct-2026). Recorded here, beside the
+             *    machine's own readings, by the same people who may type them. One writer
+             *    (`VehicleService::saveMeterReplacement`) — it flushes everything derived.
+             */
+            if ($data['target'] === 'replacement') {
+                $r = $svc->saveMeterReplacement((int) $id, $date,
+                    (int) ($data['old_reading'] ?? 0), (int) ($data['new_reading'] ?? 0),
+                    $data['note'] ?? null, (int) auth()->id());
+                return response()->json(['success' => $r['ok'], 'message' => $r['message']], $r['ok'] ? 200 : 422);
+            }
+            if ($data['target'] === 'replacement_remove') {
+                $r = $svc->removeMeterReplacement((int) $id, (int) ($data['replacement_id'] ?? 0));
+                return response()->json(['success' => $r['ok'], 'message' => $r['message']], $r['ok'] ? 200 : 422);
+            }
             if ($data['target'] === 'attendance') {
                 if (!$this->canCorrectAttendance()) {
                     return response()->json(['success' => false,

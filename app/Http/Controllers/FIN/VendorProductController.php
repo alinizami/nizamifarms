@@ -55,6 +55,19 @@ class VendorProductController extends Controller
                                       ->orderBy('product_name')
                                       ->get();
 
+        return view('fin.vendor.products', ['vendor' => $vendor, 'products' => $products]
+            + $this->managerContext($vendor, $products));
+    }
+
+    /**
+     * ⭐ Oct-2026: what a product MANAGER needs beside the product rows — the full page above
+     * and the Ledger Hub's Products window both call this, so the two forms are fed the very
+     * same categories, ingredient list, unit catalogue and purchase locks and cannot drift.
+     *
+     * @return array{categories:array, ingredients:array, unitCatalogue:array, purchaseCounts:array}
+     */
+    public function managerContext(VendorModel $vendor, $products): array
+    {
         // Level-1 categories, read from the SALES catalogue so a purchase
         // can never be filed under a category that sales doesn't use.
         $categories = app(\App\Services\CategorySalesPurchaseService::class)->categoryVocabulary();
@@ -85,7 +98,7 @@ class VendorProductController extends Controller
         $unitCatalogue  = VendorUnits::catalogue();
         $purchaseCounts = $this->purchaseCounts($products->pluck('id')->all());
 
-        return view('fin.vendor.products', compact('vendor', 'products', 'categories', 'ingredients', 'unitCatalogue', 'purchaseCounts'));
+        return compact('categories', 'ingredients', 'unitCatalogue', 'purchaseCounts');
     }
 
     /**
@@ -130,6 +143,22 @@ class VendorProductController extends Controller
             }
             $p->setAttribute('purchase_count', $purchaseCounts[$p->id] ?? 0);
         });
+
+        // ❄🧂 Sep-30: what is on the shelf now, beside each tagged product — only for a Frozen
+        //   BY-WEIGHT vendor (the only bills that count as "bought"). Additive and read-only;
+        //   a failure leaves it absent and the purchase sheet exactly as it was.
+        if ($bu === self::FROZEN_BU && ($vendor->default_purchase_method ?? null) === 'by_weight') {
+            try {
+                $ids   = $products->pluck('ingredient_id')->filter()->unique()->values()->all();
+                $shelf = (new \App\Services\Khaas\IngredientStockService())->onShelfShaped($bu, $ids);
+                $products->each(function ($p) use ($shelf) {
+                    $s = $p->ingredient_id ? ($shelf[(int) $p->ingredient_id] ?? null) : null;
+                    $p->setAttribute('on_shelf_text', $s['text'] ?? null);
+                });
+            } catch (\Throwable $e) {
+                // the sheet works without it
+            }
+        }
 
         return response()->json([
             'success' => true,

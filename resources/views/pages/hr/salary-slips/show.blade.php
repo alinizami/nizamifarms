@@ -113,23 +113,24 @@
                         <span class="text-2xl mr-2">➖</span> Deductions
                     </h3>
                     <div class="space-y-3">
-                        @if($slip->late_deduction > 0)
+                        {{-- Oct-2026 — shown whenever the month HAD lateness, not only when money
+                             was taken: a fully waived month, or one inside the free buffer, must
+                             still show its lateness and the waive, as Payroll and the phone do. --}}
+                        @if($slip->hasLateness())
+                        @php($lateNote = \App\Models\HR\SalarySlipModel::lateNote($slip->late_minutes, $slip->late_raw_minutes, $slip->late_waived_minutes))
                         <div class="flex justify-between items-center">
                             <span class="text-gray-700">
-                                Late ({{ $slip->late_minutes }} mins)
+                                Late ({{ (int) round((float) $slip->late_minutes) }} mins counted)
                                 @if($slip->late_deduction_overridden)
                                     <span class="text-xs text-orange-600">⚠ Overridden</span>
                                 @endif
-                                {{-- Sep-2026 — the minutes a manager forgave. A slip is a frozen
-                                     receipt, so this is what lets it still account for a figure
-                                     smaller than the month's own days. Null on older slips. --}}
-                                @if(!is_null($slip->late_waived_minutes) && $slip->late_waived_minutes > 0)
-                                    <span class="block text-xs text-gray-500">
-                                        {{ $slip->late_raw_minutes }} mins late · {{ $slip->late_waived_minutes }} waived by a manager
-                                    </span>
+                                {{-- The minutes a manager forgave (and a figure typed by hand),
+                                     worded once in SalarySlipModel::lateNote. Null on older slips. --}}
+                                @if($lateNote)
+                                    <span class="block text-xs text-gray-500">{{ $lateNote }}</span>
                                 @endif
                             </span>
-                            <span class="font-semibold text-red-600">-PKR {{ number_format($slip->late_deduction, 2) }}</span>
+                            <span class="font-semibold {{ $slip->late_deduction > 0 ? 'text-red-600' : 'text-gray-500' }}">{{ $slip->late_deduction > 0 ? '-PKR ' . number_format($slip->late_deduction, 2) : 'no deduction' }}</span>
                         </div>
                         @endif
                         @if($slip->absent_deduction > 0)

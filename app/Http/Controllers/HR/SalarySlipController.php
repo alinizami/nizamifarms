@@ -282,6 +282,12 @@ class SalarySlipController extends Controller
                 ], 400);
             }
             
+            $lateSplit = \App\Models\HR\SalarySlipModel::lateSplitForNewSlip(
+                (int) $validated['user_id'], (string) $validated['salary_month'],
+                $validated['late_minutes'] ?? 0,
+                $validated['late_raw_minutes'] ?? null, $validated['late_waived_minutes'] ?? null
+            );
+
             // Create salary slip with status 'draft' first
             $slip = \App\Models\HR\SalarySlipModel::create([
                 'user_id' => $validated['user_id'],
@@ -304,8 +310,9 @@ class SalarySlipController extends Controller
                 // ⚠ Posted by the create screen, which reads them from the calculate endpoint.
                 // Defaulting `raw` to the net figure is right for every slip made before day
                 // review existed and for any month with no waiver: raw and net are the same.
-                'late_waived_minutes' => $validated['late_waived_minutes'] ?? 0,
-                'late_raw_minutes' => $validated['late_raw_minutes'] ?? ($validated['late_minutes'] ?? 0),
+                // Oct-2026: settled by the server, the same helper the phone's door uses.
+                'late_waived_minutes' => $lateSplit['waived'],
+                'late_raw_minutes' => $lateSplit['raw'],
                 'late_deduction' => $validated['late_deduction'] ?? 0,
                 'absent_days' => $validated['absent_days'] ?? 0,
                 'absent_deduction' => $validated['absent_deduction'] ?? 0,

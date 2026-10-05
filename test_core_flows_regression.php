@@ -142,7 +142,13 @@ try {
     if (!$spare) { ok('a spare company machine exists (none — skipped honestly)', true, true, true); }
     else {
         $before = (int) ($res->currentVehicleFor($RID) ?: 0);
-        $r = $vsvc->assign((int) $spare, $RID, (int) $store->id);
+        // ⚠ 5-Oct-2026: `assign()` grew a date parameter and (meter integrity, 13-Sep) a company
+        //   machine now changes hands only WITH its readings — the one handed over and the one
+        //   he steps off. Each is derived from the machine's own odometer, never hard-coded.
+        $nextReading = fn (int $vid) => $vid ? ((int) ($vsvc->currentMeterFor($vid) ?? 1000)) + 1 : null;
+        $r = $vsvc->assign((int) $spare, $RID, null, (int) $store->id, 'regression test',
+                            $nextReading((int) $spare), false, $nextReading($before));
+        if (empty($r['ok'])) { echo '      ! ' . ($r['message'] ?? '') . "\n"; }
         ok('⭐ assigning a different vehicle succeeds', !empty($r['ok'] ?? $r), true, true);
         $after = (int) ($res->currentVehicleFor($RID) ?: 0);
         ok('  …the registry now names it', $after, (int) $spare);

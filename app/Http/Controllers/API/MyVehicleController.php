@@ -253,14 +253,18 @@ class MyVehicleController extends Controller
                 return response()->json(['success' => false,
                     'message' => 'Enter at least one reading.'], 422);
             }
-            if ($start !== null && $end !== null && $end < $start) {
+            // (compared on the machine's continuous scale, so the day its meter was replaced —
+            //  start off the old meter, close off the new — is not "lower"; identical otherwise)
+            if ($start !== null && $end !== null
+                && \App\Services\Riders\MeterReplacement::toContinuous((int) $vid, $end, $date)
+                   < \App\Services\Riders\MeterReplacement::toContinuous((int) $vid, $start, $date)) {
                 return response()->json(['success' => false,
                     'message' => 'The closing reading cannot be lower than the starting one.'], 422);
             }
 
             // 3. it has to be believable for THAT machine
             foreach (array_filter([$start, $end], fn ($v) => $v !== null) as $val) {
-                if (!$veh->readingPlausibleFor($vid, (int) $val)) {
+                if (!$veh->readingPlausibleFor($vid, (int) $val, $date ?? null, false)) {
                     return response()->json(['success' => false,
                         'message' => 'That reading does not look like this vehicle\'s odometer. '
                             . 'Please check the number.'], 422);

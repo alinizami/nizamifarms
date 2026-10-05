@@ -334,6 +334,13 @@
                         <button type="button" id="ingFormCancel"
                                 class="px-3 py-2 rounded-lg text-sm border border-gray-300 text-gray-700">Cancel</button>
                     </div>
+                    {{-- ❄ Sep-30: a duplicate, or one in the wrong unit, cannot be deleted (its history
+                         would lose its meaning) — it can be HIDDEN, or REPLACED by another one. --}}
+                    <div id="ingFormMore" class="hidden mt-3 pt-3 border-t border-amber-200 flex flex-wrap gap-3 text-xs">
+                        <button type="button" id="ingHideBtn" class="underline" style="color:#991B1B;">Hide this ingredient</button>
+                        <button type="button" id="ingReplaceBtn" class="underline" style="color:#4338CA;">Replace with another ingredient…</button>
+                    </div>
+                    <div id="ingReplace" class="hidden mt-3"></div>
                 </div>
 
                 {{-- ❄ Where the recipes and the purchasing have not met yet. Filled by JS from
@@ -347,6 +354,7 @@
             </div>
 
             {{-- ── RIGHT: the recipe for one product ───────────────────── --}}
+            {{-- (the ❄🧂 stock card sits below both columns) --}}
             <div class="lg:col-span-3 bg-white border border-gray-200 rounded-xl overflow-hidden">
                 <div class="px-5 py-4 border-b border-gray-100 bg-gray-50">
                     <h3 class="font-semibold text-gray-900 text-sm">📖 Recipe</h3>
@@ -414,6 +422,40 @@
                     </div>
                 </div>
             </div>
+        </div>
+
+        {{-- ── ❄🧂 Sep-30: INGREDIENT STOCK — start + bought − used = left ─────────
+             Filled by JS from khaas.ingredients.stock (the same controller the phone reads).
+             Bought = Frozen BY-WEIGHT bills only. A blank line is skipped, never saved as 0. --}}
+        <div id="stockCard" class="mt-6 bg-white border border-gray-200 rounded-xl overflow-hidden">
+            <div class="px-5 py-4 border-b border-gray-100 bg-gray-50 flex flex-wrap items-center justify-between gap-3">
+                <div class="min-w-0">
+                    <h3 class="font-semibold text-gray-900 text-sm">🧂 Ingredient stock <span class="font-normal text-gray-500">— start + bought − used = left</span></h3>
+                    <p class="text-xs text-gray-500 mt-0.5">
+                        Weigh at the <b>end of the day</b>, after any running batch has ended. Leave a line blank to skip it.
+                        Only by-weight Frozen bills count as bought.
+                    </p>
+                </div>
+                <div id="stockActions" class="hidden">
+                    <div class="flex items-center gap-2">
+                        <select id="stockDate" class="px-2 py-1.5 border border-gray-300 rounded-lg text-sm bg-white">
+                            <option value="today">Weighed today</option>
+                            <option value="yesterday">Weighed yesterday</option>
+                        </select>
+                        <button type="button" id="stockSave"
+                                class="px-4 py-2 rounded-lg text-sm font-semibold text-white"
+                                style="background-color:#B45309;">Save weigh-in</button>
+                    </div>
+                </div>
+            </div>
+            <div id="stockMode" class="hidden px-5 py-2 text-xs border-b border-gray-100"></div>
+            <div id="stockList" class="divide-y divide-gray-100">
+                <div class="px-5 py-8 text-center text-sm text-gray-400">Loading…</div>
+            </div>
+            <details id="stockHidden" class="hidden border-t border-gray-100">
+                <summary class="px-5 py-2 text-xs text-gray-500 cursor-pointer select-none"></summary>
+                <div id="stockHiddenList" class="divide-y divide-gray-100"></div>
+            </details>
         </div>
     </div>
     @endif
@@ -953,6 +995,11 @@ function saveRecipeMappings() {
     var gaps        = {items: [], not_linked: 0, never_bought: 0}; // recipe names purchasing has not met
     var lines       = [];   // rows in the recipe being edited
     var current     = null; // the recipe as loaded
+    var CAN_MANAGE_ING = false;
+    // ❄🧂 Sep-30: the stock sheet as loaded, and ingredient id => its row (active + hidden)
+    var STOCK       = {rows: [], hidden: [], can_manage: false, can_adjust: false};
+    var STOCK_BY_ID = {};
+    var ON_SHELF    = {};   // ingredient id => {qty, text}, from the loaded recipe
 
     // Which display units a base unit may be typed in, and what they are worth.
     var UNITS = {g: ['g', 'kg'], ml: ['ml', 'L'], pcs: ['pcs']};
@@ -990,6 +1037,7 @@ function saveRecipeMappings() {
                 ingredients = d.ingredients || [];
                 gaps = d.gaps || {items: [], not_linked: 0, never_bought: 0};
                 LINK_VENDORS = d.link_vendors || [];
+                CAN_MANAGE_ING = !!d.can_manage;
                 renderIngredients(d.can_manage);
                 renderGaps();
                 return ingredients;
@@ -1024,7 +1072,7 @@ function saveRecipeMappings() {
                             (i.is_meat ? '<span class="ml-2 text-[10px] px-1.5 py-0.5 rounded-full" ' +
                                 'style="background:#FEE2E2;color:#991B1B;">from storage</span>' : '') +
                         '</div>' +
-                        '<div class="text-[11px] text-gray-500">measured by ' + unit + gapBadge(i.id) + '</div>' +
+                        '<div class="text-[11px] text-gray-500">measured by ' + unit + shelfBadge(i.id) + gapBadge(i.id) + '</div>' +
                     '</div>' +
                     (canManage
                         ? '<div class="flex items-center gap-3 shrink-0">' +
@@ -1056,46 +1104,23 @@ function saveRecipeMappings() {
      *   off as consumption. Inventing usage would inflate a cost that is already an
      *   estimate, and nobody could separate the invented part afterwards.
      */
+    // ❄🧂 Sep-30: the two pop-ups are gone — "Stock" takes you to that ingredient's line on
+    //   the stock sheet below, where the server (not the page) decides start / adjust / weigh-in.
     function openStock(id) {
-        var ing = ingredients.filter(function (x) { return x.id === id; })[0];
-        if (!ing) { return; }
+        var row = document.querySelector('[data-stock-row="' + id + '"]');
+        if (!row) { document.getElementById('stockCard').scrollIntoView({behavior: 'smooth'}); return; }
+        row.scrollIntoView({behavior: 'smooth', block: 'center'});
+        var box = row.querySelector('.stock-qty');
+        if (box) { setTimeout(function () { box.focus(); }, 300); }
+        row.style.background = '#FFFBEB';
+        setTimeout(function () { row.style.background = ''; }, 1600);
+    }
 
-        var units = ing.display_units || [ing.base_unit];
-        var unit  = units[units.length - 1];
-
-        var isCount = confirm(
-            'Stock for ' + ing.name + '\n\n' +
-            'OK      = a physical COUNT (what is on the shelf right now)\n' +
-            'Cancel  = OPENING stock (the starting figure)\n\n' +
-            'Either way the next screen asks how much.'
-        );
-
-        var typed = prompt(
-            (isCount ? 'Counted' : 'Opening') + ' stock of ' + ing.name + ', in ' + unit + ':',
-            ''
-        );
-        if (typed === null) { return; }
-
-        var qty = parseFloat(String(typed).replace(/,/g, ''));
-        if (!isFinite(qty) || qty < 0) {
-            alert('Give a number that is zero or more.');
-            return;
-        }
-
-        api('{{ route('khaas.ingredients.opening') }}', {
-            method: 'POST',
-            body: {
-                business_unit_id: BU,
-                ingredient_id: id,
-                qty: qty,
-                unit: unit,
-                kind: isCount ? 'count' : 'opening'
-            }
-        })
-        .then(function (d) {
-            alert((d && d.message) ? d.message : (d && d.success ? 'Saved.' : 'Could not save that.'));
-        })
-        .catch(function () { alert('Could not reach the server. Nothing was saved.'); });
+    /** "· 🧂 980 g on shelf" beside an ingredient in the master list, once the sheet has loaded. */
+    function shelfBadge(ingredientId) {
+        var s = STOCK_BY_ID[ingredientId];
+        if (!s || !s.tracked) { return ''; }
+        return ' · <span style="color:#065F46;">🧂 ' + esc(s.on_shelf_text) + ' on shelf</span>';
     }
 
     /** The badge beside an ingredient that a recipe names but purchasing has not met. */
@@ -1191,6 +1216,15 @@ function saveRecipeMappings() {
         uc.innerHTML = '';
         document.getElementById('ingUnitChangeBtn').onclick = function () { if (ing) { openUnitChange(ing); } };
 
+        // ❄ Sep-30: hide / replace — for an existing, non-meat ingredient
+        var more = document.getElementById('ingFormMore');
+        var rep  = document.getElementById('ingReplace');
+        rep.classList.add('hidden');
+        rep.innerHTML = '';
+        more.classList.toggle('hidden', !(ing && !ing.is_meat));
+        document.getElementById('ingHideBtn').onclick    = function () { if (ing) { hideIngredient(ing); } };
+        document.getElementById('ingReplaceBtn').onclick = function () { if (ing) { openReplace(ing); } };
+
         form.classList.remove('hidden');
         document.getElementById('ingFormName').focus();
     }
@@ -1269,6 +1303,9 @@ function saveRecipeMappings() {
                     unitOptions(base, ln.unit) +
                 '</select>' +
                 '<span class="rec-per text-[11px] text-gray-500 w-24 text-right"></span>' +
+                // ❄🧂 Sep-30: what is on the shelf now (tracked ingredients only)
+                '<span class="rec-shelf text-[10px] w-20 text-right" style="color:#065F46;" title="On the shelf now">' +
+                    (ON_SHELF[ln.ingredient_id] ? '🧂 ' + esc(ON_SHELF[ln.ingredient_id].text) : '') + '</span>' +
                 '<span class="rec-cost text-[11px] w-28 text-right"></span>' +
                 '<button type="button" class="rec-del text-gray-400 hover:text-red-600 px-1" data-i="' + idx + '">✕</button>' +
             '</div>';
@@ -1564,6 +1601,7 @@ function saveRecipeMappings() {
                 PRICES   = d.prices || {};
                 CAN_COST = !!d.can_see_cost;
                 SELL     = d.selling_price || null;
+                ON_SHELF = d.on_shelf || {};
                 SUPPLY   = {};
                 (current.lines || []).forEach(function (l) { SUPPLY[l.ingredient_id] = l.supply_state; });
 
@@ -1642,7 +1680,342 @@ function saveRecipeMappings() {
         });
     };
 
-    loadIngredients().then(loadProducts);
+    // ══ ❄🧂 Sep-30: INGREDIENT STOCK — start + bought − used = left ══════════
+    // Everything here reads and writes through Khaas\RecipeController (the phone's too).
+    // The page never decides what a weigh-in IS: the server makes it a start, an adjustment
+    // or — for someone without "Adjust Frozen Stock" — a weigh-in that moves nothing.
+    var STOCK_URL          = @json(route('khaas.ingredients.stock'));
+    var STOCK_SAVE_URL     = @json(route('khaas.ingredients.stock.save'));
+    var STOCK_HIST_URL     = @json(route('khaas.ingredients.stock-history', ['id' => '__ID__']));
+    var ACTIVATE_URL       = @json(route('khaas.ingredients.activate', ['id' => '__ID__']));
+    var DEACTIVATE_URL     = @json(route('khaas.ingredients.deactivate', ['id' => '__ID__']));
+    var REPLACE_IMPACT_URL = @json(route('khaas.ingredients.replace-impact', ['id' => '__ID__']));
+    var REPLACE_URL        = @json(route('khaas.ingredients.replace', ['id' => '__ID__']));
+
+    function loadStock() {
+        return api(STOCK_URL + '?business_unit_id=' + BU)
+            .then(function (d) {
+                if (!d.success) { throw new Error(d.message || 'Could not load the stock sheet.'); }
+                STOCK = d;
+                STOCK_BY_ID = {};
+                (d.rows || []).concat(d.hidden || []).forEach(function (r) { STOCK_BY_ID[r.id] = r; });
+                renderStock();
+                if (ingredients.length) { renderIngredients(CAN_MANAGE_ING); }
+            })
+            .catch(function (e) {
+                document.getElementById('stockList').innerHTML =
+                    '<div class="px-5 py-8 text-center text-sm" style="color:#B91C1C;">' + esc(e.message) + '</div>';
+            });
+    }
+
+    function gapHtml(e) {
+        if (!e || e.gap_text == null) { return ''; }
+        var col = e.gap < -0.0005 ? '#B91C1C' : (e.gap > 0.0005 ? '#B45309' : '#047857');
+        var money = (e.gap_rupees != null && Math.abs(e.gap_rupees) >= 1) ? ' (' + rs(Math.abs(e.gap_rupees)) + ')' : '';
+        return ' · <span style="color:' + col + ';font-weight:600;">' + esc(e.gap_text) + money + '</span>';
+    }
+
+    function entryHtml(e) {
+        if (!e) { return ''; }
+        return esc(e.kind_label) + ' ' + esc(e.qty_text) + ' on ' + esc(e.date_text) +
+            (e.by ? ' by ' + esc(e.by) : '') + gapHtml(e) +
+            (e.kind === 'check' ? ' <span class="text-gray-400">(recorded, not applied)</span>' : '');
+    }
+
+    function stockRowHtml(r, editable) {
+        var units = r.display_units || [r.base_unit];
+        var unit  = units[units.length - 1];
+        var shelf = r.tracked
+            ? '<b>' + esc(r.on_shelf_text) + '</b> <span class="text-gray-400">on the shelf</span>'
+            : '<span class="text-gray-400">not tracked yet</span>';
+        var inputs = editable
+            ? '<div class="flex items-center gap-1.5 shrink-0">' +
+                '<input type="number" step="any" min="0" inputmode="decimal" class="stock-qty w-24 px-2 py-1.5 border border-gray-300 rounded text-sm" ' +
+                    'data-id="' + r.id + '" placeholder="' + (r.tracked ? 'weighed' : 'start') + '">' +
+                (units.length > 1
+                    ? '<select class="stock-unit px-1.5 py-1.5 border border-gray-300 rounded text-sm bg-white" data-id="' + r.id + '">' +
+                        units.map(function (u) { return '<option value="' + u + '"' + (u === unit ? ' selected' : '') + '>' + u + '</option>'; }).join('') +
+                      '</select>'
+                    : '<span class="text-xs text-gray-500 w-8">' + esc(unit) + '</span>') +
+                '<input type="text" maxlength="255" class="stock-note w-36 px-2 py-1.5 border border-gray-200 rounded text-xs" ' +
+                    'data-id="' + r.id + '" placeholder="note (optional)">' +
+              '</div>'
+            : '';
+        return '<div class="px-5 py-2.5" data-stock-row="' + r.id + '">' +
+            '<div class="flex flex-wrap items-center gap-3">' +
+                '<div class="min-w-0 flex-1">' +
+                    '<div class="text-sm text-gray-900">' + esc(r.name) +
+                        ' <span class="text-[10px] text-gray-400">' + esc(r.kind_label) + '</span></div>' +
+                    '<div class="text-[12px] text-gray-700">' + shelf +
+                        (r.last_entry ? ' <span class="text-gray-500">· last: ' + entryHtml(r.last_entry) + '</span>' : '') + '</div>' +
+                    (r.by_weight ? '' : '<div class="text-[11px]" style="color:#B45309;">No by-weight vendor product — its bills will not count as bought</div>') +
+                    '<div class="stock-err text-[11px] font-semibold hidden" style="color:#B91C1C;" data-id="' + r.id + '"></div>' +
+                '</div>' +
+                inputs +
+                '<button type="button" class="stock-hist text-xs text-gray-500 underline shrink-0" data-id="' + r.id + '">History</button>' +
+            '</div>' +
+            '<div class="stock-hist-box hidden mt-2 pl-3 border-l-2 border-gray-200 text-[12px] text-gray-600" data-id="' + r.id + '"></div>' +
+        '</div>';
+    }
+
+    function renderStock() {
+        var editable = !!STOCK.can_manage;
+        document.getElementById('stockActions').classList.toggle('hidden', !editable);
+
+        var mode = document.getElementById('stockMode');
+        mode.classList.remove('hidden');
+        if (!editable) {
+            mode.style.background = '#F9FAFB';
+            mode.innerHTML = 'You can see the figures. Taimur, Shabib or Qasim enter the weigh-ins.';
+        } else if (STOCK.can_adjust) {
+            mode.style.background = '#ECFDF5';
+            mode.innerHTML = '✅ Your figures <b>set</b> the stock — a <b>start</b> the first time, an <b>adjustment</b> after. ' +
+                'The difference from what the system expected is kept and shown in History.';
+        } else {
+            mode.style.background = '#FEF3C7';
+            mode.innerHTML = '🔒 Adjustments are locked for you: your weigh-in is <b>recorded</b> and its difference shown, ' +
+                'but the figure stays until Taimur or Shabib adjusts it.';
+        }
+
+        var rows = STOCK.rows || [];
+        var list = document.getElementById('stockList');
+        list.innerHTML = rows.length
+            ? rows.map(function (r) { return stockRowHtml(r, editable); }).join('')
+            : '<div class="px-5 py-8 text-center text-sm text-gray-400">No ingredients yet.</div>';
+
+        var hidden = STOCK.hidden || [];
+        var det = document.getElementById('stockHidden');
+        det.classList.toggle('hidden', !hidden.length);
+        det.querySelector('summary').textContent = 'Hidden ingredients (' + hidden.length + ') — kept for their history';
+        document.getElementById('stockHiddenList').innerHTML = hidden.map(function (r) {
+            return '<div class="px-5 py-2 flex items-center justify-between gap-3">' +
+                '<div class="text-sm text-gray-500">' + esc(r.name) +
+                    (r.tracked ? ' <span class="text-[11px]">· ' + esc(r.on_shelf_text) + ' when hidden</span>' : '') + '</div>' +
+                (editable ? '<button type="button" class="stock-unhide text-xs underline" style="color:#4338CA;" data-id="' + r.id + '">Unhide</button>' : '') +
+            '</div>';
+        }).join('');
+
+        Array.prototype.forEach.call(document.querySelectorAll('#stockCard .stock-hist'), function (b) {
+            b.onclick = function () { toggleHistory(Number(b.getAttribute('data-id'))); };
+        });
+        Array.prototype.forEach.call(document.querySelectorAll('#stockCard .stock-unhide'), function (b) {
+            b.onclick = function () { unhideIngredient(Number(b.getAttribute('data-id')), b); };
+        });
+    }
+
+    function toggleHistory(id) {
+        var box = document.querySelector('#stockCard .stock-hist-box[data-id="' + id + '"]');
+        if (!box) { return; }
+        if (!box.classList.contains('hidden')) { box.classList.add('hidden'); return; }
+        box.classList.remove('hidden');
+        box.innerHTML = 'Loading…';
+        api(STOCK_HIST_URL.replace('__ID__', id) + '?business_unit_id=' + BU).then(function (d) {
+            if (!d.success) { box.textContent = d.message || 'Could not load the history.'; return; }
+            var h = d.history || [];
+            box.innerHTML = h.length ? h.map(function (e) {
+                return '<div class="py-0.5"' + (e.replaced ? ' style="text-decoration:line-through;opacity:.6;"' : '') + '>' +
+                    '<b>' + esc(e.date_text) + '</b> · ' + esc(e.kind_label) + ' ' + esc(e.qty_text) +
+                    (e.expected_text ? ' <span class="text-gray-400">(system said ' + esc(e.expected_text) + ')</span>' : '') +
+                    gapHtml(e) + (e.by ? ' · ' + esc(e.by) : '') +
+                    (e.note ? ' · <i>' + esc(e.note) + '</i>' : '') +
+                    (e.replaced ? ' · replaced the same day' : '') +
+                '</div>';
+            }).join('') : 'Nothing entered yet.';
+        }).catch(function () { box.textContent = 'Could not reach the server.'; });
+    }
+
+    document.getElementById('stockSave').onclick = function () {
+        var btn = this;
+        var F = Number(STOCK.sure_factor) || 5;
+        var entries = [], odd = [];
+        Array.prototype.forEach.call(document.querySelectorAll('#stockCard .stock-qty'), function (inp) {
+            var raw = String(inp.value || '').trim();
+            var id  = Number(inp.getAttribute('data-id'));
+            var err = document.querySelector('#stockCard .stock-err[data-id="' + id + '"]');
+            if (err) { err.classList.add('hidden'); err.textContent = ''; }
+            if (raw === '') { return; }
+            var sel  = document.querySelector('#stockCard .stock-unit[data-id="' + id + '"]');
+            var r    = STOCK_BY_ID[id] || {};
+            var us   = r.display_units || [r.base_unit];
+            var unit = sel ? sel.value : us[us.length - 1];
+            var note = document.querySelector('#stockCard .stock-note[data-id="' + id + '"]');
+            entries.push({ingredient_id: id, qty: raw, unit: unit, note: note ? note.value : ''});
+            var base = parseFloat(raw) * ((unit === 'kg' || unit === 'L') ? 1000 : 1);
+            if (r.tracked && r.on_shelf > 0 && isFinite(base) && (base > r.on_shelf * F || base < r.on_shelf / F)) {
+                odd.push('• ' + r.name + ': you typed ' + raw + ' ' + unit + ', the system expects about ' + r.on_shelf_text);
+            }
+        });
+        if (!entries.length) { alert('Type at least one amount.'); return; }
+        if (odd.length && !confirm('These are far from what the system expects — check for a typing slip:\n\n' +
+                odd.join('\n') + '\n\nSave anyway?')) { return; }
+
+        var date = document.getElementById('stockDate').value === 'yesterday' ? STOCK.yesterday : STOCK.today;
+        btn.disabled = true;
+        btn.textContent = 'Saving…';
+        api(STOCK_SAVE_URL, {method: 'POST', body: {business_unit_id: BU, date: date, entries: entries}})
+            .then(function (d) {
+                btn.disabled = false;
+                btn.textContent = 'Save weigh-in';
+                if (!d.success) {
+                    var errs = d.errors || {};
+                    Object.keys(errs).forEach(function (id) {
+                        var el = document.querySelector('#stockCard .stock-err[data-id="' + id + '"]');
+                        if (el) { el.textContent = errs[id]; el.classList.remove('hidden'); }
+                    });
+                    alert((d.message || 'Nothing was saved.') +
+                        (Object.keys(errs).length ? '\n\n' + Object.keys(errs).map(function (k) { return '• ' + errs[k]; }).join('\n') : ''));
+                    return;
+                }
+                var gaps = (d.saved || []).filter(function (s) { return s.gap_text && s.gap_text !== 'matches'; })
+                    .map(function (s) { var r = STOCK_BY_ID[s.ingredient_id] || {}; return '• ' + (r.name || '') + ': ' + s.gap_text + ' (system said ' + s.expected_text + ')'; });
+                alert(d.message + (gaps.length ? '\n\nDifferences:\n' + gaps.join('\n') : ''));
+                loadStock();
+            })
+            .catch(function () {
+                btn.disabled = false;
+                btn.textContent = 'Save weigh-in';
+                alert('Could not reach the server. Nothing was saved.');
+            });
+    };
+
+    function unhideIngredient(id, btn) {
+        if (btn) { btn.disabled = true; }
+        api(ACTIVATE_URL.replace('__ID__', id), {method: 'POST', body: {business_unit_id: BU}}).then(function (d) {
+            alert(d.message || (d.success ? 'Done.' : 'Could not do that.'));
+            loadIngredients().then(function () { refreshLineSelects(); loadStock(); });
+        }).catch(function () { if (btn) { btn.disabled = false; } alert('Could not reach the server.'); });
+    }
+
+    function hideIngredient(ing) {
+        var s = STOCK_BY_ID[ing.id] || {};
+        var used = s.current_recipes || [];
+        var msg = 'Hide "' + ing.name + '"?\n\nIt stops showing on the lists. Its past bills, batches, weigh-ins and old ' +
+            'recipe versions keep it, and you can Unhide it any time.';
+        if (used.length) {
+            msg += '\n\n⚠ It is still in the CURRENT recipe of: ' + used.join(', ') + '.\nThat recipe keeps counting it until you ' +
+                'change the line — "Replace with another ingredient…" does both in one step.';
+        }
+        if (!confirm(msg)) { return; }
+        api(DEACTIVATE_URL.replace('__ID__', ing.id), {method: 'POST', body: {business_unit_id: BU}}).then(function (d) {
+            alert(d.message || (d.success ? 'Hidden.' : 'Could not hide it.'));
+            if (d.success) { document.getElementById('ingForm').classList.add('hidden'); }
+            loadIngredients().then(function () { refreshLineSelects(); loadStock(); });
+        }).catch(function () { alert('Could not reach the server. Nothing was changed.'); });
+    }
+
+    /**
+     * 🔁 Replace with another ingredient: a duplicate, or one in the wrong unit that already has
+     * history. Preview first (what changes), then one confirm. Nothing past is rewritten.
+     */
+    function openReplace(ing) {
+        var box = document.getElementById('ingReplace');
+        var others = ingredients.filter(function (x) { return x.id !== ing.id && !x.is_meat; });
+        box.classList.remove('hidden');
+        box.innerHTML =
+            '<div class="rounded-lg border border-indigo-200 p-3" style="background:#EEF2FF;">' +
+                '<div class="text-xs font-semibold mb-2" style="color:#3730A3;">🔁 Replace ' + esc(ing.name) + ' with…</div>' +
+                '<select id="repTo" class="w-full px-2 py-1.5 border border-gray-300 rounded text-sm bg-white mb-2">' +
+                    '<option value="">— choose —</option>' +
+                    '<option value="__new__">➕ A new ingredient (e.g. the same one, counted by weight)</option>' +
+                    others.map(function (o) { return '<option value="' + o.id + '">' + esc(o.name) + ' (' + esc(o.base_unit) + ')</option>'; }).join('') +
+                '</select>' +
+                '<div id="repNew" class="hidden grid grid-cols-2 gap-2 mb-2">' +
+                    '<input id="repName" type="text" class="px-2 py-1.5 border border-gray-300 rounded text-sm" value="' + esc(ing.name) + '">' +
+                    '<select id="repUnit" class="px-2 py-1.5 border border-gray-300 rounded text-sm bg-white">' +
+                        '<option value="g">Weight (g / kg)</option><option value="ml">Volume (ml / L)</option><option value="pcs">Pieces</option>' +
+                    '</select>' +
+                    '<div class="col-span-2 text-[11px] text-gray-500">Keeping the same name renames the old one to “' + esc(ing.name) + ' (old)”.</div>' +
+                '</div>' +
+                '<button type="button" id="repPreview" class="px-3 py-1.5 rounded text-xs font-semibold text-white" style="background:#4338CA;">Show what changes</button>' +
+                '<div id="repImpact" class="mt-2"></div>' +
+            '</div>';
+
+        var toSel = document.getElementById('repTo');
+        toSel.onchange = function () {
+            document.getElementById('repNew').classList.toggle('hidden', toSel.value !== '__new__');
+            document.getElementById('repImpact').innerHTML = '';
+        };
+        document.getElementById('repPreview').onclick = function () {
+            var to = toSel.value;
+            if (!to) { alert('Choose what replaces it.'); return; }
+            var q = to === '__new__'
+                ? '?new_unit=' + encodeURIComponent(document.getElementById('repUnit').value)
+                : '?to=' + encodeURIComponent(to);
+            var out = document.getElementById('repImpact');
+            out.innerHTML = '<div class="text-xs text-gray-500">Checking…</div>';
+            api(REPLACE_IMPACT_URL.replace('__ID__', ing.id) + q + '&business_unit_id=' + BU).then(function (d) {
+                if (!d.success) { out.innerHTML = '<div class="text-xs" style="color:#B91C1C;">' + esc(d.message || 'Could not check.') + '</div>'; return; }
+                renderReplaceImpact(ing, d, to);
+            }).catch(function () { out.innerHTML = '<div class="text-xs" style="color:#B91C1C;">Could not reach the server.</div>'; });
+        };
+    }
+
+    function renderReplaceImpact(ing, d, to) {
+        var out = document.getElementById('repImpact');
+        var word = d.to_base_word || 'g';
+        var html = '';
+        if ((d.refusals || []).length) {
+            out.innerHTML = '<div class="text-xs rounded p-2" style="background:#FEE2E2;color:#991B1B;">' +
+                d.refusals.map(esc).join('<br>') + '</div>';
+            return;
+        }
+        html += '<div class="text-[12px] text-gray-800 mb-1"><b>Current recipes</b></div>';
+        html += (d.recipes || []).length ? (d.recipes || []).map(function (r) {
+            return '<div class="text-[12px] mb-1">' + esc(r.product_name) + ' v' + r.version + ': ' + esc(r.old_text) + ' → ' +
+                (r.needs_qty
+                    ? '<input type="number" step="any" min="0" class="rep-rq w-20 px-1.5 py-1 border border-gray-300 rounded text-xs" data-r="' + r.recipe_id + '"> ' + esc(word) +
+                      ' <span class="text-gray-500">per batch of ' + r.basis_packets + '</span>'
+                    : '<b>the same amount</b>') + ' <span class="text-gray-400">(becomes v' + (r.version + 1) + ')</span></div>';
+        }).join('') : '<div class="text-[12px] text-gray-500 mb-1">None use it now.</div>';
+        html += '<div class="text-[12px] text-gray-800 mt-2 mb-1"><b>Vendor products</b></div>';
+        html += (d.products || []).length ? (d.products || []).map(function (p) {
+            return '<div class="text-[12px] mb-1">' + esc(p.vendor_name || '') + ' · ' + esc(p.product_name) + ' (' + esc(p.unit) + '): ' +
+                (p.needs_size
+                    ? 'how many ' + esc(word) + ' in one ' + esc(p.unit) + '? <input type="number" step="any" min="0" class="rep-ps w-20 px-1.5 py-1 border border-gray-300 rounded text-xs" data-p="' + p.id + '">'
+                    : 'counts automatically (' + p.new_pack_qty_base + ' ' + esc(word) + ' each)') + '</div>';
+        }).join('') : '<div class="text-[12px] text-gray-500 mb-1">None are tagged to it.</div>';
+        html += '<div class="text-[11px] text-gray-600 mt-2">Past bills, batches, weigh-ins and old recipe versions stay exactly as they were. ' +
+            esc(ing.name) + ' will be hidden.' +
+            (d.from_was_tracked ? ' <b>Its stock figure does not carry over</b> — enter a starting stock for the new one.' : '') + '</div>';
+        html += '<button type="button" id="repGo" class="mt-2 px-3 py-1.5 rounded text-xs font-semibold text-white" style="background:#B45309;">Replace it</button>';
+        out.innerHTML = html;
+
+        document.getElementById('repGo').onclick = function () {
+            var btn = this;
+            var body = {business_unit_id: BU, recipe_qty: {}, product_sizes: {}};
+            if (to === '__new__') {
+                body.new_name = document.getElementById('repName').value.trim();
+                body.new_unit = document.getElementById('repUnit').value;
+                if (!body.new_name) { alert('Give the new ingredient a name.'); return; }
+            } else {
+                body.to = Number(to);
+            }
+            var missing = false;
+            Array.prototype.forEach.call(out.querySelectorAll('.rep-rq'), function (i) {
+                if (!(parseFloat(i.value) > 0)) { missing = true; }
+                body.recipe_qty[i.getAttribute('data-r')] = parseFloat(i.value);
+            });
+            Array.prototype.forEach.call(out.querySelectorAll('.rep-ps'), function (i) {
+                if (!(parseFloat(i.value) > 0)) { missing = true; }
+                body.product_sizes[i.getAttribute('data-p')] = parseFloat(i.value);
+            });
+            if (missing) { alert('Fill in every amount first.'); return; }
+            if (!confirm('Replace ' + ing.name + ' now?')) { return; }
+            btn.disabled = true;
+            api(REPLACE_URL.replace('__ID__', ing.id), {method: 'POST', body: body}).then(function (r) {
+                btn.disabled = false;
+                alert(r.message || (r.success ? 'Done.' : 'Could not replace it.'));
+                if (!r.success) { return; }
+                document.getElementById('ingForm').classList.add('hidden');
+                loadIngredients().then(function () { refreshLineSelects(); loadStock(); });
+                if (document.getElementById('recProduct').value) {
+                    document.getElementById('recProduct').dispatchEvent(new Event('change'));
+                }
+            }).catch(function () { btn.disabled = false; alert('Could not reach the server. Nothing was changed.'); });
+        };
+    }
+
+    loadIngredients().then(loadProducts).then(loadStock);
 })();
 </script>
 @endpush

@@ -6194,6 +6194,16 @@ class RiderController extends Controller
                     && !empty($attendance->meter_start)
                     && !empty($attendance->meter_start_vehicle_id))
                         ? (int) $attendance->meter_start_vehicle_id : null,
+                /**
+                 * 🔁 THE METER ON THIS MACHINE WAS REPLACED TODAY (Oct-2026). His morning reading
+                 *   is off the OLD meter and his closing one off the NEW — so "end is less than
+                 *   start" is the truth, not a typo, and the phone must not block it. True only
+                 *   once a manager has RECORDED the replacement for today (so the guard keeps
+                 *   firing on every ordinary day). Older APKs ignore the key.
+                 */
+                'meter_replaced_today' => (bool) array_filter(
+                    \App\Services\Riders\MeterReplacement::rowsFor((int) $vid),
+                    fn ($r) => $r['d'] === date('Y-m-d')),
             ];
 
             // 2 / 5 / 6 — cheap disqualifiers first.
@@ -8263,7 +8273,7 @@ class RiderController extends Controller
                             $wjU = new \App\Services\Riders\WorkJourneyService();
                             // ⭐ PHASE D: the MACHINE's last reading, not the man's — a rider
                             //   who swapped bikes is no longer accused of an impossible meter.
-                            $prevM = $wjU->continuityBaseline($user->id, $today);
+                            $prevM = $wjU->continuityBaseline($user->id, $today, (int) $meterReading);
                             if ($prevM !== null) {
                                 $gapKm = (int) $meterReading - $prevM['value'];
                                 if (abs($gapKm) > $wjU->continuityKm()) {
@@ -9261,7 +9271,7 @@ class RiderController extends Controller
             // CONTINUITY gate: morning reading vs the last closing meter (bike slept at home).
             $meterStart = (int) $request->meter_start;
             // ⭐ PHASE D: keyed to the machine he is actually on (see continuityBaseline).
-            $prev = $wj->continuityBaseline($user->id, $today);
+            $prev = $wj->continuityBaseline($user->id, $today, $meterStart);
             if ($prev !== null) {
                 $gap = $meterStart - $prev['value'];
                 if (abs($gap) > $wj->continuityKm() && !$request->boolean('confirm_gap')) {
@@ -13503,14 +13513,15 @@ class RiderController extends Controller
                                 $record->late_minutes, $record->expected_shift_start, false
                             );
                             $lateMinutes = $lateDay['minutes'];
-                            // ⚠⚠ THE RIDER'S OWN SCREEN follows the EFFECTIVE minutes, unlike
-                            // every manager surface, which follows the raw figure.
-                            // Riders are deliberately told nothing about the review layer
-                            // (owner ruling), so a day whose lateness a manager forgave must
-                            // simply read as a normal day here. Keying the badge off `raw`
-                            // instead produced a red "Late" chip reading "0 min" — a
-                            // contradiction he has no way to interpret, on the one screen
-                            // where nobody can explain it to him.
+                            // ⚠⚠ `status` follows the EFFECTIVE minutes, unlike every manager
+                            // surface, which follows the raw figure. Kept that way ONLY for
+                            // installed APKs: keyed off `raw`, an old build draws a red "Late"
+                            // chip reading "0 min" on a fully waived day.
+                            // ⭐ Owner ruling 5-Oct-2026 (replaces the older "riders are told
+                            // nothing about the review layer"): the rider SEES the waive. The
+                            // day row carries `late_raw_minutes` / `late_waived_minutes` below,
+                            // and the current APK labels a waived day from them ("Late · 90m
+                            // waived") instead of a plain "Present".
                             $status = $lateMinutes > 0 ? 'late' : ($record->logout_time ? 'completed' : 'in_progress');
                         }
                         // else: status stays as initialised above — 'not_needed' on a tagged day,
@@ -21461,6 +21472,11 @@ class RiderController extends Controller
                 }
             } catch (\Throwable $e) { /* morning info is additive — the screen must still load */ }
 
+            // Oct-2026: a leave day is never late (lateForDay) — one query for the whole board.
+            try {
+                $shiftService->primeLeaveDays(collect($query)->pluck('user_id')->filter()->all(), $selectedDate, $selectedDate);
+            } catch (\Throwable $e) { /* falls back to a lookup per rider */ }
+
             foreach ($query as $row) {
                 // Resolve the shift FOR THE SELECTED DATE (not today) so past dates use
                 // the shift that was actually in effect then.
@@ -21545,6 +21561,10 @@ class RiderController extends Controller
                     $isLate = false; $lateMinutes = 0;
                     $isOvertime = false; $overtimeMinutes = 0;
                 }
+                // ⭐ 5-Oct-2026: the waive itself, so the board can say "13m · 90m waived" and a
+                //   FULLY waived day still reads late (it showed "Present" with nothing to say why).
+                $lateRaw    = $isHalfDay ? 0 : (int) $lateDay['raw'];
+                $lateWaived = $isHalfDay ? 0 : (int) $lateDay['waived'];
 
                 $formattedData[] = [
                     'user_id' => $row->user_id,
@@ -21565,6 +21585,8 @@ class RiderController extends Controller
                         : true,
                     'is_late' => $isLate,
                     'late_minutes' => $lateMinutes,
+                    'late_raw_minutes' => $lateRaw,
+                    'late_waived_minutes' => $lateWaived,
                     'is_overtime' => $isOvertime,
                     'overtime_minutes' => $overtimeMinutes,
                     'is_half_day' => $isHalfDay,
@@ -21765,7 +21787,7 @@ class RiderController extends Controller
 
                 if (!empty($employee['is_company_bike']) && !empty($employee['meter_start'])) {
                     try {
-                        $mb = $wjBase->closingBaseline((int) $employee['user_id'], $selectedDate);
+                        $mb = $wjBase->closingBaseline((int) $employee['user_id'], $selectedDate, (int) $employee['meter_start']);
                         // holds_nothing = on no machine today ⇒ nothing to measure against.
                         $employee['prev_meter_end']    = $mb['holds_nothing'] ? null : $mb['value'];
                         $employee['prev_meter_date']   = $mb['holds_nothing'] ? null : $mb['date'];
@@ -27478,6 +27500,9 @@ class RiderController extends Controller
                 
                 // Deductions
                 'late_minutes' => 'nullable|numeric|min:0',
+                // Oct-2026 — the day-review split, exactly as the web slip form posts it.
+                'late_waived_minutes' => 'nullable|integer|min:0',
+                'late_raw_minutes' => 'nullable|integer|min:0',
                 'late_deduction' => 'nullable|numeric|min:0',
                 'absent_days' => 'nullable|integer|min:0',
                 'absent_deduction' => 'nullable|numeric|min:0',
@@ -27549,6 +27574,13 @@ class RiderController extends Controller
             $slipCount = \App\Models\HR\SalarySlipModel::whereDate('created_at', today())->count() + 1;
             $slipNumber = 'SAL-' . date('Ymd') . '-' . str_pad($slipCount, 3, '0', STR_PAD_LEFT);
             
+            $lateSplit = \App\Models\HR\SalarySlipModel::lateSplitForNewSlip(
+                (int) $validated['user_id'], (string) $validated['salary_month'],
+                $validated['late_minutes'] ?? 0,
+                $validated['late_raw_minutes'] ?? null, $validated['late_waived_minutes'] ?? null,
+                (bool) ($validated['allow_multiple'] ?? false)
+            );
+
             // Create salary slip
             $slip = \App\Models\HR\SalarySlipModel::create([
                 'user_id' => $validated['user_id'],
@@ -27567,6 +27599,14 @@ class RiderController extends Controller
                 
                 // Deductions
                 'late_minutes' => $validated['late_minutes'] ?? 0,
+                // ⭐ Oct-2026 — frozen alongside it, as the web slip does (HR\SalarySlipController):
+                //   what the month really was and what a manager forgave. A phone-made slip used
+                //   to drop both, so its receipt showed a reduced figure it could not account for.
+                //   An older APK posts neither → raw = net, waived 0, i.e. exactly as before.
+                //   Oct-2026: the split is settled by the server (lateSplitForNewSlip) — an older
+                //   APK that sends neither still gets the month's real split.
+                'late_waived_minutes' => $lateSplit['waived'],
+                'late_raw_minutes' => $lateSplit['raw'],
                 'late_deduction' => $validated['late_deduction'] ?? 0,
                 'absent_days' => $validated['absent_days'] ?? 0,
                 'absent_deduction' => $validated['absent_deduction'] ?? 0,
@@ -27763,6 +27803,10 @@ class RiderController extends Controller
                     
                     // Deductions
                     'late_minutes' => (float)$slip->late_minutes,
+                    // Oct-2026 — the slip's frozen split, as /salary/slips/{id} already sends.
+                    'late_raw_minutes' => $slip->late_raw_minutes,
+                    'late_waived_minutes' => $slip->late_waived_minutes,
+                    'late_note' => \App\Models\HR\SalarySlipModel::lateNote($slip->late_minutes, $slip->late_raw_minutes, $slip->late_waived_minutes),
                     'late_deduction' => (float)$slip->late_deduction,
                     'absent_days' => (int)$slip->absent_days,
                     'absent_deduction' => (float)$slip->absent_deduction,
@@ -34501,8 +34545,10 @@ class RiderController extends Controller
             ->all();
         $att = \DB::table('t_ops_attendance')->where('user_id', $uid)
             ->whereBetween('attendance_date', [$startStr, $endStr])
-            ->get(['attendance_date', 'login_time', 'logout_time', 'late_minutes'])
+            ->get(['attendance_date', 'login_time', 'logout_time', 'late_minutes', 'expected_shift_start'])
             ->keyBy(fn($a) => substr((string) $a->attendance_date, 0, 10));
+        // Half-days carry no lateness (owner's rule) — same suppression as every other screen.
+        $halfDays = (new \App\Services\HR\LeavePolicyService())->halfDayDates($uid, $startStr, $endStr);
 
         // "Not needed" day tags for the month (guarded — table may not be deployed yet).
         $dayTags = [];
@@ -34534,7 +34580,21 @@ class RiderController extends Controller
 
             $a = $att[$ds] ?? null;
             $loggedIn = $a && !empty($a->login_time);
-            $late = ($loggedIn && !is_null($a->late_minutes)) ? (int) $a->late_minutes : null;
+            /**
+             * ⭐⭐ Through the ONE engine (lateForDay) since 5-Oct-2026. This read the raw
+             *    `late_minutes` column, so a manager's waive never showed here (Kanan's 4-Oct read
+             *    103 after 90 were waived), a half-day still read late, and an unsnapshotted day
+             *    read "on time". `late_minutes` = what COUNTS (null when not late at all, as
+             *    before); raw / waived let the app say why. ⚠ An older APK reads only
+             *    `late_minutes`, so a FULLY waived day shows "on time" there until the APK.
+             */
+            $late = null; $lateRaw = 0; $lateWaived = 0;
+            if ($loggedIn && !isset($halfDays[$ds])) {
+                $ld = $svc->lateForDay($uid, $ds, $a->login_time, $a->late_minutes,
+                                       $a->expected_shift_start ?: null, false, ['default_shift' => null]);
+                $lateRaw = $ld['raw']; $lateWaived = $ld['waived'];
+                $late = $ld['raw'] > 0 ? $ld['minutes'] : null;
+            }
 
             $days[] = [
                 'date' => $ds,
@@ -34553,6 +34613,8 @@ class RiderController extends Controller
                 'is_future' => $ds > $today,
                 'logged_in' => $loggedIn,
                 'late_minutes' => $late,
+                'late_raw_minutes' => $lateRaw,
+                'late_waived_minutes' => $lateWaived,
             ];
         }
 

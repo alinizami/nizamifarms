@@ -199,6 +199,10 @@
     if (i.stale) {
       html += '<div class="nfdr-warn">🔁 this day changed after it was checked</div>';
     }
+    // Oct-2026 (owner ruling): allowed, but said BEFORE he decides — pay is already processed.
+    if (i.pay_processed) {
+      html += '<div class="nfdr-warn" style="color:#b91c1c;">💰 ' + esc(i.pay_processed) + '</div>';
+    }
     return html;
   }
 
@@ -247,6 +251,10 @@
   async function act(item, verdict) {
     if (!item) { return; }
     var payload = { user_id: item.user_id, date: item.date, kind: item.kind, verdict: verdict };
+    // Oct-2026 (owner ruling): a change in a month whose pay is already processed goes
+    // ahead only once he has read, in plain words, that the money will NOT move.
+    if (verdict !== 'verified' && item.pay_processed
+        && !confirm('⚠ PAY ALREADY PROCESSED\n\n' + item.pay_processed + '\n\nGo ahead anyway?')) { return; }
     if (verdict === 'adjusted') {
       var v = prompt('How many minutes of overtime did ' + item.fullname + ' really do on '
         + item.date + '?\n\nThe system counted ' + hm(item.minutes) + '.', String(item.minutes));
@@ -275,6 +283,8 @@
       });
       var j = await res.json();
       if (!j.success) { throw new Error(j.message || 'Could not save that.'); }
+      // Saved — and if this day's pay was already processed, the server says so again.
+      if (j.warning) { alert('Saved.\n\n⚠ ' + j.warning); }
       await load();
     } catch (e) {
       alert(e.message || e);

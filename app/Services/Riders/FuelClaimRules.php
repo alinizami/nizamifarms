@@ -429,6 +429,30 @@ class FuelClaimRules
     {
         $win = $this->odometerWindow($userId, $date, $vehicleId, $ignoreServiceLogId);
 
+        /**
+         * ⭐⭐ METER REPLACED (5-Oct-2026). `$win` is in the figures of the meter fitted that day
+         *    (what the messages print). The COMPARISON is made on the machine's continuous
+         *    scale — the typed reading and both bounds — so a new meter's 147 is not "lower
+         *    than this bike's 9,133", and on the replacement day itself a reading off either
+         *    meter is judged as what it is. `$cm`/`$cf`/`$cc` equal the plain figures for a
+         *    machine never replaced, so every line below is unchanged for it.
+         */
+        $cm = $meter; $cf = $win['floor']; $cc = $win['ceil'];
+        try {
+            $res = new VehicleResolver();
+            $rv  = $res->rulesEnabled() ? ($vehicleId ?: $res->vehicleForDay($userId, $date)) : null;
+            if ($rv && MeterReplacement::has((int) $rv)) {
+                $cw = (new VehicleService())->meterWindowContinuousFor((int) $rv, $date, $ignoreServiceLogId);
+                if ($cw !== null) {
+                    $cm = (int) MeterReplacement::toContinuous((int) $rv, $meter, $date);
+                    $cf = $cw['floor']; $cc = $cw['ceil'];
+                    // Show each bound as the meter it was read on showed it.
+                    $win = ['floor' => $cf !== null ? MeterReplacement::toRaw((int) $rv, (int) $cf, $date) : null,
+                            'ceil'  => $cc !== null ? MeterReplacement::toRaw((int) $rv, (int) $cc, $date) : null];
+                }
+            }
+        } catch (\Throwable $e) { /* the plain comparison stands */ }
+
         // ⭐⭐ NAME THE RECORD THAT SET THE BOUND (Sep-20 2026). Kanan's honest 52,702 on
         //    18-Sep was refused against "52,766 recorded before 2026-09-18", and nobody could
         //    find which record said that — it was a service log typed on the 19th and dated
@@ -440,7 +464,7 @@ class FuelClaimRules
             $side, $date, $ignoreServiceLogId
         );
 
-        if ($win['floor'] !== null && $meter < $win['floor'] - self::METER_SLACK_KM) {
+        if ($cf !== null && $cm < $cf - self::METER_SLACK_KM) {
             // ⭐ Teach the remedy, don't just refuse. The most common legitimate hit
             // (owner, Aug-3): a rider fills MID-SHIFT and hands over the receipt
             // after his day has closed — so the claim is filed the NEXT day, the
@@ -456,13 +480,13 @@ class FuelClaimRules
                 . 'Otherwise please check the number.'
                 . $whence('floor');
         }
-        if ($win['ceil'] !== null && $meter > $win['ceil'] + self::METER_SLACK_KM) {
+        if ($cc !== null && $cm > $cc + self::METER_SLACK_KM) {
             return 'That reading (' . number_format($meter) . ' km) is higher than this bike\'s '
                 . number_format($win['ceil']) . ' km recorded after ' . $date . '. Please check the number.'
                 . $whence('ceil');
         }
-        if ($win['ceil'] === null && $win['floor'] !== null
-            && $meter > $win['floor'] + self::MAX_FORWARD_JUMP_KM) {
+        if ($cc === null && $cf !== null
+            && $cm > $cf + self::MAX_FORWARD_JUMP_KM) {
             return 'That reading (' . number_format($meter) . ' km) is far above this bike\'s last '
                 . number_format($win['floor']) . ' km. Please check the number.'
                 . $whence('floor');

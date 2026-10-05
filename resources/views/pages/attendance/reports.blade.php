@@ -512,6 +512,11 @@ function showDailyDetails(userId) {
   const lateHours = Math.floor(lateMinutes / 60);
   const lateMins = lateMinutes % 60;
   document.getElementById('modalStatLateHours').textContent = `${lateHours}h ${lateMins}m`;
+  // Oct-2026 — the header figure is what COUNTS; say what was forgiven to get there.
+  const lateWaivedHdr = Math.round(Number(employee.late_waived_minutes) || 0);
+  if (lateWaivedHdr > 0) {
+    document.getElementById('modalStatLateHours').textContent += ` · ${lateWaivedHdr}m waived`;
+  }
   
   // TARGET-based minutes (the ones that earn the bonus days above) — not the shift-END
   // figure that feeds salary and shows ~0 because the resolved shift has no end time.
@@ -555,7 +560,10 @@ function showDailyDetails(userId) {
       const loginTime = day.login_time || '-';
       const logoutTime = day.logout_time || '-';
       const hours = (isAbsent || isOnLeave) ? '-' : calculateHours(day.login_time, day.logout_time);
-      const lateBy = (isAbsent || isOnLeave) ? { duration: '-', isLate: false } : calculateLateBy(day.login_time, day.shift_start);
+      // ⭐ 5-Oct-2026: the server's ONE-engine figure (frozen snapshot + manager waive) —
+      //   what payroll counts. The browser calc is only a fallback for an older response.
+      const lateBy = (isAbsent || isOnLeave) ? { duration: '-', isLate: false }
+        : (day.late_minutes != null ? serverLateBy(day) : calculateLateBy(day.login_time, day.shift_start));
       // Server-supplied TARGET overtime for this day (the figure that earns bonus leave).
       // Replaces a client-side logout-vs-shift_end calculation that was a third, disagreeing
       // definition — and that silently defaulted to a 17:00 shift end when none was set.
@@ -739,6 +747,17 @@ function calculateHours(login, logout) {
   const h = Math.floor(diff / 60);
   const m = diff % 60;
   return `${h}h ${m}m`;
+}
+
+// A day's lateness as the server's engine gave it: what COUNTS, with any waive named.
+// A late DAY stays late on the raw figure even when every minute was waived.
+function serverLateBy(day) {
+  const n = Number(day.late_minutes) || 0;
+  const raw = (day.late_raw_minutes != null) ? Number(day.late_raw_minutes) : n;
+  const w = Number(day.late_waived_minutes) || 0;
+  const f = (m) => { const h = Math.floor(m / 60), mm = m % 60; return h > 0 ? `${h}h ${mm}m` : `${mm}m`; };
+  if (raw <= 0) return { isLate: false, duration: '-' };
+  return { isLate: true, duration: f(n) + (w > 0 ? ` (${f(w)} waived)` : '') };
 }
 
 function calculateLateBy(loginTime, shiftStart) {

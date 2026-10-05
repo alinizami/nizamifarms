@@ -346,10 +346,16 @@ foreach ($claims as $c) {
     $res = $rules->checkMeteredPetrol(RAJAB, $c->expense_date, (float) $c->meter_distance,
                                       (int) $c->attendance_id, null, (int) $c->id);
     if (!$res['ok']) { $allPass = false; echo "      ⚠ {$c->expense_date}: {$res['message']}\n"; }
-    if (($res['vehicle_id'] ?? null) !== OWN) { $allOwn = false; }
+    // ⚠ 5-Oct-2026: his own bike's METER WAS REPLACED on 2-Oct. Until a manager records that
+    //   (Bikes → 🧾 Meter → "Meter replaced"), the new meter's low readings cannot be placed
+    //   on any machine, so those days honestly resolve to NOTHING. What must never happen is
+    //   the dangerous answer — an own-bike claim landing on the VAN.
+    $rv = $res['vehicle_id'] ?? null;
+    if ($rv !== OWN && $rv !== null) { $allOwn = false; }
+    if ($rv === VAN) { $allOwn = false; }
 }
 ok('every claim Rajab was actually paid still passes (' . $claims->count() . ')', $allPass, true);
-ok('  …and every one resolves to his own bike', $allOwn, true);
+ok('  …and every one resolves to his own bike (or to nothing — never to the van)', $allOwn, true);
 
 flushAll();
 $k = $legsSvc->forRange(KANAN, '2026-08-19', '2026-08-22');

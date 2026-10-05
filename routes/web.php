@@ -1456,6 +1456,13 @@ Route::middleware(['auth'])->group(function () {
         Route::post('/ingredients/{id}/change-unit', [\App\Http\Controllers\Khaas\RecipeController::class, 'changeUnit'])->name('ingredients.change-unit');
         Route::get('/ingredients/month', [\App\Http\Controllers\Khaas\RecipeController::class, 'ingredientMonth'])->name('ingredients.month');
         Route::post('/ingredients/opening', [\App\Http\Controllers\Khaas\RecipeController::class, 'saveOpening'])->name('ingredients.opening');
+        // ❄🧂 Sep-30: ingredient stock (start + bought − used = left), hide/unhide, replace.
+        Route::get('/ingredients/stock', [\App\Http\Controllers\Khaas\RecipeController::class, 'stockSheet'])->name('ingredients.stock');
+        Route::post('/ingredients/stock', [\App\Http\Controllers\Khaas\RecipeController::class, 'saveStock'])->name('ingredients.stock.save');
+        Route::get('/ingredients/{id}/stock-history', [\App\Http\Controllers\Khaas\RecipeController::class, 'stockHistory'])->name('ingredients.stock-history');
+        Route::post('/ingredients/{id}/activate', [\App\Http\Controllers\Khaas\RecipeController::class, 'activateIngredient'])->name('ingredients.activate');
+        Route::get('/ingredients/{id}/replace-impact', [\App\Http\Controllers\Khaas\RecipeController::class, 'replaceImpact'])->name('ingredients.replace-impact');
+        Route::post('/ingredients/{id}/replace', [\App\Http\Controllers\Khaas\RecipeController::class, 'replaceIngredient'])->name('ingredients.replace');
         Route::get('/recipe', [\App\Http\Controllers\Khaas\RecipeController::class, 'show'])->name('recipe.show');
         Route::post('/recipe', [\App\Http\Controllers\Khaas\RecipeController::class, 'save'])->name('recipe.save');
         Route::get('/recipe/coverage', [\App\Http\Controllers\Khaas\RecipeController::class, 'coverage'])->name('recipe.coverage');

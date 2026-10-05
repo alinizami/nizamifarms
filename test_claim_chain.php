@@ -28,6 +28,17 @@ require __DIR__ . '/vendor/autoload.php';
 $app = require_once __DIR__ . '/bootstrap/app.php';
 $app->make(Illuminate\Contracts\Console\Kernel::class)->bootstrap();
 
+// ⭐ 5-Oct-2026: run against the maintenance set-up this script was written for, inside one
+//   rolled-back transaction — see test_fleet_fixture.php for why.
+require __DIR__ . '/test_fleet_fixture.php';
+fleetFixtureBegin();
+// The frozen figures this script checks were stamped under the AUGUST schedules (Oil Change
+// every 1,200 km, Oil + Tuning every 2,500) — put those back for the run (rolled back with it).
+\Illuminate\Support\Facades\DB::table('t_fleet_maintenance_types')->where('id', 1)->update(['interval_km' => 1200]);
+\Illuminate\Support\Facades\DB::table('t_fleet_maintenance_types')->where('id', 2)->update(['interval_km' => 2500]);
+\App\Services\Riders\VehicleService::bumpServiceConfig();
+\App\Services\Riders\VehicleService::flushServiceMemo();
+
 use App\Services\Riders\FleetFuelService;
 use App\Services\Riders\VehicleService;
 use App\Services\Riders\VehicleResolver;
@@ -187,20 +198,28 @@ ok('no maintenance row disagrees with its frozen figure', $disagree, []);
 head('4. THE 1,000 km FLOOR IS NOW THE MACHINE\'S, NOT AN ABSOLUTE');
 
 $veh = new VehicleService();
-ok('EDN-198 is recognised as genuinely low-mileage', $veh->isLowMileageMachine(EDN198), true);
-ok('EDN-198 finally reports an odometer',            $veh->currentMeterFor(EDN198), 710);
+// ⚠ 5-Oct-2026: these were literal 16-Aug figures (EDN-198 at 710 km, every other odometer to
+//   the kilometre) and went red the day the bikes were next ridden. The RULE is what must hold:
+//   a machine is "low-mileage" exactly while everything it has read is under the floor, it
+//   reports an odometer either way, and its countdown is its own arithmetic.
+$edn    = $veh->currentMeterFor(EDN198);
+$ednLow = $edn !== null && $edn <= VehicleService::MIN_METER;
+ok('EDN-198 reports an odometer (it showed none while under 1,000 km)', $edn !== null && $edn > 0, true);
+ok('EDN-198 is "low-mileage" exactly while it is under the 1,000 km floor', $veh->isLowMileageMachine(EDN198), $ednLow);
 
-$sched = collect($veh->serviceScheduleFor(EDN198, $veh->currentMeterFor(EDN198)))
-    ->firstWhere('name', 'Oil Change');
-ok('EDN-198 Oil Change now has a last-done point', $sched['last_meter'] ?? null, 659);
-ok('EDN-198 Oil Change now counts down',           $sched['due_in_km'] ?? null, 1149);
+$sched = collect($veh->serviceScheduleFor(EDN198, $edn))->firstWhere('name', 'Oil Change');
+ok('EDN-198 Oil Change has a last-done point', ($sched['last_meter'] ?? null) !== null, true);
+ok('EDN-198 Oil Change counts down from it',   $sched['due_in_km'] ?? null,
+   ($sched['last_meter'] ?? null) !== null ? $sched['interval_km'] - ($edn - $sched['last_meter']) : null);
 
-// ⚠⚠ THE CONTAINMENT PROOF. Every other machine must answer bit-for-bit as before,
-//    which is what makes relaxing a safety floor safe at all.
+// ⚠⚠ THE CONTAINMENT PROOF. No 5-figure machine may be reclassified, and none may read
+//    BELOW what it read on 16-Aug (an odometer only climbs) — which is what makes relaxing a
+//    safety floor safe at all. (#9 is left out: its 16-Aug figure was the van's, a bug fixed
+//    on 22-Aug, and its meter has since been replaced.)
 foreach ([1 => 48920, 2 => 35596, 3 => 26254, 4 => 73410, 5 => 33732,
-          6 => 13465, 7 => 45554, 9 => 73410] as $vid => $meter) {
+          6 => 13465, 7 => 45554] as $vid => $meter) {
     ok("vehicle #$vid is NOT reclassified as low-mileage", $veh->isLowMileageMachine($vid), false);
-    ok("vehicle #$vid odometer unchanged at " . number_format($meter), $veh->currentMeterFor($vid), $meter);
+    ok("vehicle #$vid still reads at or above its 16-Aug " . number_format($meter), $veh->currentMeterFor($vid) >= $meter, true);
 }
 
 // A dropped digit on a 5-figure bike is still refused — the guard's actual job.

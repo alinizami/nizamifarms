@@ -974,6 +974,9 @@ class FleetFuelService
         $dirtyGap = [];
         $today = Carbon::today()->format('Y-m-d');
         foreach ($rows as $r) {
+            // Meter replaced (Oct-2026): judged on the machine's continuous scale. The same
+            // object comes back unless one of its readings is off a replaced meter.
+            $r = MeterReplacement::liftRow($r);
             $uid = (int) $r->user_id;
             if (!isset($out[$uid])) {
                 $out[$uid] = ['days' => 0, 'work_km' => 0, 'offduty_km' => 0,
@@ -1481,7 +1484,11 @@ class FleetFuelService
         // closed) makes the NEXT gap part-work, so it can't be called off-duty.
         $dirtyGap = false;
         $todayYmd = Carbon::today()->format('Y-m-d');
-        foreach ($att as $a) {
+        foreach ($att as $typed) {
+            // ⭐ Meter replaced (Oct-2026): `$a` is the row on the machine's CONTINUOUS scale —
+            //   what the day is judged and measured on; `$typed` is the row as recorded — what
+            //   is shown. They are the same object unless a reading is off a replaced meter.
+            $a    = MeterReplacement::liftRow($typed, $userId);
             $date = $a->attendance_date;
             $sane = $this->isSaneRow($a);
             $offduty = null;
@@ -1512,8 +1519,8 @@ class FleetFuelService
             }
             $days[$date] = [
                 'date'        => $date,
-                'meter_start' => $a->meter_start !== null ? (int) $a->meter_start : null,
-                'meter_end'   => $a->meter_end !== null ? (int) $a->meter_end : null,
+                'meter_start' => $typed->meter_start !== null ? (int) $typed->meter_start : null,
+                'meter_end'   => $typed->meter_end !== null ? (int) $typed->meter_end : null,
                 'work_km'     => $sane ? (int) $a->meter_end - (int) $a->meter_start : null,
                 'offduty_km'  => $isCompany === true ? $offduty : null,
                 'offduty_since' => $isCompany === true ? $offdutySince : null,
@@ -2072,7 +2079,9 @@ class FleetFuelService
                         $prev = null; $prevBy = null; $prevById = null; $prevOn = null;
                         continue;
                     }
-                    $cur  = (int) $c['meter'];
+                    // Chained on the machine's continuous scale, so a fill on a NEW meter is
+                    // measured from the last fill on the old one (same figure without a replacement).
+                    $cur  = (int) ($c['meter_cont'] ?? $c['meter']);
                     $his  = isset($mine[$c['id']]);
 
                     if ($prev === null) {
@@ -2095,7 +2104,8 @@ class FleetFuelService
                                 // and "since Danish's fill" on Danish's row reads as a bug.
                                 'by' => ($prevById !== null && $prevById !== $userId) ? $prevBy : null,
                                 'on' => $prevOn,
-                                'from_meter' => $prev,
+                                // shown as that fill's own meter read it
+                                'from_meter' => MeterReplacement::toRawByValue((int) $vid, $prev),
                             ];
                         }
                         $prev = $cur; $prevBy = $c['by_name'];
@@ -2355,7 +2365,8 @@ class FleetFuelService
                     if ($vid) {
                         $t = $types->find($r->maintenance_type_id ?? null);
                         $point = $veh->lastServicePointBefore((int) $vid, $cur,
-                            $t && (int) $t->interval_km > 0 ? (int) $t->interval_km : null);
+                            $t && (int) $t->interval_km > 0 ? (int) $t->interval_km : null,
+                            $r->d);   // the claim's own day — see the meter-replaced note there
                         // ⚠ "Nothing on record that could have included this job" IS an
                         //   answer, and it is `null` — falling through to the rider
                         //   anchor here would count exactly the smaller jobs the covers

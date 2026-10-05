@@ -2868,7 +2868,7 @@ class KhaasController extends Controller
     {
         if (!empty($data['ingredients']['rows'])) {
             foreach ($data['ingredients']['rows'] as $i => $row) {
-                foreach (['bought_cost', 'used_value', 'rate_per_base', 'rate_text'] as $k) {
+                foreach (['bought_cost', 'used_value', 'rate_per_base', 'rate_text', 'adjusted_value', 'last_check_value'] as $k) {
                     $data['ingredients']['rows'][$i][$k] = null;
                 }
             }

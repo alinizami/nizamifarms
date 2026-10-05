@@ -78,6 +78,12 @@ class MeterPairHelper
         $a = self::obj($att);
         if (!$a) return null;
 
+        // ⭐ Meter replaced (Oct-2026): on the day a machine's meter is swapped the two readings
+        //   are off two meters — measured on the continuous scale that is the real ride, where
+        //   the bare `abs()` reads "21,365 km". The same object comes back (and nothing
+        //   changes) unless a reading is off a replaced meter.
+        $a = MeterReplacement::liftRow($a);
+
         $ms = self::num($a->meter_start ?? null);
         $me = self::num($a->meter_end ?? null);
         if ($ms === null || $me === null) return null;

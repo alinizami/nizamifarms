@@ -23,6 +23,11 @@ require __DIR__ . '/vendor/autoload.php';
 $app = require_once __DIR__ . '/bootstrap/app.php';
 $app->make(Illuminate\Contracts\Console\Kernel::class)->bootstrap();
 
+// ⭐ 5-Oct-2026: run against the maintenance set-up this script was written for, inside one
+//   rolled-back transaction — see test_fleet_fixture.php for why.
+require __DIR__ . '/test_fleet_fixture.php';
+fleetFixtureBegin();
+
 use App\Services\Riders\FleetFuelService;
 use App\Services\Riders\ServiceIntervalResolver;
 use App\Services\Riders\VehicleService;

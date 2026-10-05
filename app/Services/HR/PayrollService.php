@@ -85,6 +85,19 @@ class PayrollService
     }
 
     // ── Schema guards (safe before the custom-schedule SQL is applied) ────────
+    private static ?bool $payrollLateWaivedColMemo = null;
+    private function payrollHasLateWaivedCol(): bool
+    {
+        if (self::$payrollLateWaivedColMemo === null) {
+            try {
+                self::$payrollLateWaivedColMemo = Schema::hasColumn('t_hr_payroll_payment', 'late_waived_minutes');
+            } catch (\Throwable $e) {
+                self::$payrollLateWaivedColMemo = false;
+            }
+        }
+        return self::$payrollLateWaivedColMemo;
+    }
+
     private static ?bool $payrollPeriodColsMemo = null;
     private function payrollHasPeriodCols(): bool
     {
@@ -388,7 +401,10 @@ class PayrollService
             $step = (int) $row['late_step_min'];
             $out[] = $this->leaveActionShape('late_penalty', $lateRec, $dec['late_penalty'] ?? null, [
                 'headline' => '−' . max(1, $lateRec) . ' leave',
-                'basis'    => $this->fmtMins($lateMin) . ' late across the month',
+                // Oct-2026 — net of any waive, and it says so (the waive is a manager's act).
+                'basis'    => $this->fmtMins($lateMin) . ' late across the month'
+                    . ((int) ($row['late_waived_minutes'] ?? 0) > 0
+                        ? ' (after ' . $this->fmtMins((int) $row['late_waived_minutes']) . ' waived)' : ''),
                 'formula'  => 'over the ' . $this->fmtMins($buf) . ' free buffer, under the '
                     . $this->fmtMins($step) . ' salary-cut line → −1 leave, no pay cut',
                 'drill'    => 'month_late',
@@ -1314,6 +1330,7 @@ class PayrollService
     {
         self::$rowMemo = [];
         self::$leaveDecisionMemo = [];
+        self::$processedMemo = [];
     }
 
     /** Drop every cached row for a month (a decision or a payment changed the inputs). */
@@ -1846,6 +1863,67 @@ class PayrollService
         }
     }
 
+    /** user => list of [from, to, what] covering paid/processed days. Per-request. */
+    private static array $processedMemo = [];
+
+    public static function forgetProcessed(): void { self::$processedMemo = []; }
+
+    /**
+     * Has this employee's pay for the day ALREADY been processed? Returns a plain sentence
+     * saying what covers it, or null. (Owner ruling 5-Oct-2026: a waive or an overtime
+     * verdict in a processed month is ALLOWED, but the manager must be told clearly that the
+     * money already paid does not move — the receipt, the cut and any −1 leave stay as paid.)
+     *
+     * Covers every way pay is processed here:
+     *   · a monthly payroll payment for that month,
+     *   · a paid custom period whose dates include the day (khata payments never cover days),
+     *   · a salary slip for that month (draft, approved or paid — the slip froze the figure).
+     */
+    public function payProcessedNote(int $userId, string $date): ?string
+    {
+        $date = substr($date, 0, 10);
+        if (!isset(self::$processedMemo[$userId])) {
+            $spans = [];
+            foreach ($this->userPaidRows($userId) as $r) {
+                if (($r->entry_kind ?? '') === 'balance_payment') { continue; }
+                $paidOn = !empty($r->paid_at) ? date('j M Y', strtotime((string) $r->paid_at)) : null;
+                if (($r->period_key ?? '') !== '' && $r->period_start && $r->period_end) {
+                    $spans[] = [$r->period_start, $r->period_end,
+                        'Pay for ' . $this->fmtRange($r->period_start, $r->period_end)
+                        . ' has already been paid' . ($paidOn ? ' (on ' . $paidOn . ')' : '') . '.'];
+                } elseif (!empty($r->pay_month)) {
+                    [$ms, $me] = $this->monthBounds($r->pay_month);
+                    $spans[] = [$ms, $me,
+                        date('F Y', strtotime($r->pay_month . '-01')) . ' salary has already been paid'
+                        . ($paidOn ? ' (on ' . $paidOn . ')' : '') . '.'];
+                }
+            }
+            try {
+                $slips = DB::table('t_hr_salary_slips')
+                    ->where('user_id', $userId)
+                    ->whereIn('slip_status', ['draft', 'approved', 'paid'])
+                    ->get(['salary_month', 'slip_number', 'slip_status']);
+                foreach ($slips as $s) {
+                    if (empty($s->salary_month)) { continue; }
+                    $ym = substr((string) $s->salary_month, 0, 7);
+                    [$ms, $me] = $this->monthBounds($ym);
+                    $spans[] = [$ms, $me,
+                        'A salary slip for ' . date('F Y', strtotime($ym . '-01')) . ' has already been made'
+                        . ($s->slip_number ? ' (' . $s->slip_number . ', ' . $s->slip_status . ')' : '') . '.'];
+                }
+            } catch (\Throwable $e) { /* no slips table — nothing to add */ }
+            self::$processedMemo[$userId] = $spans;
+        }
+        foreach (self::$processedMemo[$userId] as [$from, $to, $what]) {
+            if ($date >= $from && $date <= $to) {
+                return $what . ' Changing this day now updates the screens and reports, but NOT the money '
+                    . 'already processed — the paid amount, any late cut and any leave taken stay as they were. '
+                    . 'Settle any difference by hand.';
+            }
+        }
+        return null;
+    }
+
     public function isPaid(int $userId, string $month): bool
     {
         try {
@@ -2294,6 +2372,12 @@ class PayrollService
                     $insert['period_end']       = null;
                     $insert['period_key']       = '';
                     $insert['business_unit_id'] = $row['business_unit_id'];
+                }
+                // ⭐ Oct-2026 — `late_minutes` above is NET of what a manager waived; freeze the
+                //   waive beside it so the receipt can still explain itself. Column-guarded:
+                //   safe before `payroll_late_waived_oct2026.sql` has run.
+                if ($this->payrollHasLateWaivedCol()) {
+                    $insert['late_waived_minutes'] = (int) ($row['late_waived_minutes'] ?? 0);
                 }
                 DB::table('t_hr_payroll_payment')->insert($insert);
 
@@ -2986,6 +3070,8 @@ class PayrollService
                         'leave_days'        => (int) $p->leave_days,
                         'absent_deduction'  => (float) $p->absent_deduction,
                         'late_minutes'      => (int) $p->late_minutes,
+                        // Oct-2026 — what a manager waived that month (0 on older rows / no column).
+                        'late_waived_minutes' => (int) ($p->late_waived_minutes ?? 0),
                         'late_deduction'    => (float) $p->late_deduction,
                         'late_leave_deduct' => (int) $p->late_leave_deduct,
                         'bonus_leaves'      => (int) $p->bonus_leaves,

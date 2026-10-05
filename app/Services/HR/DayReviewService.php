@@ -71,6 +71,7 @@ class DayReviewService
         // written. Dropping only $memo would leave the chips showing the OLD standing.
         self::$itemMemo = [];
         self::$dayMemo = [];
+        self::$currentMemo = [];
         // The overtime engine caches ranges per request and those embed the verdicts too.
         OvertimeService::forgetRanges();
         // ⭐ And the bulb's cross-request count, so a manager who has just checked a day
@@ -126,11 +127,59 @@ class DayReviewService
      * The live review for one day, or null. Returns null for anything before the start
      * date, so switching the feature on can never reach back into settled history.
      */
-    public function reviewFor(int $userId, string $date, string $kind): ?array
+    public function reviewFor(int $userId, string $date, string $kind, bool $includeStale = false): ?array
     {
         $date = substr($date, 0, 10);
         if ($date < $this->startDate()) { return null; }
-        return $this->rows($userId)[$date . '|' . $kind] ?? null;
+        $r = $this->rows($userId)[$date . '|' . $kind] ?? null;
+        /**
+         * ⚠⚠ A STALE REVIEW MOVES NO NUMBER (5-Oct-2026 audit). A review whose day was edited
+         *    afterwards — a back-dated shift re-stamp, a CSV import, any path that rewrote the
+         *    check-in or the frozen minutes without calling supersedeIfChanged() — used to keep
+         *    reducing pay while the queue showed the same day as "pending, 0 waived". Kanan:
+         *    103 late, 90 waived, re-stamped to 150 → the queue said pending, payroll counted
+         *    60. Now every reader sees what the queue sees: an out-of-date verdict is no
+         *    verdict. Only the two places that must see it anyway (the supersede check and the
+         *    queue card that flags it) ask for it with $includeStale.
+         */
+        if ($r !== null && !$includeStale && !$this->reviewIsCurrent($userId, $r)) {
+            return null;
+        }
+        return $r;
+    }
+
+    /** user => date => bool. Per-request; dropped with the rest on forget(). */
+    private static array $currentMemo = [];
+
+    /**
+     * Does this stored review still match its day? Reads the day through the per-user day
+     * cache, loading ALL of this user's reviewed days in one query the first time — this runs
+     * inside per-day payroll loops and must never become a query per day.
+     */
+    private function reviewIsCurrent(int $userId, array $r): bool
+    {
+        $date = $r['date'];
+        $key = $date . '|' . $r['kind'];
+        if (isset(self::$currentMemo[$userId][$key])) { return self::$currentMemo[$userId][$key]; }
+        if (!isset(self::$dayMemo[$userId]) || !array_key_exists($date, self::$dayMemo[$userId])) {
+            $dates = array_values(array_unique(array_column($this->rows($userId), 'date')));
+            try {
+                $found = DB::table('t_ops_attendance')
+                    ->where('user_id', $userId)
+                    ->whereIn('attendance_date', $dates)
+                    ->get($this->attendanceCols());
+                foreach ($dates as $d) {
+                    if (!isset(self::$dayMemo[$userId]) || !array_key_exists($d, self::$dayMemo[$userId])) {
+                        self::$dayMemo[$userId][$d] = null;
+                    }
+                }
+                foreach ($found as $a) {
+                    self::$dayMemo[$userId][substr((string) $a->attendance_date, 0, 10)] = $a;
+                }
+            } catch (\Throwable $e) { /* fall back to the per-day read below */ }
+        }
+        $row = $this->attendanceRow($userId, $date);
+        return self::$currentMemo[$userId][$key] = $this->isFresh($r['kind'], $row, $r['source_hash']);
     }
 
     /**
@@ -172,8 +221,21 @@ class DayReviewService
                 ->whereDate('d.review_date', $date)
                 ->whereNull('d.superseded_at')
                 ->get(['d.user_id', 'd.kind', 'd.verdict', 'd.effective_minutes',
-                       'd.waived_minutes', 'd.reason', 'u.fullname as reviewed_by_name']);
+                       'd.waived_minutes', 'd.reason', 'd.source_hash', 'u.fullname as reviewed_by_name']);
+            // ⭐ Oct-2026: the board marker follows the same "a stale verdict is no verdict"
+            // rule as the figures beside it — ONE more query for the whole board, not per rider.
+            $days = [];
+            if (count($rs)) {
+                $days = DB::table('t_ops_attendance')
+                    ->whereIn('user_id', $rs->pluck('user_id')->unique()->all())
+                    ->whereDate('attendance_date', $date)
+                    ->get(array_merge(['user_id'], $this->attendanceCols()))
+                    ->keyBy('user_id');
+            }
             foreach ($rs as $r) {
+                if (!$this->isFresh((string) $r->kind, $days[$r->user_id] ?? null, (string) $r->source_hash)) {
+                    continue;
+                }
                 $out[$r->user_id . '|' . $r->kind] = [
                     'verdict'   => (string) $r->verdict,
                     'effective' => (int) $r->effective_minutes,
@@ -191,7 +253,11 @@ class DayReviewService
     {
         $out = [];
         foreach ($this->rows($userId) as $key => $r) {
-            if ($r['date'] >= substr($start, 0, 10) && $r['date'] <= substr($end, 0, 10)) {
+            if ($r['date'] >= substr($start, 0, 10) && $r['date'] <= substr($end, 0, 10)
+                && $r['date'] >= $this->startDate()
+                // Same rule as reviewFor(): a verdict the day has since moved away from is
+                // not shown as standing (the rider's own month reads this).
+                && $this->reviewIsCurrent($userId, $r)) {
                 $out[$key] = $r;
             }
         }
@@ -207,17 +273,37 @@ class DayReviewService
      * change overtime or lateness belongs in here — if it isn't, an edit to it would slip
      * past a verified day and silently change the money.
      */
-    public function sourceHash(?object $row): string
+    public function sourceHash(?object $row, ?string $kind = null): string
     {
         if (!$row) { return md5('missing'); }
+        /**
+         * ⚠⚠ LATENESS IS FINGERPRINTED ONLY BY WHAT LATENESS IS MADE OF (5-Oct-2026 prod).
+         *    Shabib waived 90 of Kanan's 103 late minutes on 4-Oct at 17:18; Kanan checked out
+         *    at 17:59. The checkout changed `logout_time`, the one shared fingerprint stopped
+         *    matching, and the waive went back into the queue as "changed since review" — while
+         *    the money engine kept applying it. A checkout cannot move a check-in, so the late
+         *    fingerprint blanks the checkout-side fields. Same field order as the full hash, so
+         *    a late review taken BEFORE checkout (those fields were empty then) matches it
+         *    exactly — the existing rows heal without a data change.
+         */
+        $late = $kind === 'late';
         return md5(implode('|', [
             (string) ($row->login_time ?? ''),
-            (string) ($row->logout_time ?? ''),
-            (string) ($row->checkout_unlock_until ?? ''),
+            $late ? '' : (string) ($row->logout_time ?? ''),
+            $late ? '' : (string) ($row->checkout_unlock_until ?? ''),
             (string) ($row->expected_shift_start ?? ''),
             (string) ($row->late_minutes ?? ''),
-            (string) ($row->overtime_minutes ?? ''),
+            $late ? '' : (string) ($row->overtime_minutes ?? ''),
         ]));
+    }
+
+    /**
+     * Does a stored verdict still describe the day? The kind's own fingerprint, or — for a
+     * late review written before 5-Oct-2026 with the full fingerprint — the full one.
+     */
+    private function isFresh(string $kind, ?object $row, string $stored): bool
+    {
+        return $stored === $this->sourceHash($row, $kind) || $stored === $this->sourceHash($row);
     }
 
     /** Cached answer to "does this database have the checkout-unlock columns yet". */
@@ -294,12 +380,14 @@ class DayReviewService
     {
         if (!$this->enabled()) { return false; }
         $date = substr($date, 0, 10);
+        // ⚠ This runs right AFTER a write to the day. A row cached earlier in the same request
+        // is the PRE-edit row and would call every review fresh — so read the day anew.
+        unset(self::$dayMemo[$userId][$date], self::$currentMemo[$userId]);
         $row  = $this->attendanceRow($userId, $date);
-        $hash = $this->sourceHash($row);
         $hit  = false;
         foreach (self::KINDS as $kind) {
-            $r = $this->reviewFor($userId, $date, $kind);
-            if ($r === null || $r['source_hash'] === $hash) { continue; }
+            $r = $this->reviewFor($userId, $date, $kind, true);
+            if ($r === null || $this->isFresh($kind, $row, $r['source_hash'])) { continue; }
             try {
                 DB::table('t_hr_day_review')->where('id', $r['id'])->update([
                     'superseded_at'   => now(),
@@ -416,7 +504,7 @@ class DayReviewService
                     // edited, the bypass cleared, or the orders re-assigned. Built here rather
                     // than trusted from the caller, so every door records the same thing.
                     'evidence'          => json_encode($opts['evidence'] ?? $this->evidenceFor($userId, $date, $kind, $row)),
-                    'source_hash'       => $this->sourceHash($row),
+                    'source_hash'       => $this->sourceHash($row, $kind),
                     'reviewed_by'       => $actorId,
                     'reviewed_at'       => now(),
                     // Re-deciding a superseded day revives it.
@@ -443,7 +531,29 @@ class DayReviewService
             );
         } catch (\Throwable $e) { /* auditing must never break the action */ }
 
-        return ['success' => true, 'message' => $this->confirmation($kind, $verdict, $computed, $effective, $waived)];
+        $msg = $this->confirmation($kind, $verdict, $computed, $effective, $waived);
+        // ⭐ Owner ruling 5-Oct-2026: allowed in a month whose pay is already processed, but
+        // said plainly — the verdict changes every screen, not the money already paid.
+        $warning = $this->payProcessedNote($userId, $date);
+        return [
+            'success'       => true,
+            'message'       => $warning !== null ? $msg . "\n\n⚠ " . $warning : $msg,
+            'warning'       => $warning,
+            'pay_processed' => $warning !== null,
+        ];
+    }
+
+    /** PayrollService's "is this day's pay already processed?" — null when not (or unknown). */
+    public function payProcessedNote(int $userId, string $date): ?string
+    {
+        try {
+            // Held: item() asks once per queue card, and building PayrollService is not free.
+            static $payroll = null;
+            $payroll = $payroll ?? app(PayrollService::class);
+            return $payroll->payProcessedNote($userId, $date);
+        } catch (\Throwable $e) {
+            return null;
+        }
     }
 
     /**
@@ -648,12 +758,12 @@ class DayReviewService
     /** One queue item: the figure, the evidence, and where the verdict stands. */
     private function item(int $userId, ?string $name, string $date, string $kind, int $raw, array $meta, string $today): array
     {
-        $r = $this->reviewFor($userId, $date, $kind);
+        $r = $this->reviewFor($userId, $date, $kind, true);
         $row = null;
         $stale = false;
         if ($r !== null) {
             $row = $this->attendanceRow($userId, $date);
-            $stale = $this->sourceHash($row) !== $r['source_hash'];
+            $stale = !$this->isFresh($kind, $row, $r['source_hash']);
         }
         // A day still open (no checkout, or an unlock window still running) is not yet
         // judgeable for overtime — offering it would freeze a figure that can still move.
@@ -684,6 +794,9 @@ class DayReviewService
             'at'        => $r && !$stale ? $r['reviewed_at'] : null,
             'meta'      => $meta,
             'label'     => $this->label($kind, $raw, $r, $stale),
+            // ⭐ Oct-2026: set when this day's pay is already processed (paid month, paid
+            // period, or a salary slip). The card shows it BEFORE the manager decides.
+            'pay_processed' => $this->payProcessedNote($userId, $date),
         ];
     }
 

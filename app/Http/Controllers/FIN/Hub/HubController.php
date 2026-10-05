@@ -1576,6 +1576,20 @@ class HubController extends Controller
                 ->orderByDesc('is_default')->orderByDesc('is_active')->orderBy('product_name')->get()
             : collect();
 
+        // ❄ Oct-2026: the SAME manager context the full Products page gets (categories, Frozen
+        //   ingredients, the unit catalogue, purchase locks) — one source, so the Hub's Products
+        //   window can tag an ingredient and its pack size exactly like the full page. Fails soft:
+        //   the window then behaves as it did before (no ingredient field).
+        $productManager = ['categories' => [], 'ingredients' => [], 'unitCatalogue' => \App\Services\FIN\VendorUnits::catalogue(), 'purchaseCounts' => []];
+        if ($vendor->default_purchase_method === 'by_weight') {
+            try {
+                $productManager = app(\App\Http\Controllers\FIN\VendorProductController::class)
+                    ->managerContext($vendor, $vendorProducts);
+            } catch (\Throwable $e) {
+                \Illuminate\Support\Facades\Log::warning('Hub: product manager context failed', ['vendor' => $vendor->id, 'error' => $e->getMessage()]);
+            }
+        }
+
         // Pay-from options (vendor's BU, minus the expense fund) + our banks for the payment modal.
         $vendorBu = (int) $vendor->business_unit_id;
         $paymentSources = AccountModel::getAccessibleCompanyAccounts()
@@ -1602,6 +1616,7 @@ class HubController extends Controller
             'periodPurchases' => $periodPurchases, 'periodPayments' => $periodPayments, 'lastPayment' => $lastPayment,
             'paymentSources' => $paymentSources, 'receivingBanks' => $receivingBanks,
             'vendorProducts' => $vendorProducts,
+            'productManager' => $productManager,
             'oldUrl' => route('fin.vendors.show', $vendor->id),
         ]);
     }
