@@ -347,6 +347,34 @@ class RiderController extends Controller
                 ], 403);
             }
 
+            // 📍 Delivery address = THIS ORDER's address (an order can ship somewhere
+            //    other than the customer's saved profile), falling back to the profile
+            //    only when the order has none. Lines 1+2 are taken from the SAME source
+            //    so a profile line 2 is never glued onto an order-specific line 1.
+            //    The orders list (mobile OrdersScreen) builds it the same way.
+            //    Tidy-up for real data: line 2 is often a copy of line 1 (Shopify), and
+            //    line 1 often already ends with the city — the app appends `city` itself,
+            //    so a trailing city segment is dropped here rather than shown twice.
+            $orderLine1 = trim((string) ($order->address_line1 ?? ''));
+            [$line1, $line2] = $orderLine1 !== ''
+                ? [$orderLine1, trim((string) ($order->address_line2 ?? ''))]
+                : [trim((string) ($order->customer->address1 ?? '')), trim((string) ($order->customer->address2 ?? ''))];
+            if ($line2 !== '' && mb_stripos($line1, $line2) !== false) {
+                $line2 = '';
+            }
+            $deliveryCity = trim((string) ($order->address_city ?? '')) ?: trim((string) ($order->customer->city ?? ''));
+            $segments = [];
+            foreach (explode(',', $line1 . ',' . $line2) as $seg) {
+                $seg = trim($seg);
+                if ($seg !== '' && (empty($segments) || mb_strtolower(end($segments)) !== mb_strtolower($seg))) {
+                    $segments[] = $seg;
+                }
+            }
+            if ($deliveryCity !== '' && count($segments) > 1 && mb_strtolower(end($segments)) === mb_strtolower($deliveryCity)) {
+                array_pop($segments);
+            }
+            $deliveryAddress = implode(', ', $segments);
+
             // Format line items
             $lineItems = $order->lineItems->map(function($item) {
                 return [
@@ -476,10 +504,10 @@ class RiderController extends Controller
                         'name' => $order->customer ? trim($order->customer->first_name . ' ' . $order->customer->last_name) : 'N/A',
                         'phone' => $order->customer->phone_original ?? $order->customer->phone ?? '',
                         'email' => $order->customer->email ?? '',
-                        'address' => $order->customer->address1 ?? '',
+                        'address' => $deliveryAddress, // order's delivery address (lines 1+2), city separate
                         'address1' => $order->customer->address1 ?? '',
                         'address2' => $order->customer->address2 ?? '',
-                        'city' => $order->customer->city ?? '',
+                        'city' => $deliveryCity,
                         'province' => $order->customer->province ?? '',
                         'postal_code' => $order->customer->postal_code ?? '',
                         'verified_location' => ($order->customer && ($order->customer->verified_location_url || ($order->customer->latitude && $order->customer->longitude))) ? [

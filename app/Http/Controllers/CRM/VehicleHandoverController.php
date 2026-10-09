@@ -82,6 +82,9 @@ class VehicleHandoverController extends Controller
             // a number, and nothing more. The reading describes something that already
             // happened; the approver is shown a plausibility hint and decides.
             'meter'      => 'nullable|integer|min:0|max:9999999',
+            // ⭐ 7-Oct: the CLOSING reading of the company machine he is holding — only on a
+            //   company → company swap. `meter` stays the reading of the machine he asks about.
+            'close_meter'=> 'nullable|integer|min:0|max:9999999',
             'note'       => 'nullable|string|max:255',
             'photo'      => 'nullable|image|max:' . self::MAX_PHOTO_KB,
         ]);
@@ -104,13 +107,16 @@ class VehicleHandoverController extends Controller
             (int) $data['vehicle_id'],
             isset($data['meter']) ? (int) $data['meter'] : null,
             $data['note'] ?? null,
-            $photoPath
+            $photoPath,
+            isset($data['close_meter']) ? (int) $data['close_meter'] : null
         );
 
         if (!($res['ok'] ?? false)) {
             // Don't leave an orphan file behind for a request that was refused.
             if ($photoPath) { try { Storage::disk('public')->delete($photoPath); } catch (\Throwable $e) {} }
-            return response()->json(['success' => false, 'message' => $res['message']], 422);
+            // `meter_missing` names the box the phone should point at ('meter' | 'close_meter').
+            return response()->json(['success' => false, 'message' => $res['message']]
+                + array_intersect_key($res, ['meter_missing' => 1]), 422);
         }
         return response()->json(['success' => true] + $res);
     }
@@ -168,6 +174,8 @@ class VehicleHandoverController extends Controller
             'give_back_vehicle_id' => 'nullable|integer',
             'give_back_none'       => 'nullable|boolean',
             'meter'                => 'nullable|integer|min:0|max:9999999',
+            // ⭐ 7-Oct: the closing reading of the company machine he steps OFF on a take.
+            'close_meter'          => 'nullable|integer|min:0|max:9999999',
             'displaced_action'     => 'nullable|in:none,own,vehicle',
             'displaced_vehicle_id' => 'nullable|integer',
             'displaced_meter'      => 'nullable|integer|min:0|max:9999999',
@@ -176,7 +184,10 @@ class VehicleHandoverController extends Controller
 
         $res = $this->svc()->decide($id, $approve, (int) auth()->id(), $data);
         if (!($res['ok'] ?? false)) {
-            return response()->json(['success' => false, 'message' => $res['message']], 422);
+            // ⭐ `meter_missing` ('meter' | 'close_meter') + `meter_vehicle_id` let the banner ask
+            //   for exactly that one reading and retry, instead of a dead-end alert.
+            return response()->json(['success' => false, 'message' => $res['message']]
+                + array_intersect_key($res, ['meter_missing' => 1, 'meter_vehicle_id' => 1]), 422);
         }
         return response()->json(['success' => true] + $res);
     }

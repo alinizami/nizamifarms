@@ -566,7 +566,7 @@ document.getElementById('addProductForm').addEventListener('submit', function(e)
         if (data.success) {
             showMessage('success', data.message);
             document.getElementById('addProductForm').reset();
-            setTimeout(() => window.location.reload(), 1000);
+            offerRecount(data, function () { setTimeout(() => window.location.reload(), 1000); });
         } else {
             handleRefusal('', data);
         }
@@ -650,7 +650,7 @@ document.getElementById('editProductForm').addEventListener('submit', function(e
         if (data.success) {
             showMessage('success', data.message);
             closeEditModal();
-            setTimeout(() => window.location.reload(), 1000);
+            offerRecount(data, function () { setTimeout(() => window.location.reload(), 1000); });
         } else {
             handleRefusal('edit_', data);
         }
@@ -751,6 +751,39 @@ function deleteProduct(id) {
 }
 
 // Show Message
+/**
+ * 🧾↩ Oct-7: a save that SET or MOVED the ingredient tag may carry `recount` — the
+ * product's earlier bills that do not count towards the ingredient yet. Ask, in the
+ * numbers the server gave, and only then stamp them. `done` runs either way.
+ */
+function offerRecount(data, done) {
+    var rc = data && data.recount;
+    var product = data && data.product;
+    if (!rc || !product || !product.id) { done(); return; }
+    var lines = [];
+    if (rc.uncounted && rc.uncounted.n > 0) {
+        lines.push(rc.uncounted.n + ' earlier bill line(s) of "' + rc.product_name + '" (' + rc.uncounted.first
+            + (rc.uncounted.last !== rc.uncounted.first ? ' to ' + rc.uncounted.last : '') + ', Rs '
+            + Number(rc.uncounted.total).toLocaleString() + ') do not count towards ' + rc.ingredient_name + ' yet.');
+    }
+    if (rc.moved && rc.moved.n > 0) {
+        lines.push(rc.moved.n + ' line(s) (Rs ' + Number(rc.moved.total).toLocaleString() + ') currently count towards '
+            + rc.moved.from_name + '.');
+    }
+    lines.push('');
+    lines.push('OK = count them all towards ' + rc.ingredient_name + ' (price + stock).');
+    lines.push('Cancel = only bills from now on count.');
+    if (!window.confirm(lines.join('\n'))) { done(); return; }
+    fetch('/finance/vendors/' + vendorId + '/products/' + product.id + '/count-past-bills', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json', 'Accept': 'application/json', 'X-CSRF-TOKEN': '{{ csrf_token() }}'},
+        body: JSON.stringify({from_ingredient_id: rc.moved ? rc.moved.from_id : null, include_moved: rc.moved ? 1 : 0})
+    })
+    .then(function (r) { return r.json(); })
+    .then(function (d) { showMessage(d.success ? 'success' : 'error', d.message || ''); done(); })
+    .catch(function () { showMessage('error', 'Could not count the earlier bills.'); done(); });
+}
+
 function showMessage(type, message) {
     const container = document.getElementById('messageContainer');
     const bgColor = type === 'success' ? 'bg-green-50 border-green-200 text-green-800' : 'bg-red-50 border-red-200 text-red-800';

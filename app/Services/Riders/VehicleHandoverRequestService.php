@@ -61,6 +61,25 @@ class VehicleHandoverRequestService
         catch (\Throwable $e) { return false; }
     }
 
+    /**
+     * ⭐ ONE-STEP COMPANY → COMPANY SWAP (7-Oct-2026) — are its two columns there?
+     *
+     * A rider holding a company bike who asks for the van needs TWO readings: the bike's
+     * closing and the van's opening. Before `vehicle_handover_swap_oct2026.sql` the request
+     * had room for one, so it was refused ("pehle wapas karein…"). Uploaded before that SQL,
+     * this answers false and the old refusal stands, word for word.
+     */
+    public function swapReady(): bool
+    {
+        static $ok = null;
+        if ($ok !== null) return $ok;
+        try {
+            return $ok = $this->available()
+                && Schema::hasColumn(self::TABLE, 'swap_from_vehicle_id')
+                && Schema::hasColumn(self::TABLE, 'swap_from_meter');
+        } catch (\Throwable $e) { return $ok = false; }
+    }
+
     /** Is the meter PHOTO compulsory? Owner: optional now, possibly mandatory later. */
     public function photoRequired(): bool
     {
@@ -179,6 +198,10 @@ class VehicleHandoverRequestService
                 'give_back' => $svc->ownVehicleFor($userId),
                 'options'   => $out,
                 'photo_required' => $this->photoRequired(),
+                // ⭐ Additive (7-Oct): may he ask for a company machine while holding one, in ONE
+                //   request with two readings? The phone shows the second meter box only when
+                //   true — an older server, or this one before its SQL, keeps the old refusal.
+                'swap_ready' => $this->swapReady(),
             ];
         } catch (\Throwable $e) {
             Log::warning('handover options failed', ['user' => $userId, 'error' => $e->getMessage()]);
@@ -209,8 +232,15 @@ class VehicleHandoverRequestService
     // RAISE / CANCEL — the rider's side
     // =================================================================
 
+    /**
+     * @param ?int $closeMeter  7-Oct — the CLOSING reading of the company machine he is holding,
+     *                          used only on a company → company swap (see the block below). The
+     *                          other number, `$meterClaimed`, stays the reading of the machine
+     *                          this request is ABOUT, exactly as before.
+     */
     public function raise(int $userId, string $direction, int $vehicleId,
-                          ?int $meterClaimed, ?string $note, ?string $photoPath = null): array
+                          ?int $meterClaimed, ?string $note, ?string $photoPath = null,
+                          ?int $closeMeter = null): array
     {
         if (!$this->available()) return $this->fail('Handover requests are not set up on this server yet.');
 
@@ -229,10 +259,26 @@ class VehicleHandoverRequestService
 
             $holdingId = $res->currentVehicleFor($userId);
             $giveBack  = null;
+            // ⭐ 7-Oct: set only on a company → company swap (the machine he steps OFF + its reading).
+            $swapFrom  = null;
+            $swapMeter = null;
 
             if ($direction === self::DIR_TAKE) {
                 if ($holdingId && (int) $holdingId === $vehicleId) {
                     return $this->fail('You already have that machine.');
+                }
+                /**
+                 * ⚠ NO RIDER PROFILE ⇒ NOTHING CAN EVER BE ASSIGNED TO HIM. `VehicleService::assign()`
+                 *   refuses such a user, so a request from him would sit on the managers' banner with
+                 *   an Approve button that can only fail. Since 7-Oct the door is shown to EVERYONE
+                 *   holding nothing (owner ruling), so say it to him now, while he is asking, instead
+                 *   of to a manager hours later.
+                 */
+                if (!DB::table('t_ops_rider_profile')->where('user_id', $userId)->exists()) {
+                    return $this->fail(
+                        'Aap ka rider profile abhi nahi bana — is liye gaari aap ke naam nahi ho sakti. '
+                        . 'Office se kehein ke pehle profile bana dein.'
+                    );
                 }
                 // ⚠⚠ A PERSONAL machine can only be asked back by its OWNER (Sep-01
                 //   review finding) — the same first-keeper rule the picker applies,
@@ -295,20 +341,42 @@ class VehicleHandoverRequestService
             }
 
             /**
-             * ⚠ TWO COMPANY MACHINES IN ONE REQUEST — refused, deliberately. He holds a company
-             *   machine and is asking for ANOTHER one, so BOTH need a reading (one closing, one
-             *   opening) and this request carries a single meter box. Rather than guess which
-             *   number he typed, send him through the two moves that already exist, each with its
-             *   own reading. Rare: the everyday case (company machine → his own bike) is R4 above.
+             * ⭐⭐ TWO COMPANY MACHINES IN ONE REQUEST — the ONE-STEP SWAP (owner ruling, 7-Oct-2026).
+             *
+             * He holds a company machine and is asking for ANOTHER one (Waseem on EHP-676 asking for
+             * the van), so BOTH need a reading: the van's opening (`$meterClaimed`, checked just
+             * above) and the bike's closing (`$closeMeter`). Each number has its own box and its own
+             * column, so nothing is guessed.
+             *
+             * ⚠⚠ WHY IT COULD NOT STAY TWO REQUESTS. The old answer was "hand the bike back first,
+             *    then ask for the van". But after the first approval he holds NOTHING — and a rider
+             *    holding nothing had no door to ask with at all. A rider without his own bike was
+             *    therefore stuck exactly halfway, with no machine.
+             *
+             * ⚠ Before the SQL the request has nowhere to keep the second reading, so the old refusal
+             *   stands word for word. The everyday van → own-bike case is R4 above and is untouched.
              */
             if ($direction === self::DIR_TAKE && $holdingId
                 && (int) $holdingId !== $vehicleId
                 && $svc->isCompanyMachine((int) $holdingId)) {
                 $heldName = (new VehicleResolver())->labelFor((int) $holdingId);
-                return $this->fail(
-                    'Pehle ' . $heldName . ' wapas karein (us ka meter likh kar), phir ye machine lein — '
-                    . 'dono company ki hain, dono ki reading alag chahiye.'
-                );
+                if (!$this->swapReady()) {
+                    return $this->fail(
+                        'Pehle ' . $heldName . ' wapas karein (us ka meter likh kar), phir ye machine lein — '
+                        . 'dono company ki hain, dono ki reading alag chahiye.'
+                    );
+                }
+                if ($closeMeter === null || $closeMeter <= 0) {
+                    // ⚠ An APK older than this round has no second box and can never send it — so
+                    //   the sentence also keeps the old two-step route open for that phone.
+                    return $this->fail(
+                        $heldName . ' ka abhi ka meter bhi likhein — wo company ki hai, aur aap use '
+                        . 'isi waqt wapas kar rahe hain. (Purani app mein ye box nahi hai: pehle '
+                        . $heldName . ' wapas karein, phir ye machine maangein.)'
+                    ) + ['meter_missing' => 'close_meter'];
+                }
+                $swapFrom  = (int) $holdingId;
+                $swapMeter = $closeMeter;
             }
 
             // ⚠ ONE OPEN REQUEST PER RIDER — checked INSIDE a transaction with the
@@ -319,14 +387,15 @@ class VehicleHandoverRequestService
             //   row and is refused. An EXPIRED-but-pending old row deliberately does
             //   not block (same TTL rule the banner uses).
             $id = DB::transaction(function () use ($userId, $direction, $vehicleId, $giveBack,
-                                                   $meterClaimed, $photoPath, $note) {
+                                                   $meterClaimed, $photoPath, $note,
+                                                   $swapFrom, $swapMeter) {
                 $open = DB::table(self::TABLE)
                     ->where('user_id', $userId)->where('status', self::ST_PENDING)
                     ->where('requested_at', '>=', $this->ttlCutoff())
                     ->lockForUpdate()->exists();
                 if ($open) return null;
 
-                return (int) DB::table(self::TABLE)->insertGetId([
+                $row = [
                     'user_id'              => $userId,
                     'direction'            => $direction,
                     'vehicle_id'           => $vehicleId,
@@ -338,7 +407,13 @@ class VehicleHandoverRequestService
                     'requested_at'         => now(),
                     'created_at'           => now(),
                     'updated_at'           => now(),
-                ]);
+                ];
+                // Only a swap writes these — and a swap only exists once swapReady() is true.
+                if ($swapFrom !== null) {
+                    $row['swap_from_vehicle_id'] = $swapFrom;
+                    $row['swap_from_meter']      = $swapMeter;
+                }
+                return (int) DB::table(self::TABLE)->insertGetId($row);
             });
             if ($id === null) {
                 return $this->fail('You already have a handover request waiting for approval.');
@@ -347,6 +422,7 @@ class VehicleHandoverRequestService
             Log::info('Vehicle handover requested', [
                 'id' => $id, 'user' => $userId, 'direction' => $direction,
                 'vehicle' => $vehicleId, 'meter' => $meterClaimed,
+                'swap_from' => $swapFrom, 'swap_meter' => $swapMeter,
             ]);
 
             // 🔔 TELL THE PEOPLE WHO CAN ANSWER IT. A banner needs somebody to be
@@ -357,6 +433,11 @@ class VehicleHandoverRequestService
             try {
                 $riderName = DB::table('t_sys_user')->where('id', $userId)->value('fullname') ?: 'A rider';
                 $vName = (new VehicleResolver())->labelFor($vehicleId) ?: 'a vehicle';
+                // A swap names BOTH machines in the push, so the manager knows before opening
+                // anything that approving also takes a bike back.
+                if ($swapFrom !== null) {
+                    $vName .= ' (handing back ' . ((new VehicleResolver())->labelFor($swapFrom) ?: 'his bike') . ')';
+                }
                 app()->terminating(function () use ($id, $riderName, $direction, $vName, $userId) {
                     try {
                         app(\App\Services\FirebaseService::class)
@@ -476,6 +557,16 @@ class VehicleHandoverRequestService
             'give_back_vehicle_id' => $r->give_back_vehicle_id ? (int) $r->give_back_vehicle_id : null,
             'give_back_name'=> $r->give_back_vehicle_id ? $res->labelFor((int) $r->give_back_vehicle_id) : null,
             'meter_claimed' => $r->meter_claimed !== null ? (int) $r->meter_claimed : null,
+            // ⭐ 7-Oct — a company → company SWAP: the machine he hands back in the same move, and
+            //   its closing reading. Null on every other request (and before the SQL, when the
+            //   row has no such columns at all — hence property_exists, not `??`, so a real NULL
+            //   and a missing column read the same).
+            'swap_from_vehicle_id' => property_exists($r, 'swap_from_vehicle_id') && $r->swap_from_vehicle_id
+                ? (int) $r->swap_from_vehicle_id : null,
+            'swap_from_name'       => property_exists($r, 'swap_from_vehicle_id') && $r->swap_from_vehicle_id
+                ? $res->labelFor((int) $r->swap_from_vehicle_id) : null,
+            'swap_from_meter'      => property_exists($r, 'swap_from_meter') && $r->swap_from_meter !== null
+                ? (int) $r->swap_from_meter : null,
             // ⚠ /public-storage, NOT asset('storage/…') (Sep-01 review finding): the
             //   public/storage symlink is unreliable on the stackcp deploy (two repair
             //   scripts exist in public/ because of it), so every photo on this server
@@ -532,6 +623,15 @@ class VehicleHandoverRequestService
                     }
                 } catch (\Throwable $e) { /* no hint is fine */ }
             }
+            // …and the same advice for the swap's second reading, against ITS machine.
+            $out['swap_meter_hint'] = null;
+            if ($out['swap_from_vehicle_id'] && $out['swap_from_meter'] !== null) {
+                try {
+                    if (!$svc->readingPlausibleFor($out['swap_from_vehicle_id'], $out['swap_from_meter'])) {
+                        $out['swap_meter_hint'] = 'The hand-back reading looks far from that machine\'s last known odometer — worth a second look.';
+                    }
+                } catch (\Throwable $e) { /* no hint is fine */ }
+            }
         }
 
         return $out;
@@ -549,7 +649,10 @@ class VehicleHandoverRequestService
      *                         management team must be able to change this)
      *   give_back_none        true = he gets nothing back, explicitly
      *   meter                 corrected odometer
-     *   displaced_action      what happens to the man losing the machine
+     *   close_meter           7-Oct: the closing reading of the company machine he steps OFF on a
+     *                         take (overrides the swap's stored one, or supplies it when he
+     *                         picked up a company machine after he asked)
+     *   displaced_action     what happens to the man losing the machine
      *   displaced_vehicle_id  …and onto which machine
      *   note                  free text recorded against the decision
      *
@@ -637,7 +740,7 @@ class VehicleHandoverRequestService
                     $svc->meterRequiredMessage((int) $r->vehicle_id,
                         $direction === self::DIR_RETURN ? 'closing' : 'opening')
                     . ' Type it in the meter box on this request before approving.'
-                ) + ['meter_missing' => 'meter'];
+                ) + ['meter_missing' => 'meter', 'meter_vehicle_id' => (int) $r->vehicle_id];
             }
 
             // ⚠ CLAIM THE REQUEST FIRST. If the machine moved and only THEN we tried to
@@ -655,23 +758,68 @@ class VehicleHandoverRequestService
             $extraNote = '';
 
             if ($direction === self::DIR_TAKE) {
+                /**
+                 * ⭐⭐ THE MACHINE HE STEPS OFF — ITS CLOSING READING (7-Oct-2026 swap).
+                 *
+                 * `assign()` step 3 closes whatever else he holds, and R3 demands that machine's
+                 * closing reading when it is a company one. Which number:
+                 *   1. the approver's `close_meter`, when typed — a correction, or the answer to
+                 *      "he picked up a company bike AFTER he asked";
+                 *   2. else the swap's stored reading — but ONLY while he still holds THAT machine.
+                 *      If the world moved (someone took the bike off him in between), the stored
+                 *      number is of a machine he no longer has, and must never be written onto
+                 *      whatever he holds now. assign() then asks for the right one by name.
+                 */
+                $vacatedMeter = null;
+                if (isset($over['close_meter']) && (int) $over['close_meter'] > 0) {
+                    $vacatedMeter = (int) $over['close_meter'];
+                } elseif (property_exists($r, 'swap_from_vehicle_id') && $r->swap_from_vehicle_id
+                          && $r->swap_from_meter !== null && (int) $r->swap_from_meter > 0) {
+                    $swapKeeper = $svc->keeperOf((int) $r->swap_from_vehicle_id);
+                    if ($swapKeeper && (int) $swapKeeper->user_id === (int) $r->user_id) {
+                        $vacatedMeter = (int) $r->swap_from_meter;
+                    }
+                }
+                // ⚠ WHAT HE IS ACTUALLY STEPPING OFF, read before the move — which is not always
+                //   the request's `swap_from` (the approver's `close_meter` may be for a machine he
+                //   was put on after asking). The outcome sentence and the push name THIS one.
+                $steppingOff = null;
+                if ($vacatedMeter !== null) {
+                    $held = $res->currentVehicleFor((int) $r->user_id);
+                    if ($held && (int) $held !== (int) $r->vehicle_id && $svc->isCompanyMachine((int) $held)) {
+                        $steppingOff = (int) $held;
+                    }
+                }
+
                 // The machine goes to him. `assign()` closes the previous keeper's row
                 // AND his own other open row (his bike goes spare) — one call, the same
                 // one the web screen makes.
                 // ⚠ settle-follows = true: the displaced man's ride-home timer is
                 //   judged AFTER settleDisplaced() places him, below.
                 $result = $svc->assign((int) $r->vehicle_id, (int) $r->user_id, $today, $actorId,
-                                       'Rider request #' . $id, $meter, true);
+                                       'Rider request #' . $id, $meter, true, $vacatedMeter);
                 if (!($result['ok'] ?? false)) {
                     DB::table(self::TABLE)->where('id', $id)->update([
                         'status' => self::ST_PENDING, 'decided_by' => null, 'decided_at' => null,
                         'decision_note' => 'Approval failed: ' . ($result['message'] ?? 'unknown'),
                         'updated_at' => now(),
                     ]);
-                    return $this->fail($result['message'] ?? 'Could not hand that machine over.');
+                    // ⭐ Say WHICH box the approver must fill, in this request's own words:
+                    //   assign()'s `handover_meter` is this request's `meter`, its `vacated_meter`
+                    //   is `close_meter`. The banners re-ask for that one number and retry.
+                    $missing = ['handover_meter' => 'meter', 'vacated_meter' => 'close_meter'][$result['meter_missing'] ?? ''] ?? null;
+                    return $this->fail($result['message'] ?? 'Could not hand that machine over.')
+                        + ($missing ? ['meter_missing' => $missing,
+                                       'meter_vehicle_id' => $result['meter_vehicle_id'] ?? null] : []);
                 }
                 $extraNote = $this->settleDisplaced($svc, $result['displaced_user_id'] ?? null,
                                                     $over, (int) $r->vehicle_id, $today, $actorId);
+                // The swap's other half, in the outcome sentence — assign() already closed that
+                // machine and wrote its reading (step 3 + R3); this only SAYS it happened.
+                if ($steppingOff !== null) {
+                    $extraNote .= ' ' . ($res->labelFor($steppingOff) ?: 'His bike')
+                        . ' handed back at ' . number_format($vacatedMeter) . '.';
+                }
                 if (!empty($result['displaced_user_id'])) {
                     $svc->disarmIdleHomeJourney((int) $result['displaced_user_id']);
                 }
@@ -794,7 +942,9 @@ class VehicleHandoverRequestService
             //    machine he thinks he still has. His card updates on its own poll
             //    within 30s; this is what reaches him when the app is closed.
             $this->pushDecision((int) $r->user_id, true, (string) $r->direction,
-                                $res->labelFor((int) $r->vehicle_id) ?: 'the vehicle');
+                                $res->labelFor((int) $r->vehicle_id) ?: 'the vehicle', null,
+                                // a swap tells him BOTH halves — he must stop riding the bike too
+                                !empty($steppingOff) ? ($res->labelFor((int) $steppingOff) ?: null) : null);
 
             return ['ok' => true, 'request' => $this->find($id),
                     'message' => trim(($result['message'] ?? 'Done.') . $extraNote)];
@@ -807,18 +957,22 @@ class VehicleHandoverRequestService
     /** Tell the rider his request was answered. Deferred + try-wrapped: a decision
      *  that is already recorded must never fail because a push did. */
     private function pushDecision(int $riderId, bool $approved, string $direction,
-                                  string $vehicleName, ?string $why = null): void
+                                  string $vehicleName, ?string $why = null,
+                                  ?string $handedBack = null): void
     {
         try {
-            app()->terminating(function () use ($riderId, $approved, $direction, $vehicleName, $why) {
+            app()->terminating(function () use ($riderId, $approved, $direction, $vehicleName, $why, $handedBack) {
                 try {
                     // 🗣 Roman Urdu — this is the rider's own answer, and it tells him which
                     // machine to ride tomorrow (owner ruling). $why is the manager's typed
                     // reason and is passed through exactly as he wrote it.
+                    // ⭐ $handedBack (7-Oct swap): the company machine that left him in the same move.
                     $body = $approved
                         ? ($direction === self::DIR_RETURN
                             ? "Aap ne {$vehicleName} wapas kar di hai."
-                            : "{$vehicleName} ab aap ki hai — meter hamesha ki tarah daal dein.")
+                            : ($handedBack
+                                ? "{$vehicleName} ab aap ki hai aur {$handedBack} wapas ho gayi — meter hamesha ki tarah daal dein."
+                                : "{$vehicleName} ab aap ki hai — meter hamesha ki tarah daal dein."))
                         : ("{$vehicleName} ki request manzoor nahi hui."
                             . ($why ? ' ' . $why : ' Apni maujooda bike hi istemal karte rahein.'));
                     app(\App\Services\FirebaseService::class)->notifyUser($riderId, [

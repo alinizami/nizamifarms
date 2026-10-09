@@ -82,6 +82,16 @@
     }
     if(r.meter_claimed != null){ line += ' · meter <strong>' + esc(num(r.meter_claimed)) + '</strong>'; }
     if(at){ line += ' · ' + esc(at); }
+    // ⭐ 7-Oct — a company → company SWAP: approving also takes his current company machine
+    //   back, at the reading he typed. Said on the card so it is read before the tap.
+    if(!isReturn && r.swap_from_name){
+      line += '<br><span style="opacity:.85;">He hands back: <strong>' + esc(r.swap_from_name) + '</strong>'
+           + (r.swap_from_meter != null ? ' · meter <strong>' + esc(num(r.swap_from_meter)) + '</strong>' : '')
+           + '</span>';
+      if(r.swap_meter_hint){
+        line += '<br><span style="color:#b45309;">⚠ ' + esc(r.swap_meter_hint) + '</span>';
+      }
+    }
     if(r.note){ line += '<br><span style="opacity:.85;">“' + esc(r.note) + '”</span>'; }
     if(r.meter_hint){
       line += '<br><span style="color:#b45309;">⚠ ' + esc(r.meter_hint) + '</span>';
@@ -225,6 +235,27 @@
       .then(function(r){ return r.json(); })
       .then(function(d){
         busy = false;
+        /**
+         * ⭐ 7-Oct — A MISSING READING IS A QUESTION, NOT A DEAD END. The server names the one
+         *   box it needs (`meter` = the machine he is asking about, `close_meter` = the company
+         *   machine he steps off). Ask for that number and send the SAME decision again — the
+         *   request was put back to pending, so nothing has moved yet.
+         */
+        if(d && !d.success && (d.meter_missing === 'meter' || d.meter_missing === 'close_meter')){
+          var typed = prompt((d.message || 'A meter reading is needed.') + '\n\nType the reading to approve:');
+          if(typed !== null){
+            var n = parseInt(String(typed).replace(/[^0-9]/g, ''), 10);
+            if(n > 0){
+              var again = {};
+              for(var k in (body || {})){ if(Object.prototype.hasOwnProperty.call(body, k)) again[k] = body[k]; }
+              again[d.meter_missing] = n;
+              return act(url, again, btn, failMsg);
+            }
+          }
+          if(btn){ btn.disabled = false; btn.style.opacity = '1'; }
+          poll();
+          return;
+        }
         if(!d || !d.success){ alert(failMsg + (d && d.message ? ': ' + d.message : '')); }
         else if(d.message){ /* the outcome sentence is worth seeing — it says what moved */
           if(/could not|somebody else|no machine/i.test(d.message)) alert(d.message);

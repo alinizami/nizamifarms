@@ -1634,6 +1634,9 @@ Route::middleware(['auth'])->group(function () {
             Route::post('/{vendorId}/products/{productId}/toggle', [\App\Http\Controllers\FIN\VendorProductController::class, 'toggleStatus'])->name('products.toggle');
             Route::post('/{vendorId}/products/{productId}/set-default', [\App\Http\Controllers\FIN\VendorProductController::class, 'setAsDefault'])->name('products.set-default');
             Route::delete('/{vendorId}/products/{productId}', [\App\Http\Controllers\FIN\VendorProductController::class, 'destroy'])->name('products.delete');
+            // 🧾↩ Oct-7: count a product's earlier bills after it is tagged (opt-in) / drop a tag.
+            Route::post('/{vendorId}/products/{productId}/count-past-bills', [\App\Http\Controllers\FIN\VendorProductController::class, 'countPastBills'])->name('products.count-past-bills');
+            Route::post('/{vendorId}/products/{productId}/unlink-ingredient', [\App\Http\Controllers\FIN\VendorProductController::class, 'unlinkIngredient'])->name('products.unlink-ingredient');
         });
 
         // Asset Management Routes

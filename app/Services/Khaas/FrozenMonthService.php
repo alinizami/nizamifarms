@@ -987,6 +987,11 @@ class FrozenMonthService
                 // One-time is deliberately OUT of the per-pack maths: building
                 // a kitchen is not a cost of the packs made that month.
                 'all_in_per_pack'  => $made > 0 ? round(($product + $fixed) / $made, 2) : 0.0,
+                // ⭐ Oct-7 (owner): still OUT of all_in_per_pack, but SHOWN as a divider —
+                //   "if this month's one-time spend were spread over this month's packs, it
+                //   would be Rs X a pack" — so the maths is visible, not hidden.
+                'one_time_per_pack' => $made > 0 ? round($oneTime / $made, 2) : 0.0,
+                'all_in_with_one_time_per_pack' => $made > 0 ? round(($product + $fixed + $oneTime) / $made, 2) : 0.0,
                 'margin_per_pack'  => round($margin, 2),
                 // Packs needed to cover the fixed base at this month's prices
                 // and product cost. Meaningless when a pack loses money before

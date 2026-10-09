@@ -205,7 +205,15 @@
             <div class="mr-tile mr-t-onetime">
                 <p class="mr-lab">One-time cost</p>
                 <p class="mr-big">Rs {{ number_format($h['one_time']) }}</p>
-                <p class="mr-tile-sub">kept out of the per-pack figures</p>
+                {{-- ⭐ Oct-7: shown as a divider, still out of the per-pack total --}}
+                <p class="mr-tile-sub">
+                    @if(($h['one_time'] ?? 0) > 0 && $made > 0)
+                        Rs {{ number_format($h['one_time_per_pack'] ?? 0) }} per pack if spread over this month ·
+                        Rs {{ number_format($h['all_in_with_one_time_per_pack'] ?? 0) }} all-in with it
+                    @else
+                        kept out of the per-pack figures
+                    @endif
+                </p>
             </div>
             @if($h['unclassified'] > 0)
                 <div class="mr-tile mr-t-unknown">

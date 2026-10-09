@@ -397,6 +397,12 @@ class IngredientPriceService
                 ->whereIn('l.approval_status', self::POSTED_STATUSES)
                 ->where('l.transaction_date', '>=', now()->subDays(self::LOOKBACK_DAYS)->toDateString())
                 ->where('i.created_at', '<', self::LEGACY_BEFORE)
+                // ⭐ Oct-7: ONE rule with the recipe's "Linked now" list (RecipeService::catalogueLinks),
+                //   which shows only ACTIVE products. Qasim switched the Tazo product off on 6-Oct
+                //   and the list dropped it, but its tag kept pricing Cheese from a July bill —
+                //   a product that is off borrows nothing. Stamped lines are untouched: they
+                //   are the fact of their day, not a borrowed tag.
+                ->where('vp.is_active', 1)
                 ->whereNull('i.ingredient_id')
                 ->whereIn('vp.ingredient_id', $ids)
                 ->where('vp.pack_qty_base', '>', 0)

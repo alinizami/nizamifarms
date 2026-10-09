@@ -990,6 +990,10 @@ Route::middleware('auth:sanctum')->group(function () {
         Route::post('/{vendorId}/products/{productId}/toggle', [\App\Http\Controllers\FIN\VendorProductController::class, 'toggleStatus']);
         Route::post('/{vendorId}/products/{productId}/set-default', [\App\Http\Controllers\FIN\VendorProductController::class, 'setAsDefault']);
         Route::delete('/{vendorId}/products/{productId}', [\App\Http\Controllers\FIN\VendorProductController::class, 'destroy']);
+        // 🧾↩ Oct-7: a tag set today may count the product's EARLIER bills (the person
+        //    accepts the numbers first), and a link can be removed on its own.
+        Route::post('/{vendorId}/products/{productId}/count-past-bills', [\App\Http\Controllers\FIN\VendorProductController::class, 'countPastBills']);
+        Route::post('/{vendorId}/products/{productId}/unlink-ingredient', [\App\Http\Controllers\FIN\VendorProductController::class, 'unlinkIngredient']);
     });
 
     // Ledger transaction details (used by mobile vendor view - mirrors web route)

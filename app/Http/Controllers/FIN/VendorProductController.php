@@ -282,7 +282,10 @@ class VendorProductController extends Controller
             return response()->json([
                 'success' => true,
                 'message' => 'Product added successfully!',
-                'product' => $product
+                'product' => $product,
+                // 🧾↩ A brand-new product has no bills, so this is null — the key is kept so
+                //    every client reads one shape.
+                'recount' => $this->recountOffer($product, null),
             ]);
 
         } catch (\Exception $e) {
@@ -316,6 +319,9 @@ class VendorProductController extends Controller
         $request->merge(['unit' => $unit]);
         $this->refuseUnitChangeWithHistory($product, $unit, $request);
         $ingredientFields = $this->ingredientFields($request, $product, $vendorId);
+        // 🧾↩ The tag as it stood BEFORE this edit: a tag that moved from one ingredient to
+        //    another leaves earlier lines stamped with the old one, and the offer below says so.
+        $previousTag = (int) $product->ingredient_id ?: null;
 
         try {
             // If this is being set as default, unset any existing defaults
@@ -343,7 +349,10 @@ class VendorProductController extends Controller
             return response()->json([
                 'success' => true,
                 'message' => 'Product updated successfully!',
-                'product' => $product
+                'product' => $product,
+                // 🧾↩ Only when the tag was SET or MOVED by this edit, and only if earlier
+                //    bills would change: what they are, in numbers, for the person to accept.
+                'recount' => $this->recountOffer($product->fresh(), $previousTag),
             ]);
 
         } catch (\Exception $e) {
@@ -354,6 +363,144 @@ class VendorProductController extends Controller
                 'message' => 'Error updating product: ' . $e->getMessage()
             ], 500);
         }
+    }
+
+    // =================================================================
+    //  🧾↩ Oct-2026 — EARLIER BILLS of a product that was tagged (or re-tagged) today
+    // =================================================================
+
+    /**
+     * The offer that rides on a save: "this product has N earlier bills (Rs X) that do
+     * not count towards <ingredient> — count them?" Null when there is nothing to say.
+     * Preview only; nothing is written until countPastBills() is called.
+     */
+    private function recountOffer(?VendorProductModel $product, ?int $previousTag): ?array
+    {
+        if (!$product || !$product->ingredient_id) {
+            return null;
+        }
+        if ($previousTag && (int) $previousTag === (int) $product->ingredient_id) {
+            // The tag did not change on this save — the old bills are whatever they were.
+            return null;
+        }
+        try {
+            return (new \App\Services\Khaas\PurchaseLineRestamp())->preview($product, $previousTag);
+        } catch (\Throwable $e) {
+            Log::warning('Vendor product: recount preview failed', ['product_id' => $product->id, 'error' => $e->getMessage()]);
+            return null;
+        }
+    }
+
+    /**
+     * Who may rewrite which ingredient a bill line counts towards: the same people who
+     * may edit the bill itself (VendorController::canChangeVendorTransaction) — the
+     * vendor-transactions key, or Frozen mode on a Frozen vendor.
+     */
+    private function canRestamp(VendorModel $vendor): bool
+    {
+        $user = auth()->user();
+        if (!$user) {
+            return false;
+        }
+        if ($user->hasMobilePermission('manage_vendor_transactions')) {
+            return true;
+        }
+        return (int) $vendor->business_unit_id === self::FROZEN_BU && $user->hasMobilePermission('access_khaas_mode');
+    }
+
+    /**
+     * POST /vendors/{vendorId}/products/{productId}/count-past-bills
+     *   from_ingredient_id (optional) — the tag this product carried before, so lines
+     *                                   stamped with it are moved too when include_moved=1
+     *   include_moved (optional, 0/1)
+     *
+     * Stamps the product's earlier lines with its CURRENT tag. The person saw the
+     * numbers (the `recount` on the save) and said yes.
+     */
+    public function countPastBills(Request $request, $vendorId, $productId)
+    {
+        $vendor  = VendorModel::findOrFail($vendorId);
+        $product = VendorProductModel::where('vendor_id', $vendorId)->findOrFail($productId);
+
+        if (!$this->canRestamp($vendor)) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Purane bills badalne ki ijazat nahi hai. Taimur ya Shabib se kehein.',
+            ], 403);
+        }
+        if (!$product->ingredient_id || (float) $product->pack_qty_base <= 0) {
+            return response()->json([
+                'success' => false,
+                'message' => "{$product->product_name} kisi ingredient se linked nahi hai, is liye purane bills ginay nahi ja sakte.",
+            ], 422);
+        }
+
+        $from    = (int) $request->input('from_ingredient_id') ?: null;
+        $moved   = (bool) $request->boolean('include_moved');
+        $service = new \App\Services\Khaas\PurchaseLineRestamp();
+        $done    = $service->apply($product, $from, $moved);
+        $n       = $done['uncounted'] + $done['moved'];
+
+        $ingredient = \App\Models\Khaas\IngredientModel::find($product->ingredient_id);
+        $name = $ingredient->name ?? 'ingredient';
+
+        return response()->json([
+            'success' => true,
+            'done'    => $done,
+            'message' => $n > 0
+                ? sprintf('%d purane bill ab %s mein gin rahe hain. Recipe ki qeemat aur stock ab inhe shamil karte hain.', $n, $name)
+                : 'Koi purana bill nahi tha jo ginna baaki ho.',
+        ]);
+    }
+
+    /**
+     * POST /vendors/{vendorId}/products/{productId}/unlink-ingredient
+     *
+     * Stop this product counting towards its ingredient. Just the tag — name, unit,
+     * rate, category and the on/off state are untouched, and bills already stamped
+     * keep their stamp (they are the fact of their day). From now on no bill of this
+     * product prices or stocks that ingredient, and the recipe's "Linked now" drops it.
+     */
+    public function unlinkIngredient(Request $request, $vendorId, $productId)
+    {
+        $vendor  = VendorModel::findOrFail($vendorId);
+        $product = VendorProductModel::where('vendor_id', $vendorId)->findOrFail($productId);
+
+        if (!$this->canRestamp($vendor)) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Link hatane ki ijazat nahi hai. Taimur ya Shabib se kehein.',
+            ], 403);
+        }
+        if (!$product->ingredient_id) {
+            return response()->json([
+                'success' => true,
+                'product' => $product,
+                'message' => "{$product->product_name} pehle se kisi ingredient se linked nahi hai.",
+            ]);
+        }
+
+        $ingredient = \App\Models\Khaas\IngredientModel::find($product->ingredient_id);
+        $name = $ingredient->name ?? 'ingredient';
+        $old  = (int) $product->ingredient_id;
+
+        $product->update(['ingredient_id' => null, 'pack_qty_base' => null]);
+
+        try {
+            \App\Services\AuditLogger::log(
+                'ingredient_unlinked', 'vendor_product', (int) $product->id, $product->product_name,
+                ['ingredient_id' => ['old' => $old, 'new' => null]]
+            );
+        } catch (\Throwable $e) {
+            // audit is a nicety
+        }
+
+        return response()->json([
+            'success' => true,
+            'product' => $product->fresh(),
+            'message' => sprintf('Link hat gaya. %s ab %s mein nahi ginega. Purane bills jaise the waise hi rahenge.',
+                $product->product_name, $name),
+        ]);
     }
 
     /**
