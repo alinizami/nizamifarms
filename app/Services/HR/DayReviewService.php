@@ -550,7 +550,23 @@ class DayReviewService
             // Held: item() asks once per queue card, and building PayrollService is not free.
             static $payroll = null;
             $payroll = $payroll ?? app(PayrollService::class);
-            return $payroll->payProcessedNote($userId, $date);
+            $note = $payroll->payProcessedNote($userId, $date);
+            // ⏱ Time bank (Oct-2026): a decided month is never reopened by a day change — the
+            // difference counts in the next open month automatically ("drift"). Say so.
+            $tbNote = null;
+            try {
+                $tb = new TimeBankService();
+                $m = substr($date, 0, 7);
+                if ($tb->covers($userId, $m)) {
+                    if ($tb->isSettled($userId, $m)) {
+                        $tbNote = date('F', strtotime($m . '-01')) . ' late & extra is already decided — this change is added to the next open month automatically.';
+                    }
+                }
+            } catch (\Throwable $e) { $tbNote = null; }
+            if ($tbNote !== null) {
+                return $note !== null ? $note . ' ' . $tbNote : $tbNote;
+            }
+            return $note;
         } catch (\Throwable $e) {
             return null;
         }

@@ -121,22 +121,30 @@ class ShiftAssignedHandler implements AutomationHandler
         // location → rider default → primary). Shown in the same {{2}} variable.
         $uid = (int) ($row->user_id ?? 0);
         $date = $row->effective_from ? $row->effective_from->format('Y-m-d') : now()->format('Y-m-d');
+        // 🔁 Weekly days (Oct-2026). The start date may itself be a weekly day, whose place
+        //   is not this row's — so with weekly days, name the ROW's own place.
+        $weekly = \App\Services\Ops\WeekdayPattern::parse($row->day_pattern ?? null);
         $loc = null;
         try {
-            $loc = (new \App\Services\ShiftResolutionService())->getUserShift($uid, $date)['location_name'] ?? null;
+            $svc = new \App\Services\ShiftResolutionService();
+            $loc = $weekly
+                ? ($svc->locationFor($uid, $row->location_id ? (int) $row->location_id : null)['location_name'] ?? null)
+                : ($svc->getUserShift($uid, $date)['location_name'] ?? null);
         } catch (\Throwable $e) { /* location optional */ }
         if ($loc) {
             $base .= ' at ' . $loc;
         }
+        // ⚠ ONE line — a WhatsApp template variable may not contain a newline or a tab.
+        $weeklyTxt = $weekly ? ' (weekly days: ' . \App\Services\Ops\WeekdayPattern::summary($weekly) . ')' : '';
 
         $from = $row->effective_from ? $row->effective_from->format('D j M') : null;
         $to = $row->effective_to ? $row->effective_to->format('D j M') : null;
         if ($row->effective_to) { // bounded / temporary
             if ($from === $to) {
-                return $base . ($to ? ' — ' . $to : '');
+                return $base . ($to ? ' — ' . $to : '') . $weeklyTxt;
             }
-            return $base . ' — ' . $from . ' to ' . $to;
+            return $base . ' — ' . $from . ' to ' . $to . $weeklyTxt;
         }
-        return $base . ($from ? ' — from ' . $from : '');
+        return $base . ($from ? ' — from ' . $from : '') . $weeklyTxt;
     }
 }

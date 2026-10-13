@@ -1130,9 +1130,8 @@ class EmployeeCashController extends Controller
         ];
 
         // Get expense categories for the dropdown
-        $expenseCategories = \App\Models\FIN\ConfigModel::where('config_key', 'LIKE', 'EXPENSE_CATEGORY_%')
-            ->pluck('config_value')
-            ->toArray();
+        // Oct-2026: the one expense-type engine — active types only, Taimur's order.
+        $expenseCategories = \App\Services\FIN\ExpenseTypeService::names(1, 'expense');
 
         // ⭐ Banks for the Company Transfer modal's "Which bank?" picker (Ledger L1, B1).
         // Same shape the Transfer page uses (id/name/short_code/color + computed balance).
@@ -1611,6 +1610,11 @@ class EmployeeCashController extends Controller
             'invoice_ids.*' => 'exists:t_fin_ledger,id',
             'expense_category' => 'nullable|string|max:100' // Optional - only required if there's shortage
         ]);
+
+        // ⭐ Oct-2026 Expense Types: refuse an inactive type, map an old name (ExpenseTypeService).
+        if ($typeRefusal = $this->expenseTypeRefusal($request)) {
+            return $typeRefusal;
+        }
 
         try {
             DB::beginTransaction();
@@ -3437,6 +3441,12 @@ class EmployeeCashController extends Controller
             'payment_source_account_id' => 'nullable|exists:t_fin_accounts,id'
         ]);
 
+        // ⭐ Oct-2026 Expense Types: refuse an inactive type, map an old name (ExpenseTypeService).
+        if ($typeRefusal = $this->expenseTypeRefusal($request)) {
+            return $typeRefusal;
+        }
+        $validated['expense_category'] = $request->input('expense_category');
+
         try {
             DB::beginTransaction();
 
@@ -3638,6 +3648,11 @@ class EmployeeCashController extends Controller
             'receiving_account_id' => 'nullable|integer|exists:t_fin_online_receiving_accounts,id',
         ]);
 
+        // ⭐ Oct-2026 Expense Types: refuse an inactive type, map an old name (ExpenseTypeService).
+        if ($typeRefusal = $this->expenseTypeRefusal($request)) {
+            return $typeRefusal;
+        }
+
         try {
             DB::beginTransaction();
 
@@ -3804,5 +3819,28 @@ class EmployeeCashController extends Controller
             return redirect()->back()->with('error', 'Failed to record transfer: ' . $e->getMessage());
         }
     }
-}
 
+    /**
+     * Oct-2026 Expense Types guard for the employee-cash doors: an INACTIVE expense type is
+     * refused; an old (renamed / merged) name is swapped for the current one in the request.
+     * Unknown text passes untouched, exactly as before.
+     */
+    private function expenseTypeRefusal(Request $request)
+    {
+        $name = $request->input('expense_category');
+        if ($name === null || trim((string) $name) === '') {
+            return null;
+        }
+        $check = \App\Services\FIN\ExpenseTypeService::checkForWrite((string) $name, $request->input('business_unit_id', 1));
+        if (!$check['ok']) {
+            if ($request->wantsJson() || $request->ajax() || $request->is('api/*')) {
+                return response()->json(['success' => false, 'message' => $check['message']], 422);
+            }
+            return redirect()->back()->withInput()->with('error', $check['message']);
+        }
+        if ($check['name'] !== $name) {
+            $request->merge(['expense_category' => $check['name']]);
+        }
+        return null;
+    }
+}

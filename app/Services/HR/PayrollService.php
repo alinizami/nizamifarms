@@ -347,10 +347,17 @@ class PayrollService
         $dec = $this->leaveDecisions($month)[$uid] ?? [];
         $out = [];
 
+        // ⏱ A time-bank month has ONE item instead of the separate overtime + late ones.
+        $tb = $row['time_bank'] ?? null;
+        if ($tb !== null) {
+            $item = $this->timeBankAction($tb);
+            if ($item !== null) { $out[] = $item; }
+        }
+
         // ── Overtime → whole bonus days (the divisor lives in OvertimeService).
         $otRec = (int) $row['bonus_leaves'];
         $otMin = (int) $row['overtime_minutes'];
-        if ($otRec > 0 || isset($dec['overtime'])) {
+        if ($tb === null && ($otRec > 0 || isset($dec['overtime']))) {
             $per = $this->ot->minutesPerBonusDay();
             // ⭐ The formula MUST read the same carry the grid and the employee tab read.
             // It used to end "left over (not carried forward)" — true before Sep-2026 and a
@@ -396,7 +403,7 @@ class PayrollService
         // The RAW recommendation, so a settled month still shows what the rule asked for.
         $lateRec = (int) ($row['late_leave_recommended'] ?? $row['late_leave_deduct']);
         $lateMin = (int) $row['late_minutes'];
-        if ($lateRec > 0 || isset($dec['late_penalty'])) {
+        if ($tb === null && ($lateRec > 0 || isset($dec['late_penalty']))) {
             $buf = (int) $row['late_buffer_min'];
             $step = (int) $row['late_step_min'];
             $out[] = $this->leaveActionShape('late_penalty', $lateRec, $dec['late_penalty'] ?? null, [
@@ -471,6 +478,40 @@ class PayrollService
     }
 
     /**
+     * ⏱ The time-bank statement as a leave-action item. The rich card (web partial, phone
+     * TimeBankCard) reads `statement`; the generic fields (headline/basis/formula/choices) are
+     * what an OLD phone build renders — its single button confirms the engine's suggestion.
+     */
+    private function timeBankAction(array $tb): ?array
+    {
+        $status = $tb['status'] ?? '';
+        if (!in_array($status, ['pending', 'decided'], true)) { return null; }
+        $decided = $status === 'decided';
+        return [
+            'kind'             => 'time_bank',
+            'recommended_days' => 0,
+            'status'           => $decided ? 'applied' : 'pending',
+            'applied_days'     => null,
+            'decided_by'       => $tb['decision']['by'] ?? null,
+            'decided_at'       => $tb['decision']['at'] ?? null,
+            'current_choice'   => $decided ? 'apply' : null,
+            'choices'          => [
+                ['value' => 'apply', 'label' => 'Confirm suggested', 'tone' => 'good',
+                 'hint' => 'leave first, the rest moves to next month — more choices on the web'],
+            ],
+            'decided_label'    => $decided ? (string) $tb['chip'] : '',
+            'decided_tone'     => $decided ? 'good' : 'muted',
+            'changed'          => false,
+            'headline'         => (string) ($tb['chip'] ?? ''),
+            'basis'            => implode(' · ', $tb['lines'] ?? []),
+            'formula'          => (string) ($tb['result'] ?? ''),
+            'drill'            => 'month_late',
+            'minutes'          => (int) ($tb['late']['total'] ?? 0),
+            'statement'        => $tb,
+        ];
+    }
+
+    /**
      * The whole month's leave actions — the payload behind the Leave-actions card, the
      * review panel, and the attendance banner. All three read this one method so they can
      * never disagree about what is pending.
@@ -505,7 +546,8 @@ class PayrollService
             // Money context only — a late SALARY cut is not a leave action and has no button
             // here; it is deducted when the salary is paid. Shown so the month's total
             // picture ("what is being added or taken away") is honest.
-            if ((float) $row['late_computed_cut'] > 0) {
+            // ⏱ Old-rule months only — a time-bank cut is a DECISION shown on its own card.
+            if (($row['time_bank'] ?? null) === null && (float) $row['late_computed_cut'] > 0) {
                 $sum['late_cut_total'] += (float) $row['late_computed_cut'];
                 $sum['late_cut_count']++;
             }
@@ -639,7 +681,7 @@ class PayrollService
      * skip. Mirrors coverAbsencesWithBonus: the `absence_cover` row for the month is the
      * record of what it took, so it is the only thing that needs reading.
      */
-    private function uncoverAbsencesFor(int $userId, string $month): void
+    public function uncoverAbsencesFor(int $userId, string $month): void
     {
         if (!$this->absence->enabled()) { return; }
         $reason = 'Covered absences from ' . date('M Y', strtotime($month . '-01')) . ' overtime';
@@ -872,6 +914,18 @@ class PayrollService
 
     public function decideLeaveAction(int $userId, string $month, string $kind, string $decision, int $actorId): array
     {
+        // ⏱ Time bank. An old phone's single button ("Confirm suggested") arrives here as
+        // kind=time_bank/apply; the full choice set goes through TimeBankService::decide().
+        $tbSvc = new TimeBankService();
+        if ($kind === 'time_bank') {
+            return $decision === 'apply'
+                ? $tbSvc->decideSuggested($userId, $month, $actorId)
+                : ['success' => false, 'message' => 'Open the time-bank card on the web (or update the app) for this choice.'];
+        }
+        if (in_array($kind, ['overtime', 'late_penalty'], true) && $tbSvc->covers($userId, $month)) {
+            return ['success' => false, 'message' => date('F Y', strtotime($month . '-01'))
+                . ' late and overtime are decided on the time-bank card now — update the app or use the web.'];
+        }
         if (!in_array($kind, self::LEAVE_KINDS, true)) {
             return ['success' => false, 'message' => 'Unknown leave action.'];
         }
@@ -991,6 +1045,20 @@ class PayrollService
                 // Absences are never part of "apply all": there is nothing to apply, and
                 // leaving them undecided already means the cut. They are decided one by one.
                 if ($a['kind'] === 'absence') { continue; }
+                // ⏱ Bulk confirms the engine's SUGGESTION — leave where possible, otherwise move
+                // to next month, extra given. It never cuts a salary (owner, Oct-2026).
+                if ($a['kind'] === 'time_bank') {
+                    if ($a['status'] !== 'pending') { continue; }
+                    $res = (new TimeBankService())->decideSuggested((int) $r['user_id'], $month, $actorId);
+                    if (!empty($res['success'])) {
+                        $n = $res['statement']['decision'] ?? [];
+                        $deducted += (int) ($n['leave'] ?? 0);
+                        $given += ($n['ot'] ?? null) === 'give' ? (int) ($n['ot_days'] ?? 0) : 0;
+                    } else {
+                        $failed++;
+                    }
+                    continue;
+                }
                 if ($a['status'] !== 'pending' || (int) $a['recommended_days'] === 0) { continue; }
                 $res = $this->decideLeaveAction((int) $r['user_id'], $month, $a['kind'], 'apply', $actorId);
                 if (!empty($res['success'])) {
@@ -1095,6 +1163,7 @@ class PayrollService
         $fullMonthWorkingDays = $this->shift->calculateWorkingDays($userId, $startDate, $endDate);
         $rateDivisor = $fullMonthWorkingDays > 0 ? $fullMonthWorkingDays : $workingDays;
         $perDay  = $rateDivisor > 0 ? $base / $rateDivisor : 0.0;
+        // ⭐ The time bank prices a late day at THIS rate — dayRate() below is the same two lines.
         $perHour = $rateDivisor > 0 ? $base / ($rateDivisor * max(0.1, $this->targetHours())) : 0.0;
 
         // ── Absent deduction (unapproved absences only; leave + not-needed already excluded).
@@ -1182,6 +1251,33 @@ class PayrollService
         // carry table exists this returns days = floor(own ÷ 540) — today's exact behaviour.
         $carry = $this->carry->preview($userId, $month, $otMinutes);
         $bonusLeaves = $carry['days'];
+
+        // ⏱ TIME BANK (Oct-2026) — for a month the bank judges, it replaces BOTH rules above
+        // (the 2h30 buffer / 8h step and the stand-alone overtime ÷ 9h). Nothing is guessed
+        // here: the late cut is exactly the bank cuts that land on THIS month's pay, and the
+        // leave/bonus figures are what a manager actually decided. The free rupee box is gone
+        // for these months — the time-bank card is the one place to choose (owner, Oct-12).
+        $timeBank = null;
+        $timeBankCuts = [];
+        $tbSvc = new TimeBankService();
+        if ($tbSvc->covers($userId, $month)) {
+            $timeBank = $tbSvc->month($userId, $month);
+            $timeBankCuts = $tbSvc->cutsLandingOn($userId, $month);
+            $fig = $tbSvc->decidedFigures($userId, $month);
+            $lateLeaveDeduct = $fig['leave'];
+            $lateLeaveRecommended = 0;
+            $lateComputedCut = round(array_sum(array_column($timeBankCuts, 'amount')), 2);
+            $lateDeduction = $lateComputedCut;
+            $lateFlag = null;
+            $lateDecided = $fig['decided'];
+            $bonusLeaves = $fig['given'];
+            $carry = [
+                'carried_in' => (int) ($timeBank['ot']['in'] ?? 0),
+                'carry_out'  => (int) ($timeBank['net']['ot_left'] ?? 0),
+                'available'  => (int) ($timeBank['ot']['total'] ?? $otMinutes),
+                'carried_from' => [], 'carry_out_lots' => [], 'days' => $fig['given'],
+            ];
+        }
 
         // How much of this month has actually been LOOKED AT. Purely informational — it moves
         // no number here; the adjustments themselves already landed inside the overtime and
@@ -1285,7 +1381,7 @@ class PayrollService
             // An ENDED month whose overtime is still undecided: its leftover is not carried
             // yet (a waive could still take it away), but hiding it would make the figure
             // invisible. Shown as PENDING, naming the month that has to be settled.
-            'ot_carry_pending'   => $this->carry->pendingCarryInto($userId, $month),
+            'ot_carry_pending'   => $timeBank ? null : $this->carry->pendingCarryInto($userId, $month),
             'ot_carry_out_label' => $this->carry->describeLots($carry['carry_out_lots']),
             'advances'          => $advances,
             'advance_total'     => $advanceTotal,
@@ -1307,12 +1403,34 @@ class PayrollService
             'total_deductions'  => $totalDeductions,
             'net_salary'        => max(0, $net),
             'net_raw'           => $net,                    // before the max(0) clamp (for the ⚠ negative case)
+            // ⏱ The time-bank statement for this month (null = old rules), and the bank cuts
+            // that land on THIS pay (an earlier month decided after its own pay went out).
+            'time_bank'         => $timeBank,
+            'time_bank_cuts'    => $timeBankCuts,
         ];
 
         if ($memoKey !== null) {
             self::$rowMemo[$memoKey] = $result;
         }
         return $result;
+    }
+
+    /**
+     * One day's pay for a month — base ÷ the FULL month's working days, exactly as computeRow
+     * prices an absent day. The time bank prices a late day with this (owner, Oct-2026: "1 day
+     * of salary per day"), and it must not call computeRow (computeRow calls the bank).
+     */
+    public function dayRate(int $userId, string $month): float
+    {
+        $base = (float) (EmployeeProfileModel::where('user_id', $userId)->value('base_salary') ?? 0);
+        if ($base <= 0) { return 0.0; }
+        $startDate = $month . '-01';
+        $endDate = date('Y-m-t', strtotime($startDate));
+        $full = $this->shift->calculateWorkingDays($userId, $startDate, $endDate);
+        if ($full <= 0) {
+            $full = (int) ($this->salary->attendanceSummary($userId, $month)['working_days'] ?? 0);
+        }
+        return $full > 0 ? round($base / $full, 2) : 0.0;
     }
 
     /** user|month => computed row (per-request; dropped whenever an input changes). */
@@ -1331,6 +1449,7 @@ class PayrollService
         self::$rowMemo = [];
         self::$leaveDecisionMemo = [];
         self::$processedMemo = [];
+        TimeBankService::forget();   // ⏱ its statements are built from the same inputs
     }
 
     /** Drop every cached row for a month (a decision or a payment changed the inputs). */
@@ -2100,9 +2219,18 @@ class PayrollService
         // but NO leave decision is recorded, so the month stays pending on the Leave-actions
         // panel (and in Attendance) for someone to decide there.
         $deferLeave = !empty($opts['defer_leave_actions']);
+        // ⏱ A time-bank month: Pay writes NO leave/carry effects (the card is the one place to
+        // decide — owner, Oct-2026). The receipt freezes what WAS decided; an old phone's
+        // skip toggles mean nothing here.
+        $isBank = ($row['time_bank'] ?? null) !== null;
+        $bankCutsOnPay = round(array_sum(array_column($row['time_bank_cuts'] ?? [], 'amount')), 2);
+        if ($isBank) {
+            $appliedLateLeave   = (int) $row['late_leave_deduct'];
+            $appliedBonusLeaves = (int) $row['bonus_leaves'];
+        }
 
         try {
-            return DB::transaction(function () use ($userId, $month, $row, $net, $funding, $bankId, $actorId, $appliedLateLeave, $appliedBonusLeaves, $manualNet, $deferLeave, $shortNotes, $waivedAbsence, $advanceBudget, $carryTo, $carryOk) {
+            $payRes = DB::transaction(function () use ($userId, $month, $row, $net, $funding, $bankId, $actorId, $appliedLateLeave, $appliedBonusLeaves, $manualNet, $deferLeave, $shortNotes, $waivedAbsence, $advanceBudget, $carryTo, $carryOk, $isBank, $bankCutsOnPay) {
                 // Funding (source) account — NF Cash, or the single ONLINE ledger account tagged per bank.
                 if ($funding === 'online') {
                     $source = \App\Models\FIN\ConfigModel::getOnlineBankAccount();
@@ -2249,7 +2377,7 @@ class PayrollService
                 // on the Leave-actions panel as "pending" forever after it was paid. A month
                 // that recommends nothing writes nothing at all.
                 $effDate = $month . '-01';
-                if (!$deferLeave) {
+                if (!$deferLeave && !$isBank) {
                     if ((int) $row['late_leave_deduct'] > 0) {
                         $this->grantOnce($userId, -1 * $appliedLateLeave, 'late_penalty',
                             $this->leaveActionReason('late_penalty', $month), $effDate, $actorId);
@@ -2279,7 +2407,7 @@ class PayrollService
                 // still be BANKED or they can never carry. That is pure accounting, so it runs
                 // even when leave actions are deferred to the panel (the panel cannot bank a
                 // day-less month: it only handles leaves). Idempotent by the same rule.
-                if ((int) $row['bonus_leaves'] === 0
+                if (!$isBank && (int) $row['bonus_leaves'] === 0
                     && ((int) $row['overtime_minutes'] > 0 || (int) ($row['ot_carry_in'] ?? 0) > 0)
                     && !$this->carry->decided($userId, $month)) {
                     $this->carry->commit($userId, $month, (int) $row['overtime_minutes'], 'apply', $actorId);
@@ -2312,16 +2440,30 @@ class PayrollService
                     $this->absence->markCutPaid($userId, $month);
                 }
 
+                // ⏱ Time-bank cuts that ride on this pay: taken → marked paid; dropped (manual amount,
+                // or the shortfall answer waived the late cut) → the days go BACK into the bank.
+                $noteBits = $shortNotes;   // shortfall decision, recorded on the receipt
+                if ($bankCutsOnPay > 0) {
+                    if ($manualNet !== null || (float) ($row['late_deduction'] ?? 0) <= 0) {
+                        (new TimeBankService())->returnCuts($userId, $month, $actorId);
+                        $noteBits[] = 'Late cut not taken — the days went back to the time bank';
+                    } else {
+                        (new TimeBankService())->markCutsPaid($userId, $month);
+                    }
+                }
+                if ($isBank && (($row['time_bank']['status'] ?? '') === 'pending')) {
+                    $noteBits[] = 'Late / extra not decided yet (time bank)';
+                }
+
                 // Stamp any manager bypass onto the receipt so a paid month explains itself later
                 // (0 bonus_leaves could mean "no overtime" OR "overtime bypassed" — this disambiguates).
-                $noteBits = $shortNotes;   // shortfall decision, recorded on the receipt
-                if ($deferLeave && ((int) $row['bonus_leaves'] > 0 || (int) $row['late_leave_deduct'] > 0)) {
+                if (!$isBank && $deferLeave && ((int) $row['bonus_leaves'] > 0 || (int) $row['late_leave_deduct'] > 0)) {
                     $noteBits[] = 'Leave actions left pending (decided separately)';
                 }
-                if (!$deferLeave && (int) $row['bonus_leaves'] > 0 && $appliedBonusLeaves === 0) {
+                if (!$isBank && !$deferLeave && (int) $row['bonus_leaves'] > 0 && $appliedBonusLeaves === 0) {
                     $noteBits[] = 'OT bonus (+' . (int) $row['bonus_leaves'] . ' leave) bypassed';
                 }
-                if ((int) $row['late_leave_deduct'] > 0 && $appliedLateLeave === 0) {
+                if (!$isBank && (int) $row['late_leave_deduct'] > 0 && $appliedLateLeave === 0) {
                     $noteBits[] = 'Late -1 leave waived';
                 }
                 // A manual override pays a flat amount; freeze the deduction/advance figures to 0
@@ -2387,6 +2529,13 @@ class PayrollService
 
                 return ['success' => true, 'net' => $net, 'ledger_id' => $ledgerId, 'settled_advances' => $settledIds];
             });
+            // 💵 One push to the employee once the money has actually gone (after commit;
+            // a failed push never fails a payment).
+            if (!empty($payRes['success'])) {
+                try { (new \App\Services\FirebaseService())->notifySalaryPaid($userId, $month, (float) $net); }
+                catch (\Throwable $e) { \Log::warning('Salary-paid push failed', ['user_id' => $userId, 'error' => $e->getMessage()]); }
+            }
+            return $payRes;
         } catch (\Throwable $e) {
             \Log::error('Payroll payRow failed', ['user_id' => $userId, 'month' => $month, 'error' => $e->getMessage()]);
             return ['success' => false, 'message' => 'Could not pay: ' . $e->getMessage()];
@@ -2484,7 +2633,7 @@ class PayrollService
      * `$days` may legitimately be 0: that is a recorded WAIVE, and it deliberately occupies
      * the dedupe key so the action reads "waived" instead of drifting back to "pending".
      */
-    private function recordLeaveDecision(int $userId, int $days, string $source, string $reason, string $effectiveDate, int $actorId, bool $allowChange): string
+    public function recordLeaveDecision(int $userId, int $days, string $source, string $reason, string $effectiveDate, int $actorId, bool $allowChange): string
     {
         $existing = DB::table('t_hr_leave_grant')
             ->where('user_id', $userId)->where('source', $source)
@@ -3136,7 +3285,7 @@ class PayrollService
     }
 
     /** Map user_id => true for employees tagged pay_schedule='custom' (empty pre-SQL). */
-    private function customScheduleUserIds(): array
+    public function customScheduleUserIds(): array
     {
         if (!$this->profileHasScheduleCols()) { return []; }
         try {

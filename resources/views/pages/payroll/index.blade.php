@@ -1130,6 +1130,36 @@
     }
     lateCell += reviewChip(r, 'late');
 
+    // ⏱ TIME BANK (Oct-2026). For a month the bank judges, late + extra are ONE balance:
+    // the row shows the minutes (facts, drillable) and ONE chip saying what is pending or
+    // was decided — click it to decide right here (same card as the Leave-actions panel).
+    // The old buffer/step text, the rupee box and the will-deduct / will-add toggles do not
+    // exist for these months: the card is the one place to choose.
+    const tb = r.time_bank;
+    const tbOn = tb && ['pending', 'decided', 'clear', 'running', 'folded'].indexOf(tb.status) > -1;
+    if (tbOn) {
+      const lw = Number(r.late_waived_minutes || 0);
+      lateCell = (lm > 0
+          ? '<span class="pr-chip late" data-drill="month_late" data-uid="' + r.user_id + '" title="Click to see the late days">' + lateTxt + '</span>'
+          : '<span class="pr-chip muted">0m</span>')
+        + (lw > 0 ? '<div class="pr-formula">' + hm(Number(r.late_raw_minutes || 0)) + ' late · ' + hm(lw) + ' waived</div>' : '')
+        + reviewChip(r, 'late');
+      const tone = tb.status === 'pending' ? (tb.chip_tone === 'extra' ? '#047857;background:#ecfdf5;border-color:#a7f3d0'
+                                                                       : '#b45309;background:#fffbeb;border-color:#fcd34d')
+                 : '#4b5563;background:#f3f4f6;border-color:#e5e7eb';
+      const clickable = tb.status === 'pending' || tb.status === 'decided';
+      if (tb.chip) {
+        lateCell += '<div style="margin-top:4px;"><span ' + (clickable ? 'data-tbopen="' + i + '" ' : '')
+          + 'style="display:inline-block;font-size:10.5px;font-weight:700;border:1px solid;border-radius:6px;padding:2px 7px;'
+          + 'color:' + tone + ';' + (clickable ? 'cursor:pointer;' : '') + '"'
+          + (clickable ? ' title="Open the late &amp; extra card"' : '') + '>'
+          + (tb.status === 'pending' ? '⏳ ' : '') + esc(tb.chip) + (clickable && tb.status === 'pending' ? ' ›' : '') + '</span></div>';
+      }
+      (r.time_bank_cuts || []).forEach(c => {
+        lateCell += '<div class="pr-formula" style="color:#b91c1c;">' + esc(c.label) + ' · − ' + fmt(c.amount) + '</div>';
+      });
+    }
+
     // overtime → bonus leave (manager can bypass; applied on Pay, or decided in the panel)
     // Overtime now reads like the Late cell: the MINUTES first, then the formula that turns
     // them into whole leave days, then the decision. Showing only "+1 bonus leave" hid both
@@ -1187,6 +1217,14 @@
       ot = '<span class="pr-chip muted">—</span>';
     }
     ot += pendLine + reviewChip(r, 'overtime');
+    if (tbOn) {
+      // Bank month: the extra MINUTES only — what they become is on the one chip in the Late cell.
+      ot = (otMin > 0
+          ? '<span class="pr-chip ot" data-drill="month_overtime" data-uid="' + r.user_id + '" title="Click to see the overtime days">' + hm(otMin) + '</span>'
+          : '<span class="pr-chip muted">—</span>')
+        + (Number(r.ot_carry_in || 0) > 0 ? '<div class="pr-formula">+ ' + hm(Number(r.ot_carry_in)) + ' from before</div>' : '')
+        + reviewChip(r, 'overtime');
+    }
 
     // advances (+ always offer "give advance")
     // The amber "requested" chip is money NOT given: it is deliberately rendered BELOW the real
@@ -1309,6 +1347,13 @@
     // a settled leave action → the review panel, scoped to this employee
     document.querySelectorAll('[data-lareview="' + i + '"]').forEach(t => {
       t.onclick = () => openLeavePanel(r.user_id);
+    });
+    // ⏱ time-bank chip → decide right here (owner, Oct-12: "he can do the action from payroll")
+    document.querySelectorAll('[data-tbopen="' + i + '"]').forEach(t => {
+      t.onclick = () => {
+        if (!confirmLosingGridEdits('Saving this decision')) return;
+        NFTimeBank.open(r.user_id, CURMONTH, r.fullname, async () => { await load(); });
+      };
     });
     // bypass toggles: overtime bonus + late-leave deduction (in-place, no full re-render)
     const sot = document.querySelector('[data-skipot="' + i + '"]');
@@ -1708,7 +1753,7 @@
       (totals.length ? '<div style="font-size:12.5px;color:#374151;margin-bottom:5px;">' + totals.join(' · ') + '</div>' : '') +
       (open
         ? '⏳ <b>' + esc(monthLabel()) + ' is still running.</b> These are previews — overtime and lateness can still change, so they can be decided once the month ends. Paying a salary now works exactly as before.'
-        : 'Leaves only. Absent deductions, late salary cuts and advances are money — they still move when you pay the salary.') +
+        : 'Late &amp; extra are settled on each card (leave, salary or next month). Absent deductions and advances are money — they move when you pay the salary.') +
       (s.late_cut_count
         ? '<div style="margin-top:6px;color:#b45309;">⚠ ' + s.late_cut_count + ' employee' + (s.late_cut_count > 1 ? 's have' : ' has') +
           ' a late <b>salary cut</b> of ' + fmt(s.late_cut_total) + ' this month (too late for a leave penalty) — that is deducted at pay, not here.</div>'
@@ -1717,8 +1762,8 @@
 
     if (!open && s.pending_count > 0 && !LA_FILTER) {
       note += '<div style="padding:10px 14px;border-bottom:1px solid #eef0f2;">' +
-        '<button type="button" class="pr-la-btn pr-la-give" id="prLaAll">Apply all ' + s.pending_count + ' recommended</button>' +
-        '<span style="font-size:11px;color:#9ca3af;margin-left:8px;">gives the bonuses and takes the penalties</span></div>';
+        '<button type="button" class="pr-la-btn pr-la-give" id="prLaAll">Confirm all ' + s.pending_count + ' suggested</button>' +
+        '<span style="font-size:11px;color:#9ca3af;margin-left:8px;">late &amp; extra: leave where possible, otherwise moved to next month · never cuts a salary</span></div>';
     }
     if (LA_FILTER) {
       note = '<div class="pr-la-back" id="prLaAllEmp">‹ all employees</div>' + note;
@@ -1738,6 +1783,8 @@
       monthOpen: open,
       monthLabel: monthLabel(),
       onDecide: (item, choice) => decideLeaveAction(item, choice),
+      // ⏱ Time-bank cards save themselves; the month is reloaded so grid + panel move together.
+      onTimeBankDone: async () => { await load(); renderLeavePanel(); },
       onDrill: (it) => {
         const keep = LA_FILTER;
         SHEET_BACK = () => { LA_FILTER = keep; sheetWide(true); el('prSheetTitle').textContent = 'Leave actions — ' + monthLabel(); renderLeavePanel(); };
@@ -1813,7 +1860,7 @@
     // ⚠ Absences are NOT in this count and cannot be "applied" — say so, because the red
     //   absence rows sit in the same list directly under this button.
     if (!confirm('Apply all ' + s.pending_count + ' recommended leave actions for ' + monthLabel() + '?'
-      + '\n\nBonus leaves are given and late penalties are deducted. Anything you already decided is left alone.'
+      + '\n\nLate & extra: extra covers late first, late days come off leave where there is leave (otherwise they move to next month), extra days are given. This button never cuts a salary. Anything you already decided is left alone.'
       + (Number(s.absence_pending || 0) > 0
           ? '\n\nThis does NOT touch the ' + s.absence_pending + ' absence decision'
             + (s.absence_pending > 1 ? 's' : '') + ' — each one has to be deducted, parked or excused itself.'
@@ -2065,9 +2112,14 @@
     let html = '';
     html += dedLine('Absent days', absent,
       r.absent_days > 0 ? (r.absent_days + ' × ' + fmt(r.per_day) + '/day') : 'no unapproved absences', absent === 0);
-    html += dedLine('Late', late,
-      late > 0 ? ((r.late_minutes / 60).toFixed(1) + 'h × ' + fmt(r.per_hour) + '/hr')
-        : (r.late_leave_deduct > 0 ? 'covered by 1 leave (no pay cut)' : 'within free buffer'), late === 0);
+    // ⏱ Bank months: the late cut is exactly the time-bank cuts landing on this pay.
+    html += r.time_bank
+      ? dedLine('Late', late,
+          late > 0 ? (r.time_bank_cuts || []).map(c => c.label + ' × ' + fmt(c.amount / Math.max(1, c.days)) + '/day').join(' + ')
+                   : (r.time_bank.chip || 'no late cut'), late === 0)
+      : dedLine('Late', late,
+          late > 0 ? ((r.late_minutes / 60).toFixed(1) + 'h × ' + fmt(r.per_hour) + '/hr')
+            : (r.late_leave_deduct > 0 ? 'covered by ' + r.late_leave_deduct + ' leave (no pay cut)' : 'within free buffer'), late === 0);
     html += dedLine('Advances', adv,
       adv > 0 ? 'open advance — settled when you pay' : 'none open', adv === 0);
     html += '<div class="pr-daterow" style="font-weight:700;border-top:2px solid #eef0f2;margin-top:4px;"><span class="dt">Total deductions</span><span class="dt">' + fmt(total) + '</span></div>';
@@ -2365,9 +2417,39 @@
     let give = 0, cut = 0;
     const undecided = (r, kind) => { const a = laFor(r, kind); return !a || a.status === 'pending'; };
     sel.forEach(r => {
+      if (r.time_bank) return;   // ⏱ bank months: Pay writes no leave effects (card decides)
       if (undecided(r, 'overtime') && !r._skipOvertime) give += Number(r.bonus_leaves || 0);
       if (undecided(r, 'late_penalty') && !r._skipLateLeave) cut += Number(r.late_leave_deduct || 0);
     });
+    // ⏱ Never silent (owner, Oct-12): name anyone whose late / extra is still undecided.
+    // "Pay and decide later" is fine — no late cut is taken now; a salary cut chosen later
+    // comes off the next unpaid salary. Click a name to decide now.
+    const tbPending = sel.filter(r => r.time_bank && r.time_bank.status === 'pending');
+    let tbWarn = el('prPayTbWarn');
+    if (!tbWarn && el('prPayAbsWarn')) {
+      tbWarn = document.createElement('div');
+      tbWarn.id = 'prPayTbWarn';
+      tbWarn.style.cssText = 'margin-top:8px;font-size:12px;color:#92400e;background:#fffbeb;border:1px solid #fcd34d;border-radius:8px;padding:8px 10px;';
+      el('prPayAbsWarn').parentNode.insertBefore(tbWarn, el('prPayAbsWarn').nextSibling);
+    }
+    if (tbWarn) {
+      if (tbPending.length) {
+        tbWarn.innerHTML = '⏳ <b>' + tbPending.length + ' still have late / extra to decide</b>: '
+          + tbPending.map(r => '<span data-tbpay="' + r.user_id + '" style="cursor:pointer;text-decoration:underline dotted;font-weight:700;">'
+              + esc(r.fullname) + ' (' + esc(r.time_bank.chip.replace(' · choose', '')) + ')</span>').join(', ')
+          + '. Paying now takes no late cut — decide later and any cut comes off the next salary.';
+        tbWarn.style.display = '';
+        tbWarn.querySelectorAll('[data-tbpay]').forEach(s => {
+          const rr = sel.find(x => String(x.user_id) === s.getAttribute('data-tbpay'));
+          s.onclick = () => {
+            el('prPayModal').classList.remove('show');
+            NFTimeBank.open(rr.user_id, CURMONTH, rr.fullname, async () => { await load(); });
+          };
+        });
+      } else {
+        tbWarn.style.display = 'none';
+      }
+    }
     // ⚠ Paying is the LAST moment an absence can still be parked or excused — afterwards the
     // month is settled and the service refuses to re-decide it. Name the people, not a count.
     const absUndecided = sel.filter(r => Number(r.absent_days || 0) > 0 && !r.absence_decision);
@@ -2632,9 +2714,15 @@
     // otherwise the two screens disagree about the same number, which is the whole thing
     // the one-engine rule exists to prevent.
     const lateBits = [];
-    if (r.late_minutes > 0) {
+    if (r.time_bank) {
+      // ⏱ Bank month: the ONE chip (decided or pending) — never the retired buffer wording.
+      if (r.time_bank.chip) lateBits.push(esc(r.time_bank.chip));
+      (r.time_bank_cuts || []).forEach(c => lateBits.push(esc(c.label) + ' · − ' + fmt(c.amount)));
+    } else if (r.late_minutes > 0) {
+      // Old-rule month. (Was "within the free buffer" even when −1 leave applied — fixed.)
       lateBits.push(lateCut > 0 ? fmt(r.per_hour) + '/hr × ' + ((r.late_minutes || 0) / 60).toFixed(1) + 'h'
-                                : 'within the free buffer — no pay cut');
+                                : (Number(r.late_leave_deduct || 0) > 0 || r.late_settled ? 'settled with leave — no pay cut'
+                                                                       : 'within the free buffer — no pay cut'));
     }
     if (Number(r.late_waived_minutes || 0) > 0) {
       lateBits.push(hm(Number(r.late_raw_minutes || 0)) + ' late · ' + hm(r.late_waived_minutes)
@@ -2648,8 +2736,12 @@
     if (lateCut > 0) month += empLine('Late deduction', '− ' + fmt(lateCut), { minus: true });
     const otBits = [];
     if (Number(r.ot_carry_in || 0) > 0) otBits.push(hm(r.ot_carry_in) + ' carried in');
-    otBits.push('÷ ' + hm(OT_PER_DAY) + ' = ' + (r.bonus_leaves > 0 ? '+' + r.bonus_leaves + ' leave' + (r.bonus_leaves > 1 ? 's' : '') : 'no leave yet'));
-    if (Number(r.ot_carry_out || 0) > 0) otBits.push(hm(r.ot_carry_out) + ' carried on');
+    if (r.time_bank) {
+      otBits.push('see the late &amp; extra card');
+    } else {
+      otBits.push('÷ ' + hm(OT_PER_DAY) + ' = ' + (r.bonus_leaves > 0 ? '+' + r.bonus_leaves + ' leave' + (r.bonus_leaves > 1 ? 's' : '') : 'no leave yet'));
+      if (Number(r.ot_carry_out || 0) > 0) otBits.push(hm(r.ot_carry_out) + ' carried on');
+    }
     month += empLine('Overtime', hm(r.overtime_minutes || 0), {
       drill: 'month_overtime', why: otBits.join(' · '), review: reviewChip(r, 'overtime'),
     });
@@ -2683,7 +2775,9 @@
     leave += empLine('Taken', (bal.taken_total ?? 0), { drill: 'month_leave' });
     leave += empLine('Remaining', (bal.remaining ?? '—'), { total: true });
     const carryOpen = (EMP.ot_carry || []).reduce((s, c) => s + (c.forfeited_at ? 0 : (c.carried_out || 0)), 0);
-    if (EMP.ot_carry_on) {
+    // ⏱ A time-bank month carries late AND extra on its own card below — the old overtime-only
+    // carry line (and its forfeit) would be a second, partial number for the same minutes.
+    if (EMP.ot_carry_on && !r.time_bank) {
       leave += '<div class="pr-emp-why" style="margin-top:8px;">Carried overtime: '
         + (carryOpen > 0 ? '<b>' + hm(carryOpen) + '</b> waiting to become a leave day' : 'none')
         + '.</div>';
@@ -2702,6 +2796,8 @@
     if (acts.length) {
       la = '<div class="pr-emp-card"><h4>Leave actions — ' + esc(EMP.month_label) + '</h4>';
       acts.forEach(a => {
+        // ⏱ Time bank: the SAME card as the panel and the grid chip, mounted after paint.
+        if (a.kind === 'time_bank') { la += '<div data-emptb="1"></div>'; return; }
         const pending = a.status === 'pending';
         // ⭐⭐ Sep-6 2026 — SAME vocabulary and SAME decided-state pattern as the panel.
         //   This tab used to keep its buttons live after a decision (while the panel
@@ -2798,9 +2894,27 @@
     el('prEmpEmpty').style.display = 'none';
     el('prEmpBody').style.display = '';
     el('prEmpBody').innerHTML = empHeader(u, 'Monthly salary · ' + EMP.month_label)
-      + '<div class="pr-emp-grid"><div>' + month + hist + '</div><div>' + leave + la + absc + adv + '</div></div>';
+      + '<div class="pr-emp-grid"><div>' + month + hist + '</div><div>' + leave + la
+      + '<div class="pr-emp-card" id="prEmpTb"><h4>⏱ Late &amp; extra bank</h4><div class="pr-emp-why">Loading…</div></div>'
+      + absc + adv + '</div></div>';
 
     wireEmployee();
+    // ⏱ The time-bank card for this month (same component as the panel) …
+    const tbAct = (r.leave_actions || []).find(a => a.kind === 'time_bank');
+    const slot = el('prEmpBody').querySelector('[data-emptb]');
+    if (tbAct && slot) {
+      NFTimeBank.mount(slot, tbAct.statement, { fullname: u.fullname || r.fullname, paid: !!paid, onDone: () => empLoad() });
+    }
+    // … and its history + Taimur's manual adjust (owner, Oct-12).
+    empTimeBankHistory();
+  }
+
+  // ⏱ ONE renderer (partial: NFTimeBank.history) — the same list and the same Adjust tool the
+  // card modal and the phone show, so the Employee tab can never drift from them.
+  async function empTimeBankHistory() {
+    const box = el('prEmpTb');
+    if (!box) return;
+    NFTimeBank.history(box, EMP_ID, { title: '⏱ Late &amp; extra bank', onChange: () => empLoad() });
   }
 
   function monthName(ym) {

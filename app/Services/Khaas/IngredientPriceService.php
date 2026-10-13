@@ -26,11 +26,16 @@ use Illuminate\Support\Facades\Log;
  * ⭐ WHERE A PRICE COMES FROM, most trusted first:
  *   1. `bill`       — a purchase line stamped with the ingredient when it was recorded
  *                     (qty_base is the fact of that day).
- *   2. `older_bill` — a line recorded BEFORE ingredient stamping existed, reached
- *                     through its catalogue product's CURRENT tag. Labelled as such.
- *                     ⚠ Only before LEGACY_BEFORE: after that date an unstamped line
- *                     on a tagged product may be a deliberate "not an ingredient"
- *                     (a carrier bag), and borrowing the tag would price the bag.
+ *   2. an UNSTAMPED line of a product that is linked to the ingredient TODAY (and
+ *                     switched on), reached through that product's CURRENT tag.
+ *                     ⭐ Oct-12 (owner): the price comes from the linked product's own
+ *                     bills even when nobody pressed "count earlier bills". A link is
+ *                     to ONE product of ONE vendor (the Frozen vendor), so Daal Channa
+ *                     bought for staff food at another vendor can never price it.
+ *                     PRICE ONLY: stock and Month Review still count stamped lines
+ *                     only, because "not an ingredient" (oil for the staff kitchen)
+ *                     changes how much went into packs, never what a kg cost.
+ *                     Source `older_bill` before LEGACY_BEFORE (pre-stamping), `bill` after.
  *   3. `meat_order` — meat is bought through the storage Meat Order, never a vendor
  *                     line; its newest order line gives Rs/kg.
  *   Nothing else. An ingredient with none of these has NO price and says so; it is
@@ -396,7 +401,7 @@ class IngredientPriceService
                 ->where('l.transaction_type', LedgerModel::TYPE_VENDOR_PURCHASE)
                 ->whereIn('l.approval_status', self::POSTED_STATUSES)
                 ->where('l.transaction_date', '>=', now()->subDays(self::LOOKBACK_DAYS)->toDateString())
-                ->where('i.created_at', '<', self::LEGACY_BEFORE)
+                // ⭐ Oct-12: no date cut-off any more — see the class comment (price only).
                 // ⭐ Oct-7: ONE rule with the recipe's "Linked now" list (RecipeService::catalogueLinks),
                 //   which shows only ACTIVE products. Qasim switched the Tazo product off on 6-Oct
                 //   and the list dropped it, but its tag kept pricing Cheese from a July bill —
@@ -412,7 +417,7 @@ class IngredientPriceService
             QurbaniFinanceFilter::applyToLedgerQuery($q, 'l', QurbaniFinanceFilter::MODE_EXCLUDE);
 
             $rows = $q->select('vp.ingredient_id', 'vp.unit as product_unit', 'vp.pack_qty_base',
-                    'i.unit', 'i.quantity', 'i.line_total', 'i.product_name',
+                    'i.unit', 'i.quantity', 'i.line_total', 'i.product_name', 'i.created_at',
                     'l.transaction_date', 'v.vendor_name')
                 ->get();
 
@@ -429,7 +434,8 @@ class IngredientPriceService
                     'cost'          => (float) $r->line_total,
                     'vendor'        => $r->vendor_name,
                     'product'       => $r->product_name,
-                    'source'        => 'older_bill',
+                    // "older bill" means "from before stamping existed"; a recent line is just a bill.
+                    'source'        => (string) $r->created_at < self::LEGACY_BEFORE ? 'older_bill' : 'bill',
                 ];
             }
             return $out;

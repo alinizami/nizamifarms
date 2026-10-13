@@ -5154,20 +5154,14 @@ class RiderController extends Controller
                 ->exists();
             
             if ($isAdmin) {
-                // Admin users: Get all categories from existing expenses
-            $categories = \App\Models\Request\RequestModel::whereHas('category', function($q) {
-                    $q->whereIn('category_code', ['expense', 'salary_advance']);
-                })
-                ->whereNotNull('expense_category')
-                ->where('expense_category', '!=', '')
-                ->distinct()
-                ->pluck('expense_category')
-                ->sort()
-                ->values()
-                ->toArray();
+                // Admin users: the ACTIVE expense types from the one engine (Oct-2026) — the
+                // same list every other picker shows, so an inactive or misspelt old name is
+                // no longer offered for the short-cash expense. (Was: every distinct name
+                // ever typed on a past expense.)
+                $categories = \App\Services\FIN\ExpenseTypeService::names(1, 'expense');
 
-            // Add PENDING as a special option at the top for partial payments
-            array_unshift($categories, 'PENDING');
+                // Add PENDING as a special option at the top for partial payments
+                array_unshift($categories, 'PENDING');
             } else {
                 // Non-admin users: Limited categories only
                 $categories = ['Petrol', 'Maintenance', 'PENDING'];
@@ -5314,37 +5308,12 @@ class RiderController extends Controller
         try {
             $businessUnitId = $request->input('business_unit_id');
             $requestCategoryCode = $request->input('request_category_code');
-            
-            $query = \App\Models\FIN\ConfigModel::where('config_key', 'LIKE', 'EXPENSE_CATEGORY_%')
-                ->where('config_key', '!=', 'EXPENSE_CATEGORY_STAFF_SALARIES'); // salaries go through Payroll now
 
-            if ($businessUnitId) {
-                if ($businessUnitId == 1) {
-                    $query->where(function($q) {
-                        $q->where('business_unit_id', 1)
-                          ->orWhereNull('business_unit_id');
-                    });
-                } else {
-                    $query->where('business_unit_id', $businessUnitId);
-                }
-            }
-
-            if ($requestCategoryCode) {
-                $isOriginalType = in_array($requestCategoryCode, ['expense', 'khaas_expense']);
-                if ($isOriginalType) {
-                    $query->where(function ($q) use ($requestCategoryCode) {
-                        $q->whereNull('request_category_code')
-                          ->orWhere('request_category_code', $requestCategoryCode);
-                    });
-                } else {
-                    $query->where('request_category_code', $requestCategoryCode);
-                }
-            }
-            
-            $categories = $query->orderBy('config_value')
-                ->pluck('config_value')
-                ->toArray();
-
+            // ⭐ Oct-2026: the ONE expense-type engine (ExpenseTypeService) — active types only,
+            // in Taimur's order, same scope rule as before (BU + request type; NULL-scoped
+            // types shared by Expense + Khaas Expense; Staff Salaries never offered).
+            $options = \App\Services\FIN\ExpenseTypeService::options($businessUnitId, $requestCategoryCode);
+            $categories = array_column($options, 'name');
             // Jun-2026 — quick-select "bubbles": the admin-chosen ordered subset
             // shown as chips above the Expense Type dropdown. Stored per
             // (business unit + request category). Falls back to the first few
@@ -5362,6 +5331,10 @@ class RiderController extends Controller
                 'success' => true,
                 'categories' => $categories,
                 'bubbles' => $bubbles,
+                // Oct-2026 — group headings + who may open the ✎ Manage sheet.
+                'types' => $options,
+                'can_manage' => \App\Services\FIN\ExpenseTypeService::canManage(),
+                'can_chips' => \App\Services\FIN\ExpenseTypeService::canEditChips(),
             ]);
         } catch (\Exception $e) {
             \Log::error('Failed to get expense categories from config', [
@@ -5394,31 +5367,8 @@ class RiderController extends Controller
      */
     private function expenseCategoryNamesForScope($businessUnitId, $requestCategoryCode): array
     {
-        $query = \App\Models\FIN\ConfigModel::where('config_key', 'LIKE', 'EXPENSE_CATEGORY_%');
-
-        if ($businessUnitId) {
-            if ($businessUnitId == 1) {
-                $query->where(function ($q) {
-                    $q->where('business_unit_id', 1)->orWhereNull('business_unit_id');
-                });
-            } else {
-                $query->where('business_unit_id', $businessUnitId);
-            }
-        }
-
-        if ($requestCategoryCode) {
-            $isOriginalType = in_array($requestCategoryCode, ['expense', 'khaas_expense']);
-            if ($isOriginalType) {
-                $query->where(function ($q) use ($requestCategoryCode) {
-                    $q->whereNull('request_category_code')
-                      ->orWhere('request_category_code', $requestCategoryCode);
-                });
-            } else {
-                $query->where('request_category_code', $requestCategoryCode);
-            }
-        }
-
-        return $query->orderBy('config_value')->pluck('config_value')->toArray();
+        // Oct-2026: the one engine — active types only, so an inactive type cannot be a chip.
+        return \App\Services\FIN\ExpenseTypeService::names($businessUnitId, $requestCategoryCode);
     }
 
     /**
@@ -5721,6 +5671,15 @@ class RiderController extends Controller
                 'expense_category' => 'required|string|max:100'
             ]);
 
+            // ⭐ Oct-2026 Expense Types: refuse an inactive type, map an old name (see ExpenseTypeService).
+            $typeCheck = \App\Services\FIN\ExpenseTypeService::checkForWrite($request->expense_category, 1);
+            if (!$typeCheck['ok']) {
+                return response()->json(['success' => false, 'message' => $typeCheck['message']], 422);
+            }
+            if ($typeCheck['name'] !== $request->expense_category) {
+                $request->merge(['expense_category' => $typeCheck['name']]);
+            }
+
             \DB::beginTransaction();
 
             // Verify selected invoices (include both open/partial invoices and qurbani order_payment entries)
@@ -5999,6 +5958,9 @@ class RiderController extends Controller
                     'end' => $pendingAck->shiftTemplate->shift_end ? substr($pendingAck->shiftTemplate->shift_end, 0, 5) : null,
                     'effective_from' => $pendingAck->effective_from ? $pendingAck->effective_from->format('Y-m-d') : null,
                     'effective_to' => $pendingAck->effective_to ? $pendingAck->effective_to->format('Y-m-d') : null,
+                    // 🔁 Additive — weekly days that come with this change (Roman Urdu, '' = none).
+                    'weekly_summary' => \App\Services\Ops\WeekdayPattern::summary(
+                        \App\Services\Ops\WeekdayPattern::parse($pendingAck->day_pattern ?? null), 'ur'),
                 ];
             }
 
@@ -13766,6 +13728,13 @@ class RiderController extends Controller
             // correctly reflects the cycle, fixing the old calendar-year mismatch.
             $leaveBal = (new \App\Services\HR\LeavePolicyService())->balance((int) $user->id);
             $summary['leave_balance'] = $leaveBal;
+            // ⏱ Time bank (Oct-2026): "Mera time hisaab" — the SAME engine payroll uses,
+            // rider-safe slice (facts + decisions, never suggestions). Old APKs ignore it.
+            try {
+                $summary['time_bank'] = (new \App\Services\HR\TimeBankService())->riderView((int) $user->id, date('Y-m', strtotime((string) $month)));
+            } catch (\Throwable $e) {
+                $summary['time_bank'] = ['enabled' => false];
+            }
             $summary['leaves_taken_year'] = $leaveBal['taken_total'];
             $summary['leaves_year'] = (int) substr($leaveBal['cycle_start'], 0, 4);
             $summary['cycle_start'] = $leaveBal['cycle_start'];
@@ -14301,6 +14270,22 @@ class RiderController extends Controller
                     'success' => false,
                     'message' => 'Staff salaries must be paid from the Payroll screen, not entered as an expense.'
                 ], 422);
+            }
+
+            // ⭐ Oct-2026 Expense Types: an INACTIVE type is refused; an old name (renamed /
+            // merged) is mapped to the type's current name. Unknown text passes as before.
+            // Petrol / Maintenance are locked active, so rider claims are never touched.
+            if (!empty($validated['expense_category'])) {
+                $typeCheck = \App\Services\FIN\ExpenseTypeService::checkForWrite(
+                    $validated['expense_category'], $request->input('business_unit_id', 1)
+                );
+                if (!$typeCheck['ok']) {
+                    return response()->json(['success' => false, 'message' => $typeCheck['message']], 422);
+                }
+                if ($typeCheck['name'] !== $validated['expense_category']) {
+                    $validated['expense_category'] = $typeCheck['name'];
+                    $request->merge(['expense_category' => $typeCheck['name']]);
+                }
             }
 
             // Metered petrol = a petrol request tied to a real attendance row + meter reading.
@@ -22695,6 +22680,15 @@ class RiderController extends Controller
                     'overtime_minutes' => $overtimeMinutes,
                     'overtime_target_minutes' => $overtimeTargetMinutes,
                     'overtime_bonus_leaves' => $overtimeBonusLeaves,
+                    // ⏱ Time bank (Oct-2026): the same chip the web payroll/attendance show.
+                    'time_bank' => (function () use ($user, $startDate) {
+                        try {
+                            $s = (new \App\Services\HR\TimeBankService())->month((int) $user->user_id, substr((string) $startDate, 0, 7));
+                            return in_array($s['status'] ?? '', ['off', 'excluded', 'before_start'], true) ? null
+                                : ['status' => $s['status'], 'chip' => $s['chip'] ?? '', 'tone' => $s['chip_tone'] ?? 'muted',
+                                   'lines' => $s['lines'] ?? [], 'result' => $s['result'] ?? ''];
+                        } catch (\Throwable $e) { return null; }
+                    })(),
                     'overtime_minutes_per_bonus' => $otSvcMob->minutesPerBonusDay(),
                     'office_checkouts_count' => (int) ($officeCheckoutCounts[$user->user_id] ?? 0), // R9.1 mobile
                     // Web-parity flag counts (one "Flags" group on the card) + missed meters.
@@ -34475,14 +34469,42 @@ class RiderController extends Controller
             $primary = $svc->getUserShift($r->id, $today);
             $rows = \App\Models\Ops\UserShiftAssignmentModel::with('shiftTemplate')->where('user_id', $r->id)->get();
             $changes = [];
+            $WP = \App\Services\Ops\WeekdayPattern::class;
+            $closedRegular = $svc->closedRegularIds((int) $r->id, $rows);   // ⚠ a closed regular row is not a temporary change
             foreach ($rows as $row) {
                 $f = $row->effective_from ? $row->effective_from->format('Y-m-d') : null;
                 $t = $row->effective_to ? $row->effective_to->format('Y-m-d') : null;
-                if ($t !== null && $t >= $today) {
-                    $changes[] = ['assignment_id' => $row->id, 'kind' => 'temporary', 'shift_name' => optional($row->shiftTemplate)->shift_name, 'from' => $f, 'to' => $t, 'acknowledged' => $row->acknowledged_at !== null];
+                $wk = $WP::summary($WP::parse($row->day_pattern ?? null));
+                if ($t !== null && $t >= $today && $svc->isTemporaryRow($row, $closedRegular)) {
+                    $changes[] = ['assignment_id' => $row->id, 'kind' => 'temporary', 'shift_name' => optional($row->shiftTemplate)->shift_name, 'from' => $f, 'to' => $t, 'acknowledged' => $row->acknowledged_at !== null, 'weekly_summary' => $wk];
                 } elseif ($t === null && $f !== null && $f > $today) {
-                    $changes[] = ['assignment_id' => $row->id, 'kind' => 'upcoming_primary', 'shift_name' => optional($row->shiftTemplate)->shift_name, 'from' => $f, 'to' => null, 'acknowledged' => $row->acknowledged_at !== null];
+                    $changes[] = ['assignment_id' => $row->id, 'kind' => 'upcoming_primary', 'shift_name' => optional($row->shiftTemplate)->shift_name, 'from' => $f, 'to' => null, 'acknowledged' => $row->acknowledged_at !== null, 'weekly_summary' => $wk];
                 }
+            }
+            /**
+             * 🔁 WEEKLY DAYS (Oct-2026) — the regular row in force today (the resolver's own
+             * pick: latest start, newest id) and its weekly days, so the phone sheet opens
+             * with them filled in. Same shape as the web planner's `regular` / `weekly`.
+             */
+            $regRow = $rows->filter(function ($x) use ($today) {
+                    $xf = $x->effective_from ? $x->effective_from->format('Y-m-d') : null;
+                    return is_null($x->effective_to) && ($xf === null || $xf <= $today);
+                })
+                ->sortByDesc(fn ($x) => ($x->effective_from ? $x->effective_from->format('Y-m-d') : '0000-00-00')
+                                       . '|' . str_pad((string) $x->id, 10, '0', STR_PAD_LEFT))
+                ->first();
+            $regMap = $regRow ? $WP::parse($regRow->day_pattern ?? null) : null;
+            $regular = null;
+            if ($regRow && $regRow->shiftTemplate) {
+                $rl = $svc->locationFor((int) $r->id, $regRow->location_id ? (int) $regRow->location_id : null);
+                $regular = [
+                    'template_id' => (int) $regRow->shiftTemplate->id,
+                    'shift_name' => $regRow->shiftTemplate->shift_name,
+                    'start' => substr((string) $regRow->shiftTemplate->shift_start, 0, 5),
+                    'end' => $regRow->shiftTemplate->shift_end ? substr((string) $regRow->shiftTemplate->shift_end, 0, 5) : null,
+                    'location_id' => $regRow->location_id ? (int) $regRow->location_id : null,
+                    'location_name' => $rl['location_name'],
+                ];
             }
             $def = $svc->userDefaultLocation($r->id); // rider's default office (pre-selected on assign)
             $shiftAuth = $shiftAuthority->rowStateFor($shiftActor, (int) $r->id, true);
@@ -34495,6 +34517,9 @@ class RiderController extends Controller
                 'default_location_id' => $def['location_id'],
                 'default_location_name' => $def['location_name'],
                 'primary' => ['shift_name' => $primary['shift_name'], 'start' => $primary['shift_start'], 'end' => $primary['shift_end'], 'location_name' => $primary['location_name'] ?? null],
+                // 🔁 Additive — an older APK ignores both.
+                'regular' => $regular,
+                'weekly' => $regMap ? ['days' => $WP::toWire($regMap), 'summary' => $WP::summary($regMap)] : null,
                 /**
                  * 🔧 His next workshop errand (owner ask, Sep-2026): "whoever is planning
                  * the shift should know that on this date the rider has to go".
@@ -34530,12 +34555,20 @@ class RiderController extends Controller
             ->when(\App\Services\LocationService::hasHandoverPointColumn(), fn ($q) => $q->where(function ($w) {
                 $w->where('is_handover_point', 0)->orWhereNull('is_handover_point');
             }))
+            // ⚠ Oct-2026: and never a WORKSHOP — the web planner already filters it out; the
+            //   server drops it as a base place and refuses it as a weekly day either way.
+            ->when(\App\Services\LocationService::hasWorkshopColumn(), fn ($q) => $q->where(function ($w) {
+                $w->where('is_workshop', 0)->orWhereNull('is_workshop');
+            }))
             ->orderByDesc('is_primary')->orderBy('location_name')
             ->get(['id', 'location_name', 'is_primary'])
             ->map(fn($l) => ['id' => (int) $l->id, 'name' => $l->location_name, 'is_primary' => (int) $l->is_primary === 1]);
         // ⚠ `can_manage_roster` is additive — an older APK ignores it and shows no button.
         return response()->json(['success' => true, 'riders' => $out, 'locations' => $locations,
-            'can_manage_roster' => $canManageRoster]);
+            'can_manage_roster' => $canManageRoster,
+            // 🔁 The weekly-days column is there (shift_weekly_days_oct2026.sql has run).
+            'weekly_available' => \App\Services\Ops\WeekdayPattern::available()
+                && \App\Services\Ops\WeekdayPattern::requestColumnAvailable()]);
     }
 
     /** Per-rider MONTH shift breakdown for the manager (StoreShifts → tap rider → month view),
@@ -34567,6 +34600,7 @@ class RiderController extends Controller
 
         // Preload once: assignment rows, holidays, attendance (for late) across the month.
         $rows = \App\Models\Ops\UserShiftAssignmentModel::with('shiftTemplate')->where('user_id', $uid)->get();
+        $closedRegular = $svc->closedRegularIds($uid, $rows);   // ⚠ closed regular rows are not "changed" days
         $holidays = \DB::table('t_ops_public_holidays')->where('is_active', 1)
             ->whereBetween('holiday_date', [$startStr, $endStr])->get()
             ->mapWithKeys(fn($h) => [\Carbon\Carbon::parse($h->holiday_date)->format('Y-m-d') => $h->holiday_name])
@@ -34596,9 +34630,10 @@ class RiderController extends Controller
             $dow = (int) $d->format('N'); // 1=Mon..7=Sun
             $isHoliday = isset($holidays[$ds]);
             $isOff = !in_array($dow, $shift['working_days'] ?? []);
-            // A bounded row (effective_to set) covering this date = temporary override.
-            $isOverride = $rows->first(function ($row) use ($ds) {
-                if (is_null($row->effective_to)) {
+            // A TEMPORARY row covering this date = override. ⚠ A closed regular row has an
+            // end date too and is NOT one (it used to paint "changed" on every old day).
+            $isOverride = $rows->first(function ($row) use ($ds, $svc, $closedRegular) {
+                if (!$svc->isTemporaryRow($row, $closedRegular)) {
                     return false;
                 }
                 $f = $row->effective_from ? $row->effective_from->format('Y-m-d') : null;
@@ -34635,6 +34670,9 @@ class RiderController extends Controller
                 'is_holiday' => $isHoliday,
                 'holiday_name' => $isHoliday ? $holidays[$ds] : null,
                 'is_override' => $isOverride,
+                // 🔁 One of his weekly days — and WHERE, since on those days the place moves.
+                'pattern_day' => (bool) ($shift['pattern_day'] ?? false),
+                'location_name' => $shift['location_name'] ?? null,
                 // "Not needed" only matters on a would-be WORKING day (off/holiday win).
                 'is_not_needed' => (isset($dayTags[$ds]) && !$isOff && !$isHoliday),
                 'is_today' => $ds === $today,
@@ -34835,6 +34873,9 @@ class RiderController extends Controller
                 'end' => substr($pendingAck->shiftTemplate->shift_end, 0, 5),
                 'effective_from' => $pendingAck->effective_from ? $pendingAck->effective_from->format('Y-m-d') : null,
                 'effective_to' => $pendingAck->effective_to ? $pendingAck->effective_to->format('Y-m-d') : null,
+                // 🔁 The weekly days he is confirming (Roman Urdu — he reads it). '' = none.
+                'weekly_summary' => \App\Services\Ops\WeekdayPattern::summary(
+                    \App\Services\Ops\WeekdayPattern::parse($pendingAck->day_pattern ?? null), 'ur'),
             ];
         }
 
@@ -34842,26 +34883,42 @@ class RiderController extends Controller
         // or an upcoming primary switch whose effective_from is tomorrow). Triggering on the
         // start of a change — not merely "tomorrow ≠ today" — means we DON'T nag with a
         // "back to normal" reminder the day after a temporary shift ends.
+        // 🔁 Oct-2026 (owner ruling R4): with WEEKLY DAYS his week moves by design — LaCarne
+        //   09:30 on Wednesday, the office at 11:00 on Friday — so on those weeks the reminder
+        //   fires whenever tomorrow differs from today, the PLACE included.
         $reminder = null;
         $tomorrow = now()->addDay()->format('Y-m-d');
         $startsTomorrow = \App\Models\Ops\UserShiftAssignmentModel::where('user_id', $uid)
             ->whereDate('effective_from', $tomorrow)
             ->exists();
-        if ($startsTomorrow) {
+        // ⚠ This endpoint is polled every 30 s by every phone — resolve only when it can matter.
+        $hasWeekly = !$startsTomorrow && \App\Services\Ops\WeekdayPattern::available()
+            && \App\Models\Ops\UserShiftAssignmentModel::where('user_id', $uid)
+                ->whereNotNull('day_pattern')
+                ->where(function ($q) use ($today) {
+                    $q->whereNull('effective_to')->orWhereDate('effective_to', '>=', $today);
+                })
+                ->exists();
+        if ($startsTomorrow || $hasWeekly) {
             $svc = new \App\Services\ShiftResolutionService();
             $tomShift = $svc->getUserShift($uid, $tomorrow);
             $todShift = $svc->getUserShift($uid, $today);
+            $weeklyInPlay = !empty($tomShift['weekly']) || !empty($todShift['weekly']);
             $tomorrowDow = (int) now()->addDay()->dayOfWeekIso; // 1=Mon..7=Sun
             $differs = ($tomShift['shift_id'] ?? null) !== ($todShift['shift_id'] ?? null)
                 || $tomShift['shift_start'] !== $todShift['shift_start']
-                || $tomShift['shift_end'] !== $todShift['shift_end'];
+                || $tomShift['shift_end'] !== $todShift['shift_end']
+                || ($weeklyInPlay && ($tomShift['location_id'] ?? null) !== ($todShift['location_id'] ?? null));
             $worksTomorrow = in_array($tomorrowDow, $tomShift['working_days'] ?? []);
-            if ($differs && $worksTomorrow) {
+            // ⚠ Weekly days somewhere ahead are not enough — today or tomorrow must be on a
+            //   row that HAS them, else this is the "back to normal" nag the rule above avoids.
+            if ($differs && $worksTomorrow && ($startsTomorrow || $weeklyInPlay)) {
                 $reminder = [
                     'date' => $tomorrow,
                     'shift_name' => $tomShift['shift_name'],
                     'start' => $tomShift['shift_start'],
                     'end' => $tomShift['shift_end'],
+                    'location_name' => $tomShift['location_name'] ?? null,
                 ];
             }
         }
@@ -34892,9 +34949,13 @@ class RiderController extends Controller
 
         $rows = \App\Models\Ops\UserShiftAssignmentModel::with('shiftTemplate')
             ->where('user_id', $uid)->get();
+        // ⚠ A closed REGULAR row (ended because a new regular began) is not a temporary change:
+        //   it must not show as "upcoming" with a confirm button, nor as a past temporary change.
+        $closedRegular = $svc->closedRegularIds($uid, $rows);
         $upcoming = [];
         $history = [];
         foreach ($rows as $row) {
+            if (!is_null($row->effective_to) && !$svc->isTemporaryRow($row, $closedRegular)) continue;
             $f = $row->effective_from ? $row->effective_from->format('Y-m-d') : null;
             $t = $row->effective_to ? $row->effective_to->format('Y-m-d') : null;
             $nm = optional($row->shiftTemplate)->shift_name;
@@ -34912,6 +34973,9 @@ class RiderController extends Controller
                     'to' => $t,
                     'kind' => $isFutureTemp ? 'temporary' : 'primary',
                     'acknowledged' => $row->acknowledged_at !== null,
+                    // 🔁 Additive — the weekly days that come with this change ('' = none).
+                    'weekly_summary' => \App\Services\Ops\WeekdayPattern::summary(
+                        \App\Services\Ops\WeekdayPattern::parse($row->day_pattern ?? null), 'ur'),
                 ];
             } elseif ($t !== null && $t < $today && ($f === null || $t >= $f)) {
                 // Past bounded override → history. Skip dead/zero-length rows (to < from),
@@ -34922,6 +34986,33 @@ class RiderController extends Controller
         // Newest-first history, cap to a handful.
         usort($history, fn($a, $b) => strcmp($b['to'] ?? '', $a['to'] ?? ''));
         $history = array_slice($history, 0, 6);
+
+        /**
+         * 🔁 THIS WEEK, day by day (Oct-2026). With weekly days his shift and place move
+         * through the week, so "NOW" alone no longer tells him where to be on Wednesday.
+         * Each day is resolved by the SAME engine check-in and lateness use, so what he reads
+         * here is exactly what he will be measured against (covers and holidays included).
+         * ⚠ Additive: an older APK ignores `week`. The new one shows it only when
+         *   `has_weekly` is true, so nobody else's screen changes.
+         */
+        $week = [];
+        $hasWeekly = false;
+        for ($i = 0; $i < 7; $i++) {
+            $ds = now()->addDays($i)->format('Y-m-d');
+            $s = $svc->getUserShift($uid, $ds);
+            $kind = $svc->dayKind($uid, $ds);   // working | off | holiday | not_needed | not_joined
+            if (!empty($s['weekly'])) $hasWeekly = true;
+            $week[] = [
+                'date' => $ds,
+                'dow' => $dayNames[(int) date('N', strtotime($ds))],
+                'kind' => $kind,
+                'shift_name' => $s['shift_name'],
+                'start' => $s['shift_start'],
+                'end' => $s['shift_end'],
+                'location_name' => $s['location_name'] ?? null,
+                'pattern_day' => (bool) ($s['pattern_day'] ?? false),
+            ];
+        }
 
         return response()->json([
             'success' => true,
@@ -34934,6 +35025,8 @@ class RiderController extends Controller
             ],
             'upcoming' => $upcoming,
             'history' => $history,
+            'week' => $week,
+            'has_weekly' => $hasWeekly,
         ]);
     }
 }

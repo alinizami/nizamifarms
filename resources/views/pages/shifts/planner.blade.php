@@ -63,6 +63,17 @@
   .pm-day-chips { display:flex; gap:6px; flex-wrap:wrap; }
   .pm-day-chip { border:1px solid var(--line); border-radius:8px; padding:6px 10px; font-size:12px; font-weight:600; color:#334155; cursor:pointer; }
   .pm-day-chip.off { background:#EEF2F7; color:#94a3b8; text-decoration:line-through; }
+  /* 🔁 Weekly days ("different on some days") — Oct-2026 */
+  .chip-wk { display:inline-flex; align-items:center; gap:2px; font-size:9.5px; font-weight:700; color:#1d4ed8; margin-top:1px; align-self:flex-start; }
+  .wk-line { display:block; font-size:10.5px; font-weight:600; color:#1d4ed8; margin-top:3px; white-space:normal; max-width:260px; }
+  #assignModal .wk-toggle { background:none; border:0; padding:0; color:#1d4ed8; font-size:12.5px; font-weight:700; cursor:pointer; margin-top:12px; }
+  #assignModal .wk-help { font-size:11.5px; color:#64748b; margin:6px 0 8px; line-height:1.45; }
+  #assignModal .wk-row { display:grid; grid-template-columns:38px 1fr 1fr; gap:6px; align-items:center; padding:4px 0; border-top:1px solid #EEF1F6; }
+  #assignModal .wk-row:first-child { border-top:0; }
+  #assignModal .wk-day { font-size:12px; font-weight:700; color:#334155; }
+  #assignModal .wk-sel { width:100%; padding:6px 7px; font-size:12px; border:1px solid var(--line); border-radius:7px; background:#fff; color:#0f172a; }
+  #assignModal .wk-sel.on { border-color:#93C5FD; background:#EFF6FF; }
+  #assignModal .wk-clear { background:none; border:0; padding:0; color:#B91C1C; font-size:11.5px; font-weight:700; cursor:pointer; margin-top:6px; }
   /* Self-contained modal — scoped under #assignModal so the Metronic theme's
      component CSS can't override the width or hide the buttons. */
   :is(#assignModal,#newLocModal,#newShiftModal,#historyModal,#rosterModal) .pm-card{ background:#fff; border-radius:14px; box-shadow:0 25px 60px rgba(15,23,42,.35); width:100%; max-width:440px; margin:auto; max-height:calc(100vh - 32px); overflow-y:auto; }
@@ -124,6 +135,8 @@
     <div class="text-xs text-gray-400 flex items-center gap-3 ml-auto">
       <span><span class="inline-block w-3 h-3 rounded-sm align-middle" style="background:#FBECEC;border:1px solid #F3D6D6"></span> temporary change</span>
       <span><span class="inline-block w-3 h-3 rounded-sm align-middle" style="background:#EEF2F7;border:1px dashed #cbd5e1"></span> off day</span>
+      {{-- 🔁 A weekly day: part of his standing week, not a one-off — so no red, no pin. --}}
+      <span><span style="color:#1d4ed8;font-weight:700;">🔁</span> weekly day</span>
       <span><span class="inline-block w-3 h-3 rounded-sm align-middle" style="background:#E0E7FF;border:1px solid #C7D2FE"></span> not needed</span>
       {{-- 🔧 A workshop errand does NOT change the day — the rider still works and is
            still paid. It is here so whoever plans the shift can set that day's times
@@ -195,6 +208,19 @@
         <label class="pm-label">Location <span style="font-weight:400;color:#94a3b8;">— where they check in</span></label>
         <div id="locBubbles" class="loc-bubbles"></div>
         <label id="setDefaultWrap" class="loc-default"><input type="checkbox" id="mSetDefault"> <span id="setDefaultLbl">Make this their default location</span></label>
+      </div>
+
+      {{-- 🔁 WEEKLY DAYS (owner ruling 12-Oct-2026): not a fourth choice — a link INSIDE
+           "New regular shift" and "A date range". Closed = nothing is sent: a regular change
+           keeps whatever weekly days the person already has; a date range has none. Open =
+           exactly these seven rows are saved ("Same as above" everywhere = none). --}}
+      <div id="weeklySection" style="display:none;">
+        <button type="button" id="weeklyToggle" class="wk-toggle" onclick="toggleWeekly()">🔁 Different on some days?</button>
+        <div id="weeklyBody" style="display:none;">
+          <div class="wk-help" id="weeklyHelp"></div>
+          <div id="weeklyRows"></div>
+          <button type="button" class="wk-clear" onclick="clearWeekly()">Remove weekly days</button>
+        </div>
       </div>
 
       <p id="effectLine" class="pm-effect"></p>
@@ -299,6 +325,12 @@ let DATA = null;
 let SEL = new Set();     // selected user ids
 let TARGET = [];         // users being assigned in the modal [{id,name}]
 let MODE = 'until_changed';
+/* 🔁 Weekly days in the open popup — same shape the server stores:
+   { "1": {template_id, location_id}, "2": "off", … }; a missing weekday = "Same as above".
+   WEEKLY_OPEN = the section is open → exactly WEEKLY is sent. Closed → nothing is sent. */
+let WEEKLY = {};
+let WEEKLY_OPEN = false;
+const WK_DAYS = [[1,'Mon'],[2,'Tue'],[3,'Wed'],[4,'Thu'],[5,'Fri'],[6,'Sat'],[7,'Sun']];
 
 function post(url, body) {
   return fetch(url, { method:'POST', headers:{'Content-Type':'application/json','X-CSRF-TOKEN':CSRF}, body:JSON.stringify(body) }).then(r=>r.json())
@@ -449,7 +481,9 @@ function renderGrid() {
         ? `<span class="ack-yes">✓ confirmed</span>`
         : `<span class="ack-no">⏳ awaiting</span>`;
       const ackCls = c.acknowledged ? '' : 'badge-ack';
-      return `<span class="badge-chg ${ackCls}">${c.kind==='temporary'?'⏱':'⏭'} ${lbl} ${ackTxt}
+      // 🔁 This change carries weekly days — hover shows which.
+      const wk = c.weekly_summary ? ` <span title="Weekly days: ${escapeHtml(c.weekly_summary)}">🔁</span>` : '';
+      return `<span class="badge-chg ${ackCls}">${c.kind==='temporary'?'⏱':'⏭'} ${lbl}${wk} ${ackTxt}
         <button title="Cancel this change" onclick="cancelChange(${c.assignment_id})" class="ml-1 text-red-700 hover:text-red-900 font-bold">×</button></span>`;
     }).join(' ');
 
@@ -457,7 +491,7 @@ function renderGrid() {
       const isToday = c.date===DATA.today;
       let cls='chip-work', body='', clickable=false;
       if (c.is_holiday) { cls='chip-holiday'; body=`<span>Holiday</span>`; }
-      else if (c.is_off) { cls='chip-off'; body=`<span>Off</span>`; }
+      else if (c.is_off) { cls='chip-off'; body=`<span>Off${c.pattern_day?' <span title="Off on this weekday — part of the weekly days">🔁</span>':''}</span>`; }
       else if (c.not_needed) {
         // Tagged "not needed" — paid, not counted absent. Click to undo.
         cls='chip-notneeded'; clickable=true;
@@ -468,8 +502,12 @@ function renderGrid() {
         clickable=true;
         // 📍 pin ONLY when this day's location differs from the rider's usual one —
         // a normal week shows no pins, so a pin always means "different place that day".
-        const locPin = (c.location_id && r.usual_location_id && c.location_id !== r.usual_location_id)
-          ? `<span class="chip-loc" title="At ${escapeHtml(c.location_name||'')} this day">📍 ${escapeHtml(c.location_name||'')}</span>` : '';
+        // 🔁 A WEEKLY day never gets the pin (it would fire every week and stop meaning
+        //    anything — owner ruling R6); it names its place in blue under a 🔁 instead.
+        const locPin = c.pattern_day
+          ? `<span class="chip-wk" title="Weekly day — every ${escapeHtml(DATA.days.find(d=>d.date===c.date)?.label||'')}">🔁 ${escapeHtml(c.location_name||'')}</span>`
+          : ((c.location_id && r.usual_location_id && c.location_id !== r.usual_location_id)
+            ? `<span class="chip-loc" title="At ${escapeHtml(c.location_name||'')} this day">📍 ${escapeHtml(c.location_name||'')}</span>` : '');
         body=`<span class="chip-nm">${c.start}${c.end?'–'+c.end:'+'}</span><span class="text-[10px] opacity-70">${c.shift_name}</span>${locPin}`;
       }
 
@@ -530,7 +568,12 @@ function renderGrid() {
             <span class="font-semibold text-sm text-gray-900">${r.name}</span>
             <span class="block text-[11px] text-gray-400">${r.role||''}</span>
             ${r.off_roster ? `<span class="block text-[10px] font-semibold text-amber-600" title="Hidden from the attendance list, but still has a shift change to settle. Cancel it, or put them back on the list in Attendance → People &amp; Rider List.">not in attendance</span>` : ''}
-            <span class="pchip mt-1">${r.primary.start}${r.primary.end?'–'+r.primary.end:'+'} · ${r.primary.shift_name}${r.primary.location_name?' · 📍'+r.primary.location_name:''}</span>
+            ${(r.weekly && r.regular)
+              /* 🔁 With weekly days the chip shows his REGULAR shift (today's resolved one may
+                 itself be a weekly day), and the weekly days on the line under it. */
+              ? `<span class="pchip mt-1">${r.regular.start}${r.regular.end?'–'+r.regular.end:'+'} · ${escapeHtml(r.regular.shift_name)}${r.regular.location_name?' · 📍'+escapeHtml(r.regular.location_name):''}</span>
+                 <span class="wk-line">🔁 ${escapeHtml(r.weekly.summary)}</span>`
+              : `<span class="pchip mt-1">${r.primary.start}${r.primary.end?'–'+r.primary.end:'+'} · ${r.primary.shift_name}${r.primary.location_name?' · 📍'+r.primary.location_name:''}</span>`}
             ${locked
               ? `<span class="text-[11px] text-gray-400 ml-1" title="${escapeHtml(r.lock_reason||'')}">${escapeHtml(r.lock_reason||'Locked')}</span>`
               : `<button onclick="openAssignOne(${r.user_id})" class="ml-1 text-xs text-red-600 font-semibold hover:underline">${r.needs_approval?'Ask to change':'Change'}</button>`}
@@ -604,6 +647,7 @@ function onTemplateChange(){
   if(untilOpt) untilOpt.style.display = nr ? 'none' : '';
   const loc = document.getElementById('locSection'); if(loc) loc.style.display = nr ? 'none' : '';
   if(nr && MODE==='until_changed') setMode('one_day');
+  syncWeeklyUi();
   renderEffect();
 }
 function openAssignOne(id){
@@ -646,11 +690,29 @@ function openAssignModal(){
    *   would have fired on nearly every save. The effect line below says the same thing
    *   without a click, and always.
    */
-  setMode('one_day');
   // Default location: the rider's own (single) → else the primary location.
   const primary=(DATA.locations||[]).find(l=>l.is_primary) || (DATA.locations||[])[0];
   const riderDefault=(TARGET.length===1) ? (DATA.riders.find(x=>x.user_id===TARGET[0].id)||{}).default_location_id : null;
   SELLOC = riderDefault || (primary?primary.id:null);
+  /* 🔁 One person who already HAS weekly days: open the section with them filled in, and
+     put his regular shift + place in the boxes above — otherwise a Save made to tweak one
+     weekday would also quietly move his regular shift to whatever the list starts on. */
+  WEEKLY = {}; WEEKLY_OPEN = false;
+  if (TARGET.length===1) {
+    const rr = DATA.riders.find(x=>x.user_id===TARGET[0].id) || {};
+    const sel = document.getElementById('mTemplate');
+    // ⚠ Only when his regular shift is one this list can offer. If it is not (inactive, or not
+    //   allowed for him), opening pre-filled would let a weekday tweak quietly move his regular
+    //   shift to whatever the list starts on — so stay closed: a save then KEEPS his weekly days.
+    const offered = rr.regular && [...sel.options].some(o=>o.value===String(rr.regular.template_id));
+    if (rr.weekly && rr.weekly.days && offered) {
+      WEEKLY = JSON.parse(JSON.stringify(rr.weekly.days));
+      WEEKLY_OPEN = true;
+      sel.value = String(rr.regular.template_id);
+      if (rr.regular.location_id) SELLOC = rr.regular.location_id;
+    }
+  }
+  setMode('one_day');
   document.getElementById('mSetDefault').checked=false;
   renderLocBubbles();
   onTemplateChange(); // reset not-required UI state (restores "until changed" + location)
@@ -666,7 +728,104 @@ function syncApprovalUi(){
   if (btn) btn.style.background = needs ? '#B45309' : '';
 }
 function closeAssign(){ document.getElementById('assignModal').style.display='none'; }
-function setMode(m){ MODE=m; document.querySelectorAll('.mode-opt').forEach(el=>el.classList.toggle('on', el.dataset.mode===m)); document.getElementById('toWrap').style.display = (m==='date_range')?'block':'none'; document.getElementById('fromLabel').textContent = (m==='one_day')?'Day':'From'; renderEffect(); }
+function setMode(m){ MODE=m; document.querySelectorAll('.mode-opt').forEach(el=>el.classList.toggle('on', el.dataset.mode===m)); document.getElementById('toWrap').style.display = (m==='date_range')?'block':'none'; document.getElementById('fromLabel').textContent = (m==='one_day')?'Day':'From'; syncWeeklyUi(); renderEffect(); }
+
+/* 🔁 ─── WEEKLY DAYS ("different on some days") ─────────────────────────────────────── */
+function weeklyApplies(){
+  // Regular and Date range only; never for "Not required"; only once the SQL has run.
+  return !!(DATA && DATA.weekly_available) && MODE!=='one_day' && !isNotRequiredSelected();
+}
+function weeklyTemplates(){
+  // The same list the main dropdown offers — never a type the gate would refuse.
+  const allowed = allowedTemplatesForTargets();
+  return allowed ? DATA.templates.filter(t=>allowed.indexOf(t.id)>=0) : DATA.templates;
+}
+function syncWeeklyUi(){
+  const sec = document.getElementById('weeklySection'); if(!sec) return;
+  const on = weeklyApplies();
+  sec.style.display = on ? 'block' : 'none';
+  document.getElementById('weeklyBody').style.display = (on && WEEKLY_OPEN) ? 'block' : 'none';
+  document.getElementById('weeklyToggle').textContent = WEEKLY_OPEN ? '🔁 Different on some days ▴' : '🔁 Different on some days?';
+  /* ⭐ 13-Oct: a temporary change replaces only the dates it covers, so this sentence is
+     true inside a date range too — a one-day cover changes that day and the range keeps the rest. */
+  document.getElementById('weeklyHelp').innerHTML =
+    'Pick a different shift and place, or <b>Off</b>, for any weekday. Days left on <b>Same as above</b> follow the shift, place and off days chosen above. A one-day change later still wins just its day.';
+  if (on && WEEKLY_OPEN) renderWeeklyRows();
+}
+function toggleWeekly(){ WEEKLY_OPEN = !WEEKLY_OPEN; syncWeeklyUi(); renderEffect(); }
+function clearWeekly(){ WEEKLY = {}; renderWeeklyRows(); renderEffect(); }
+function renderWeeklyRows(){
+  const tpls = weeklyTemplates();
+  const locs = DATA.locations || [];
+  document.getElementById('weeklyRows').innerHTML = WK_DAYS.map(([n,lbl])=>{
+    const e = WEEKLY[n];
+    const isOff = e==='off';
+    const tId = (e && e!=='off') ? e.template_id : null;
+    const lId = (e && e!=='off') ? e.location_id : null;
+    // A type no longer offered (inactive / not allowed) still shows, so nothing silently changes.
+    const extra = (tId && !tpls.some(t=>t.id===tId)) ? `<option value="t:${tId}" selected>shift #${tId} (no longer offered)</option>` : '';
+    const tSel = `<select class="wk-sel ${e?'on':''}" onchange="setWeekDay(${n}, this.value)">
+        <option value="" ${!e?'selected':''}>Same as above</option>
+        <option value="off" ${isOff?'selected':''}>Off</option>
+        ${tpls.map(t=>`<option value="t:${t.id}" ${tId===t.id?'selected':''}>${escapeHtml(t.name)} · ${t.start}</option>`).join('')}${extra}
+      </select>`;
+    const lSel = tId
+      ? `<select class="wk-sel on" onchange="setWeekLoc(${n}, this.value)">
+          <option value="" ${!lId?'selected':''}>Same place as above</option>
+          ${locs.map(l=>`<option value="${l.id}" ${lId===l.id?'selected':''}>${escapeHtml(l.name)}</option>`).join('')}
+          ${(lId && !locs.some(l=>l.id===lId)) ? `<option value="${lId}" selected>place #${lId}</option>` : ''}
+        </select>`
+      : `<span style="font-size:11px;color:#94a3b8;">${isOff?'day off':'same place'}</span>`;
+    return `<div class="wk-row"><span class="wk-day">${lbl}</span>${tSel}${lSel}</div>`;
+  }).join('');
+}
+function setWeekDay(n, v){
+  if (!v) delete WEEKLY[n];
+  else if (v==='off') WEEKLY[n] = 'off';
+  else {
+    const prev = WEEKLY[n];
+    // A new shift on a day starts at the place chosen above; the planner moves it if needed.
+    const loc = (prev && prev!=='off' && prev.location_id) ? prev.location_id : (SELLOC || null);
+    WEEKLY[n] = { template_id: parseInt(v.slice(2)), location_id: loc };
+  }
+  renderWeeklyRows(); renderEffect();
+}
+function setWeekLoc(n, v){
+  const e = WEEKLY[n]; if (!e || e==='off') return;
+  e.location_id = parseInt(v) || null; renderEffect();
+}
+/* "Mon, Wed, Thu: LaCarne 09:30 @ Orchard Lacarne · Tue: off" — the server's wording. */
+function weeklySummaryText(map){
+  const groups = new Map();
+  WK_DAYS.forEach(([n,lbl])=>{
+    const e = map[n]; if (!e) return;
+    let label;
+    if (e==='off') label = 'off';
+    else {
+      const t = DATA.templates.find(x=>x.id===e.template_id);
+      const l = (DATA.locations||[]).find(x=>x.id===e.location_id);
+      label = (t ? `${t.name} ${t.start}${t.end?'–'+t.end:''}` : 'shift #'+e.template_id) + (l ? ' @ '+l.name : '');
+    }
+    if (!groups.has(label)) groups.set(label, []);
+    groups.get(label).push(lbl);
+  });
+  return [...groups.entries()].map(([label,days])=>days.join(', ')+': '+label).join(' · ');
+}
+function weeklyEffectText(){
+  if (!weeklyApplies()) return '';
+  const withWeekly = TARGET.map(t=>DATA.riders.find(x=>x.user_id===t.id)).filter(r=>r && r.weekly);
+  const names = withWeekly.map(r=>escapeHtml(r.name)).join(', ');
+  const sum = weeklySummaryText(WEEKLY);
+  if (WEEKLY_OPEN) {
+    if (sum) return `<br><span style="color:#1d4ed8;font-weight:600;">🔁 Except — ${escapeHtml(sum)}.</span>`;
+    if (withWeekly.length) return `<br><span style="color:#b45309;font-weight:600;">🔁 Weekly days removed for ${names} — every day follows the shift above.</span>`;
+    return '';
+  }
+  if (!withWeekly.length) return '';
+  return MODE==='until_changed'
+    ? `<br><span style="color:#1d4ed8;">🔁 ${names} keep${withWeekly.length===1?'s':''} ${withWeekly.length===1?'his':'their'} weekly days as they are.</span>`
+    : `<br><span style="color:#b45309;">🔁 ${names}'s weekly days are paused for these dates — every day is this shift. Open “Different on some days?” to keep them.</span>`;
+}
 function renderEffect(){
   const from = document.getElementById('mFrom').value, to=document.getElementById('mTo').value;
   const who = TARGET.length===1?TARGET[0].name:(TARGET.length+' people');
@@ -687,6 +846,8 @@ function renderEffect(){
   if(MODE!=='until_changed' && end && end < DATA.today){
     msg += `<br><span style="color:#b45309;font-weight:600;">✎ Correcting a past period — attendance will recalculate. The rider is not notified (nothing to confirm).</span>`;
   }
+  // 🔁 What happens to weekly days — always said out loud, open or closed.
+  msg += weeklyEffectText();
   /* ⏳ The most important sentence in the box when approval applies: nothing happens yet,
      and the person is NOT told. Without it a manager assumes the change has landed. */
   if(targetsNeedApproval()){
@@ -725,6 +886,9 @@ async function saveAssign(){
   if(MODE==='date_range') payload.effective_to=to;
   if(MODE==='one_day') payload.effective_to=from;
   if(SELLOC){ payload.location_id=SELLOC; payload.set_default_location=document.getElementById('mSetDefault').checked; }
+  /* 🔁 Sent ONLY when the section is open: then these rows are the weekly days ("{}" = none).
+     Closed → the key is absent → a regular change keeps each person's weekly days. */
+  if (weeklyApplies() && WEEKLY_OPEN) payload.day_pattern = JSON.stringify(WEEKLY);
   let json;
   if(TARGET.length===1){ payload.user_id=TARGET[0].id; json=await post('/shifts/assign',payload); }
   else { payload.user_ids=TARGET.map(t=>t.id); json=await post('/shifts/bulk-assign',payload); }

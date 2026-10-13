@@ -148,14 +148,18 @@
 
                     <!-- Expense Category (for expense requests only) -->
                     <div id="expense-category-field" style="display: none;" class="mb-6">
-                        <label class="kt-label required">Expense Type</label>
+                        <div style="display:flex;align-items:center;gap:8px">
+                            <label class="kt-label required">Expense Type</label>
+                            @if(\App\Services\FIN\ExpenseTypeService::canManage())
+                                {{-- ⭐ Oct-2026: rename / turn off / order / group, right where the list is used --}}
+                                <button type="button" class="nfet-trigger" onclick="NFExpenseTypes.open('expense_category')" title="Rename, turn off, reorder or group expense types">✎ Manage types</button>
+                            @endif
+                        </div>
                         <select name="expense_category" id="expense_category" class="kt-select" onchange="handleExpenseCategoryChange()">
                             <option value="">Select Expense Type</option>
                             @php
-                                $expenseCategories = \App\Models\FIN\ConfigModel::where('config_key', 'LIKE', 'EXPENSE_CATEGORY_%')
-                                    ->where('config_key', '!=', 'EXPENSE_CATEGORY_STAFF_SALARIES') // salaries go through Payroll now
-                                    ->orderBy('config_value')
-                                    ->pluck('config_value');
+                                // Oct-2026: active types from the one engine (Staff Salaries never offered).
+                                $expenseCategories = collect(\App\Services\FIN\ExpenseTypeService::names(1, 'expense'));
                             @endphp
                             @if($expenseCategories->count() > 0)
                                 @foreach($expenseCategories as $cat)
@@ -169,6 +173,24 @@
                             @endif
                             <option value="__ADD_NEW__" style="background-color: #f3f4f6; font-weight: bold; color: #059669;">➕ Add New Category...</option>
                         </select>
+                        @include('fin.expense-types._manager')
+                        <script>
+                            // Scope = the chosen request type's business unit + code (only Expense shows this field).
+                            NFExpenseTypes.register('expense_category', {
+                                scope: function () {
+                                    var cat = document.getElementById('category_id');
+                                    var opt = cat ? cat.options[cat.selectedIndex] : null;
+                                    return {
+                                        bu: (opt && opt.dataset && opt.dataset.bu) || 1,
+                                        rcc: (opt && opt.dataset && opt.dataset.code) || 'expense'
+                                    };
+                                },
+                                label: function () {
+                                    var cat = document.getElementById('category_id');
+                                    return cat && cat.selectedIndex > 0 ? cat.options[cat.selectedIndex].text.trim() : 'Expense Reimbursement';
+                                }
+                            });
+                        </script>
                         <p class="text-xs text-gray-500 mt-1">Select the type of expense for proper accounting, or add a new category</p>
                     </div>
 
@@ -388,6 +410,8 @@ function handlePaySourceChange() {
 }
 
 function handleCategoryChange() {
+    // Oct-2026: Expense Type list follows the chosen request type (same rule as the phone).
+    if (window.NFExpenseTypes) NFExpenseTypes.render('expense_category');
     const select = document.getElementById('category_id');
     const selectedOption = select.options[select.selectedIndex];
     const categoryCode = selectedOption.dataset.code;
@@ -671,6 +695,9 @@ function submitInlineCategory() {
         method: 'POST',
         headers: {
             'Content-Type': 'application/json',
+            // Oct-2026: ask for JSON — without it the controller answers with a redirect and
+            // this form showed an error after a successful add.
+            'Accept': 'application/json',
             'X-CSRF-TOKEN': '{{ csrf_token() }}'
         },
         body: JSON.stringify({ category_name: categoryName })
@@ -696,6 +723,8 @@ function submitInlineCategory() {
             closeInlineExpenseCategoryModal();
             document.getElementById('inline_category_name').value = '';
             
+            // Oct-2026: re-sync with the engine (order, groups) — keeps the new type selected.
+            if (window.NFExpenseTypes) NFExpenseTypes.refresh();
             alert('✓ Category "' + categoryName + '" created successfully!');
         } else {
             alert('Error: ' + (data.message || 'Failed to create category'));

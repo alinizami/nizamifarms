@@ -14,6 +14,14 @@ use Illuminate\Validation\Rule;
  */
 class PayrollController extends Controller
 {
+    use \App\Http\Controllers\Concerns\TimeBankEndpoints;
+
+    /** ⏱ Time-bank endpoints share the trait with the web controller (same gate: manage_payroll). */
+    protected function timeBankDeny(Request $request)
+    {
+        return $this->denyIfNotManager($request);
+    }
+
     private function denyIfNotManager(Request $request)
     {
         $user = $request->user();
@@ -65,7 +73,7 @@ class PayrollController extends Controller
         $v = Validator::make($request->all(), [
             'user_id'  => 'required|integer',
             'month'    => 'required|string',
-            'kind'     => 'required|in:overtime,late_penalty,absence',
+            'kind'     => 'required|in:overtime,late_penalty,absence,time_bank',
             'decision' => 'required|in:apply,waive,cut,park,excuse',
         ]);
         if ($v->fails()) {
@@ -275,7 +283,19 @@ class PayrollController extends Controller
         if (!$user) {
             return response()->json(['success' => false, 'message' => 'Not authenticated.'], 401);
         }
-        $month = $this->normMonth($request->input('month'));
+        // ⏱ Oct-2026 — with no month asked for, open on the LATEST PAID month for a week after
+        // it is paid (so the rider sees what he was actually paid), otherwise this month.
+        $asked = $request->input('month');
+        $month = $this->normMonth($asked);
+        $lastPaid = null;
+        try {
+            $lastPaid = \Illuminate\Support\Facades\DB::table('t_hr_payroll_payment')
+                ->where('user_id', $user->id)->where('status', 'paid')
+                ->orderByDesc('paid_at')->first(['pay_month', 'paid_at']);
+        } catch (\Throwable $e) { $lastPaid = null; }
+        if (!$asked && $lastPaid && $lastPaid->paid_at && strtotime((string) $lastPaid->paid_at) >= strtotime('-7 days')) {
+            $month = (string) $lastPaid->pay_month;
+        }
         try {
             $svc = new PayrollService();
             $row = $svc->computeRow((int) $user->id, $month);
@@ -302,22 +322,68 @@ class PayrollController extends Controller
             // own endpoint only.
             $granted = null;
             $otStatus = 'pending';
-            try {
+            if (($row['time_bank'] ?? null) !== null) {
+                // ⏱ Time-bank month: computeRow already carries what was DECIDED (0 until then).
+                $tbStatus = (string) ($row['time_bank']['status'] ?? '');
+                $otStatus = $tbStatus === 'decided' ? 'applied' : 'pending';
+                $granted = (float) ($row['bonus_leaves'] ?? 0);
+            } else try {
                 foreach ($svc->leaveActionsForRow($row, $month) as $a) {
                     if (($a['kind'] ?? '') !== 'overtime') { continue; }
                     $otStatus = (string) ($a['status'] ?? 'pending');
                     if ($otStatus === 'applied') { $granted = (float) ($a['applied_days'] ?? 0); }
                 }
             } catch (\Throwable $e) { /* undecided → nothing granted */ }
-            $row['bonus_leaves_recommended'] = (int) ($row['bonus_leaves'] ?? 0);
             $row['bonus_leaves'] = $granted !== null ? $granted : 0;
             $row['bonus_leaves_status'] = $otStatus;   // pending | applied | waived
+            // ⏱ A rider sees facts and decisions, never suggestions or what-ifs (plan §5.1):
+            // the manager's statement (suggested choices, rupee previews) stays off this payload.
+            unset($row['time_bank'], $row['bonus_leaves_recommended'], $row['late_flag'],
+                  $row['late_leave_recommended'], $row['late_buffer_min'], $row['late_step_min']);
+
+            // ⏱ Paid month = the FROZEN receipt (what was actually paid), never a recompute.
+            $receipt = null;
+            if ($pays->isNotEmpty()) {
+                $receipt = [
+                    'base_salary'      => (float) $pays->first()->base_salary,
+                    'present_days'     => (int) $pays->sum('present_days'),
+                    'absent_days'      => (float) $pays->sum('absent_days'),
+                    'leave_days'       => (float) $pays->sum('leave_days'),
+                    'absent_deduction' => (float) $pays->sum('absent_deduction'),
+                    'held_absence_deduction' => (float) $pays->sum(fn ($p) => (float) ($p->held_absence_deduction ?? 0)),
+                    'late_minutes'     => (int) $pays->sum('late_minutes'),
+                    'late_deduction'   => (float) $pays->sum('late_deduction'),
+                    'late_leave_deduct'=> (int) $pays->sum('late_leave_deduct'),
+                    'bonus_leaves'     => (int) $pays->sum('bonus_leaves'),
+                    'advance_total'    => (float) $pays->sum('advance_total'),
+                    'net_salary'       => (float) $pays->sum('net_salary'),
+                    'funding'          => $last->funding,
+                    'paid_at'          => (string) $last->paid_at,
+                    'payments'         => $pays->map(fn ($p) => ['paid_at' => (string) $p->paid_at,
+                        'net' => (float) $p->net_salary, 'funding' => $p->funding])->values()->all(),
+                ];
+            }
+
+            // Month chips: this month + the last 3, each paid / estimated.
+            $months = [];
+            $cur = now()->format('Y-m');
+            for ($i = 0; $i < 4; $i++) {
+                $m = date('Y-m', strtotime($cur . "-01 -{$i} month"));
+                $paidM = \Illuminate\Support\Facades\DB::table('t_hr_payroll_payment')
+                    ->where('user_id', $user->id)->where('pay_month', $m)->where('status', 'paid')->exists();
+                $months[] = ['month' => $m, 'label' => date('M', strtotime($m . '-01')),
+                             'paid' => $paidM, 'current' => $m === $cur];
+            }
 
             return response()->json([
                 'success' => true,
                 'month' => $month,
                 'month_label' => date('F Y', strtotime($month . '-01')),
                 'row' => $row,
+                'receipt' => $receipt,
+                'months' => $months,
+                // ⏱ Same engine, rider-safe slice: this month so far + recent decisions.
+                'time_bank' => (new \App\Services\HR\TimeBankService())->riderView((int) $user->id, $month),
             ]);
         } catch (\Throwable $e) {
             \Log::error('Mobile mySalary failed', ['user_id' => $user->id, 'month' => $month, 'error' => $e->getMessage()]);

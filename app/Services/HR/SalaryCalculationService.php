@@ -45,6 +45,26 @@ class SalaryCalculationService
             // 6. Calculate deductions
             $deductions = $this->calculateDeductions($profile, $attendanceData, $advances, $loans, $overrides);
 
+            // ⏱ Time bank (Oct-2026, owner R10): a NEW slip for a time-bank month takes the late
+            // cut the manager DECIDED on the late & extra card (0 until decided) instead of
+            // late hours × the profile rate, and overtime is given as leave, not money. Slips
+            // already made are never recomputed — this runs only when a slip is calculated.
+            try {
+                $tb = new TimeBankService();
+                $ym = substr((string) $month, 0, 7);
+                if ($tb->covers($userId, $ym)) {
+                    if (empty($overrides['waive_late'])) {
+                        $cut = round(array_sum(array_column($tb->cutsLandingOn($userId, $ym), 'amount')), 2);
+                        $deductions['total_deductions'] += $cut - (float) $deductions['late_deduction'];
+                        $deductions['late_deduction'] = $cut;
+                    }
+                    if (!isset($overrides['overtime_hours']) && !isset($overrides['overtime_amount'])) {
+                        $earnings['gross_salary'] -= (float) $earnings['overtime_amount'];
+                        $earnings['overtime_amount'] = 0;
+                    }
+                }
+            } catch (\Throwable $e) { /* never block a slip on the bank */ }
+
             // 7. Calculate net salary
             $netSalary = $earnings['gross_salary'] - $deductions['total_deductions'];
 

@@ -67,6 +67,16 @@ class ShiftChangeRequestService
         if ($mode === 'until_changed') $to = null;
         if ($mode === 'one_day') $to = $from;
 
+        /**
+         * 🔁 Weekly days asked for but the request table cannot hold them yet → refuse BEFORE
+         * anything is touched. (Checked after the withdraw below, a refusal would also have
+         * silently withdrawn the person's earlier waiting request.)
+         */
+        if (($payload['day_pattern'] ?? null) !== null && !WeekdayPattern::requestColumnAvailable()) {
+            return ['ok' => false, 'id' => null,
+                    'message' => 'Weekly days cannot be sent for approval yet — the database update for them has not been run.'];
+        }
+
         try {
             // ⭐ One open request per person per start-date+mode: pressing Save twice, or two
             //   managers asking the same thing, must not put two cards in front of Taimur.
@@ -79,7 +89,7 @@ class ShiftChangeRequestService
                 ->update(['status' => 'withdrawn', 'decided_at' => now(),
                           'decline_reason' => 'Replaced by a newer request']);
 
-            $id = (int) DB::table(self::T)->insertGetId([
+            $row = [
                 'user_id' => $userId,
                 'shift_template_id' => $tplId,
                 'mode' => $mode,
@@ -92,7 +102,19 @@ class ShiftChangeRequestService
                 'source' => $source === 'mobile' ? 'mobile' : 'web',
                 'status' => self::STATUS_OPEN,
                 'created_at' => now(),
-            ]);
+            ];
+            /**
+             * 🔁 Weekly days travel with the request, VERBATIM: NULL = the screen did not
+             * send any (the change keeps his current ones), '{}' = cleared, JSON = these.
+             * ⚠ If the column is missing but weekly days were asked for, refuse rather than
+             *   queue a change that would later be approved WITHOUT them.
+             */
+            $dp = $payload['day_pattern'] ?? null;
+            if ($dp !== null) {
+                // (Column presence was checked BEFORE the older request was withdrawn, above.)
+                $row['day_pattern'] = (string) $dp;
+            }
+            $id = (int) DB::table(self::T)->insertGetId($row);
         } catch (\Throwable $e) {
             Log::error('Shift change request insert failed', ['error' => $e->getMessage()]);
             return ['ok' => false, 'id' => null, 'message' => 'Could not send this for approval.'];
@@ -170,21 +192,26 @@ class ShiftChangeRequestService
     {
         if (!$this->auth->requestsAvailable()) return [];
         try {
+            $cols = ['r.id', 'r.user_id', 'r.mode', 'r.effective_from', 'r.effective_to',
+                     't.shift_name', 'a.fullname as asked_by'];
+            if (WeekdayPattern::requestColumnAvailable()) $cols[] = 'r.day_pattern';
             $rows = DB::table(self::T . ' as r')
                 ->leftJoin('t_ops_shift_template as t', 't.id', '=', 'r.shift_template_id')
                 ->leftJoin('t_sys_user as a', 'a.id', '=', 'r.requested_by')
                 ->where('r.status', self::STATUS_OPEN)
-                ->get(['r.id', 'r.user_id', 'r.mode', 'r.effective_from', 'r.effective_to',
-                       't.shift_name', 'a.fullname as asked_by']);
+                ->get($cols);
         } catch (\Throwable $e) { return []; }
 
         $map = [];
         foreach ($rows as $r) {
+            $weekly = WeekdayPattern::summary(WeekdayPattern::parse($r->day_pattern ?? null));
             $map[(int) $r->user_id][] = [
                 'id' => (int) $r->id,
-                'shift_name' => $r->shift_name,
+                // 🔁 The grid chip reads shift_name — so the weekly days ride on it there.
+                'shift_name' => $r->shift_name . ($weekly ? ' + 🔁 ' . $weekly : ''),
                 'when' => $this->whenLabel($r->mode, $r->effective_from, $r->effective_to),
                 'asked_by' => $r->asked_by ?: 'someone',
+                'weekly_summary' => $weekly,
             ];
         }
         return $map;
@@ -195,12 +222,23 @@ class ShiftChangeRequestService
         $time = $r->shift_start
             ? substr($r->shift_start, 0, 5) . ($r->shift_end ? '–' . substr($r->shift_end, 0, 5) : ' onwards')
             : '';
+        // 🔁 The approver must SEE the weekly days he is saying yes to. Every approval screen
+        //   (desk banner, Shift rules page, phone) prints shift_time, so they ride on it —
+        //   no screen can show the change without them. '{}' = "and remove his weekly days".
+        $dp = $r->day_pattern ?? null;
+        $weekly = WeekdayPattern::summary(WeekdayPattern::parse($dp));
+        if ($weekly) {
+            $time .= ($time ? ' · ' : '') . '🔁 ' . $weekly;
+        } elseif ($dp !== null && $r->mode !== 'one_day' && trim((string) $dp) === '{}') {
+            $time .= ($time ? ' · ' : '') . 'weekly days removed';
+        }
         return [
             'id' => (int) $r->id,
             'user_id' => (int) $r->user_id,
             'person' => $r->person ?: ('#' . $r->user_id),
             'shift_name' => $r->shift_name ?: 'a shift',
             'shift_time' => $time,
+            'weekly_summary' => $weekly,
             'mode' => $r->mode,
             'when' => $this->whenLabel($r->mode, $r->effective_from, $r->effective_to),
             'location_name' => $r->location_name ?? null,
@@ -261,6 +299,8 @@ class ShiftChangeRequestService
         if ($r->effective_to) $payload['effective_to'] = substr((string) $r->effective_to, 0, 10);
         if ($r->location_id)  $payload['location_id'] = (int) $r->location_id;
         if ((int) $r->set_default_location === 1) $payload['set_default_location'] = true;
+        // 🔁 Replay the weekly days exactly as asked. Absent key = "keep his current ones".
+        if (($r->day_pattern ?? null) !== null) $payload[WeekdayPattern::INPUT] = (string) $r->day_pattern;
 
         $req = new Request();
         $req->replace($payload);

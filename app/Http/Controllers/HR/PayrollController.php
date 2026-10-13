@@ -11,6 +11,14 @@ use Illuminate\Validation\Rule;
 
 class PayrollController extends Controller
 {
+    use \App\Http\Controllers\Concerns\TimeBankEndpoints;
+
+    /** ⏱ Time-bank endpoints share the trait; the gate is the same as every payroll action. */
+    protected function timeBankDeny(Request $request)
+    {
+        return $this->denyIfNotAllowed();
+    }
+
     /** One key gates the whole screen: view, generate, set salaries, advances, pay. */
     private function denyIfNotAllowed()
     {
@@ -635,7 +643,7 @@ class PayrollController extends Controller
         $v = Validator::make($request->all(), [
             'user_id'  => 'required|integer',
             'month'    => ['required', 'regex:/^\d{4}-\d{2}$/'],
-            'kind'     => 'required|in:overtime,late_penalty,absence',
+            'kind'     => 'required|in:overtime,late_penalty,absence,time_bank',
             // Absence has three outcomes rather than two; the service rejects the wrong
             // pairing (e.g. kind=overtime with decision=park) with a readable message.
             'decision' => 'required|in:apply,waive,cut,park,excuse',

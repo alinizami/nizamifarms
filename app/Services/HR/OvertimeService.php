@@ -404,6 +404,19 @@ class OvertimeService
         $month = substr($s, 0, 7);
         $wholeMonth = $s === ($month . '-01') && substr($e, 0, 7) === $month;
         if ($wholeMonth) {
+            // ⏱ Time-bank month (Oct-2026): the bank owns the answer — what was GIVEN once
+            // decided, otherwise the suggested extra days (extra covering late first). Every
+            // board that calls this therefore shows the payroll card's number.
+            $tb = new TimeBankService();
+            // A month the OLD panel already turned into leave keeps its old figure (the bank
+            // takes nothing from that kind) — only un-decided months answer from the bank.
+            if ($tb->covers($userId, $month) && !$tb->legacyOtActed($userId, $month)) {
+                $s = $tb->month($userId, $month);
+                if (($s['status'] ?? '') === 'decided') {
+                    return ($s['decision']['ot'] ?? null) === 'give' ? (int) ($s['decision']['ot_days'] ?? 0) : 0;
+                }
+                return (int) ($s['net']['ot_days'] ?? 0);
+            }
             return (new OvertimeCarryService())->preview($userId, $month, $overtimeMinutes)['days'];
         }
         return $this->bonusLeaves($overtimeMinutes);

@@ -1204,6 +1204,8 @@ class AttendanceController extends Controller
             if ($request->filled('leave_sameday_cap'))    { $put('LEAVE_SAMEDAY_CAP', (string) (int) $request->leave_sameday_cap); }
             if ($request->filled('leave_sameday_cutoff')) { $put('LEAVE_SAMEDAY_CUTOFF', substr((string) $request->leave_sameday_cutoff, 0, 5)); }
             if ($request->filled('shift_target_hours'))   { $put('SHIFT_TARGET_HOURS', (string) (float) $request->shift_target_hours); }
+            // ⏱ Time bank (Oct-2026): how many late minutes ONE extra minute covers (0.5 = 9h extra covers 4.5h late).
+            if ($request->filled('ot_late_offset_factor')) { $put('OT_LATE_OFFSET_FACTOR', (string) max(0.1, min(1.0, round((float) $request->ot_late_offset_factor, 2)))); }
             // Checkout rule (Phase H). enabled always written (a 0 is meaningful); numbers when present.
             if ($request->has('checkout_rule_enabled'))   { $put('CHECKOUT_RULE_ENABLED', $request->checkout_rule_enabled ? '1' : '0'); }
             if ($request->filled('checkout_window_mins')) { $put('CHECKOUT_DELIVERY_WINDOW_MINS', (string) (int) $request->checkout_window_mins); }
@@ -1239,6 +1241,7 @@ class AttendanceController extends Controller
             'leave_sameday_cap' => (int) $this->attendanceConfig('LEAVE_SAMEDAY_CAP', 4),
             'leave_sameday_cutoff' => (string) $this->attendanceConfig('LEAVE_SAMEDAY_CUTOFF', '10:00'),
             'shift_target_hours' => (float) $this->attendanceConfig('SHIFT_TARGET_HOURS', 9),
+            'ot_late_offset_factor' => (new \App\Services\HR\TimeBankService())->factor(),
             'checkout_rule_enabled' => (int) $this->attendanceConfig('CHECKOUT_RULE_ENABLED', 0),
             'checkout_window_mins' => (int) $this->attendanceConfig('CHECKOUT_DELIVERY_WINDOW_MINS', 15),
             'checkout_radius_m' => (int) $this->attendanceConfig('CHECKOUT_DELIVERY_RADIUS_M', 150),
@@ -3126,6 +3129,15 @@ class AttendanceController extends Controller
             $userData['overtime_bonus_leaves'] = $otSvcMonth
                 ->bonusLeavesFor($userId, $startDate, $effectiveEndDate, $userData['overtime_target_minutes']);
             $userData['overtime_minutes_per_bonus'] = $otSvcMonth->minutesPerBonusDay();
+            // ⏱ Time bank (Oct-2026): the ONE chip every surface shows for this month
+            // ("Late: −1 leave · choose", "+2 extra leaves given", "3h 10m late → Nov"…).
+            try {
+                $tbS = (new \App\Services\HR\TimeBankService())->month($userId, substr((string) $startDate, 0, 7));
+                $userData['time_bank'] = in_array($tbS['status'] ?? '', ['off', 'excluded', 'before_start'], true) ? null : [
+                    'status' => $tbS['status'], 'chip' => $tbS['chip'] ?? '', 'tone' => $tbS['chip_tone'] ?? 'muted',
+                    'lines' => $tbS['lines'] ?? [], 'result' => $tbS['result'] ?? '',
+                ];
+            } catch (\Throwable $e) { $userData['time_bank'] = null; }
             // Stamp the per-DAY figure onto the day rows too. The Reports page used to derive
             // overtime client-side from logout vs shift_end — a third implementation that
             // could disagree with both the column above and payroll. Now every surface reads

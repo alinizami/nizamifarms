@@ -93,6 +93,10 @@ function wipe(): void {
 
 /** A CLOSED month, so absent days are the whole month rather than "not happened yet". */
 $month = date('Y-m', strtotime('first day of last month'));
+// ⏱ Oct-2026: from Sep 2026 lateness is the TIME BANK's (no free-form late cut — the card
+// decides; covered by test_time_bank_oct12.php). This file proves the OLD-rule shortfall
+// behaviour, so it runs on the last old-rule month.
+if ($month >= \App\Services\HR\TimeBankService::START_MONTH) { $month = '2026-08'; }
 
 echo "month under test: $month\n";
 echo "absence engine:   " . ((new AbsenceDecisionService())->enabled() ? 'on' : 'off') . "\n\n";

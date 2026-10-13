@@ -9,6 +9,7 @@ use App\Services\ShiftResolutionService;
 use App\Models\Ops\ShiftTemplateModel;
 use App\Models\Ops\PublicHolidayModel;
 use App\Models\Ops\UserShiftAssignmentModel;
+use App\Services\Ops\WeekdayPattern;
 
 /**
  * Shift Planner — the single place to see and change who works which shift.
@@ -217,6 +218,8 @@ class ShiftPlannerController extends Controller
         foreach ($users as $u) {
             $uid = (int) $u->user_id;
             $rows = UserShiftAssignmentModel::with('shiftTemplate')->where('user_id', $uid)->get();
+            // ⚠ A closed REGULAR row has an end date too — it is not a temporary change.
+            $closedRegular = $svc->closedRegularIds($uid, $rows);
 
             $cells = [];
             foreach ($dateList as $d) {
@@ -224,10 +227,10 @@ class ShiftPlannerController extends Controller
                 $dow = (int) date('N', strtotime($d));
                 $isHoliday = isset($holidayNames[$d]);
                 $isOff = !in_array($dow, $shift['working_days']);
-                // A bounded row covering this date means it's a temporary override.
-                $isOverride = $rows->first(function ($row) use ($d) {
-                    if (is_null($row->effective_to)) {
-                        return false; // primary, not an override
+                // A TEMPORARY row covering this date means it's an override.
+                $isOverride = $rows->first(function ($row) use ($d, $svc, $closedRegular) {
+                    if (!$svc->isTemporaryRow($row, $closedRegular)) {
+                        return false; // primary (open or closed), not an override
                     }
                     $f = $row->effective_from ? $row->effective_from->format('Y-m-d') : null;
                     $t = $row->effective_to->format('Y-m-d');
@@ -250,6 +253,11 @@ class ShiftPlannerController extends Controller
                     'is_off' => $isOff,
                     'is_holiday' => $isHoliday,
                     'is_override' => $isOverride,
+                    // 🔁 One of his WEEKLY days (a different shift/place, or off, on this
+                    //   weekday). Drawn as an ordinary chip with 🔁 — never the red override
+                    //   chip and never the 📍 "different place" pin, which would otherwise
+                    //   fire every single week and stop meaning anything (owner ruling R6).
+                    'pattern_day' => (bool) ($shift['pattern_day'] ?? false),
                     'not_needed' => $notNeeded,
                     // 🔧 The workshop errand for this rider on this day, or null.
                     // Additive: an older planner blade simply ignores the key.
@@ -264,7 +272,7 @@ class ShiftPlannerController extends Controller
             foreach ($rows as $row) {
                 $f = $row->effective_from ? $row->effective_from->format('Y-m-d') : null;
                 $t = $row->effective_to ? $row->effective_to->format('Y-m-d') : null;
-                if ($t !== null && $t >= $today) {
+                if ($t !== null && $t >= $today && $svc->isTemporaryRow($row, $closedRegular)) {
                     $changes[] = [
                         'assignment_id' => $row->id,
                         'kind' => 'temporary',
@@ -273,6 +281,7 @@ class ShiftPlannerController extends Controller
                         'to' => $t,
                         'started' => ($f === null || $f <= $today),
                         'acknowledged' => $row->acknowledged_at !== null,
+                        'weekly_summary' => WeekdayPattern::summary(WeekdayPattern::parse($row->day_pattern ?? null)),
                     ];
                 } elseif ($t === null && $f !== null && $f > $today) {
                     $changes[] = [
@@ -283,6 +292,7 @@ class ShiftPlannerController extends Controller
                         'to' => null,
                         'started' => false,
                         'acknowledged' => $row->acknowledged_at !== null,
+                        'weekly_summary' => WeekdayPattern::summary(WeekdayPattern::parse($row->day_pattern ?? null)),
                     ];
                 }
             }
@@ -298,11 +308,35 @@ class ShiftPlannerController extends Controller
                     $f = $r->effective_from ? $r->effective_from->format('Y-m-d') : null;
                     return is_null($r->effective_to) && ($f === null || $f <= $today);
                 })
-                ->sortByDesc(fn ($r) => $r->effective_from ? $r->effective_from->format('Y-m-d') : '0000-00-00')
+                // Latest start, then newest id — the resolver's own tie-break, so the row
+                // whose weekly days are shown is the row that is actually applied.
+                ->sortByDesc(fn ($r) => ($r->effective_from ? $r->effective_from->format('Y-m-d') : '0000-00-00')
+                                       . '|' . str_pad((string) $r->id, 10, '0', STR_PAD_LEFT))
                 ->first();
             $usualLocationId = ($primaryRow && !empty($primaryRow->location_id))
                 ? (int) $primaryRow->location_id
                 : $def['location_id'];
+
+            /**
+             * 🔁 His standing WEEKLY DAYS (the regular row's), so the popup can open with them
+             * already filled in and the row can say them. ⚠ `regular` is the row's OWN shift and
+             * place — the summary chip must not show today's resolved shift, which on a
+             * LaCarne Wednesday IS the weekly day.
+             */
+            $weeklyMap = $primaryRow ? WeekdayPattern::parse($primaryRow->day_pattern ?? null) : null;
+            $regular = null;
+            if ($primaryRow && $primaryRow->shiftTemplate) {
+                $rt = $primaryRow->shiftTemplate;
+                $rl = $svc->locationFor($uid, $primaryRow->location_id ? (int) $primaryRow->location_id : null);
+                $regular = [
+                    'template_id' => (int) $rt->id,
+                    'shift_name' => $rt->shift_name,
+                    'start' => substr((string) $rt->shift_start, 0, 5),
+                    'end' => $rt->shift_end ? substr((string) $rt->shift_end, 0, 5) : null,
+                    'location_id' => $primaryRow->location_id ? (int) $primaryRow->location_id : null,
+                    'location_name' => $rl['location_name'],
+                ];
+            }
 
             /**
              * 🔒 SHIFT AUTHORITY (Sep-2026). Three things the grid needs per person:
@@ -338,6 +372,12 @@ class ShiftPlannerController extends Controller
                     'end' => $primary['shift_end'],
                     'location_name' => $primary['location_name'] ?? null,
                 ],
+                // 🔁 Additive: null when he has no weekly days.
+                'regular' => $regular,
+                'weekly' => $weeklyMap ? [
+                    'days' => WeekdayPattern::toWire($weeklyMap),
+                    'summary' => WeekdayPattern::summary($weeklyMap),
+                ] : null,
                 'cells' => $cells,
                 'changes' => $changes,
             ];
@@ -412,6 +452,9 @@ class ShiftPlannerController extends Controller
              *   AttendanceController::updateUserVisibility, the one door onto the list.
              */
             'can_manage_roster' => $authority->canManageRoster($me),
+            // 🔁 Weekly days need one column (shift_weekly_days_oct2026.sql). Until it is run
+            //   the popup does not offer them — and the server refuses them anyway.
+            'weekly_available' => WeekdayPattern::available() && WeekdayPattern::requestColumnAvailable(),
             'template_create' => $authority->templateCreateState($me),
             // The workshops a planner may move a proposal to while approving it.
             'workshops' => app(\App\Services\Riders\WorkshopVisitService::class)->workshopLocations(),

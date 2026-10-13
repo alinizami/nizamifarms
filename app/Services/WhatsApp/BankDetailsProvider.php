@@ -15,6 +15,10 @@ use App\Models\FIN\ConfigModel;
  *   - resources/views/fin/employee/outstanding-invoices.blade.php fuBankDetailsMessage (HBL + Meezan)
  * Owner ruling (Aug-31-2026): the `invoice_paychange` set is the correct one —
  * Bank Alfalah / Meezan / Askari, NO HBL.
+ * Owner ruling (Oct-11-2026): Askari REPLACED by HBL (PK35HABB0023297901934403,
+ * title "Nizami Farms") — set is now Bank Alfalah / Meezan / HBL. The Meta
+ * templates invoice_paychange / invoice_online / invoice_online_eta_2 were
+ * edited on Meta by the owner to match.
  *
  * The text is overridable at runtime via the t_fin_config key below, so the
  * accounts can be corrected WITHOUT a code deploy (this app deploys by hand).
@@ -43,8 +47,8 @@ Account Title: "Nizami Farms"
 * Bank: Meezan Bank Limited
 * IBAN: PK75MEZN0003050106554237
 
-* Bank: Askari Bank Limited
-* IBAN: PK10ASCM0000080200000971
+* Bank: Habib Bank Limited (HBL)
+* IBAN: PK35HABB0023297901934403
 TXT;
 
     /**

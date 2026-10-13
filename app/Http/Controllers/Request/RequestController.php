@@ -279,6 +279,24 @@ class RequestController extends Controller
             ], 422);
         }
 
+        // ⭐ Oct-2026 Expense Types: an INACTIVE type is refused; an old name (renamed /
+        // merged) is mapped to the type's current name. Unknown text passes as before.
+        if (!empty($validated['expense_category'])) {
+            $typeCheck = \App\Services\FIN\ExpenseTypeService::checkForWrite(
+                $validated['expense_category'], $validated['business_unit_id'] ?? 1
+            );
+            if (!$typeCheck['ok']) {
+                if ($request->wantsJson() || $request->ajax() || $request->is('api/*')) {
+                    return response()->json(['success' => false, 'message' => $typeCheck['message']], 422);
+                }
+                return redirect()->back()->withInput()->with('error', $typeCheck['message']);
+            }
+            if ($typeCheck['name'] !== $validated['expense_category']) {
+                $validated['expense_category'] = $typeCheck['name'];
+                $request->merge(['expense_category' => $typeCheck['name']]);
+            }
+        }
+
         // 🔗 C6 (29-Sep-2026): only a Maintenance bill may be tied to service records — the one
         //    rule, shared with the rider's own request door. Asked before any transaction opens.
         if ($linkRefusal = \App\Services\Riders\ServiceRecordService::linkRefusalForCategory(

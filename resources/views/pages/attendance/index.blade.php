@@ -245,6 +245,12 @@
               <input type="number" min="0" step="0.5" id="ruleTargetHours" style="width:100%;border:2px solid #d1d5db;border-radius:8px;padding:9px 10px;font-size:14px;">
               <div style="font-size:11px;color:#9ca3af;margin-top:4px;">Checking out after this many hours starts counting overtime.</div>
             </div>
+            {{-- ⏱ Time bank (Oct-2026): how much late one minute of extra covers. --}}
+            <div style="flex:1;min-width:150px;">
+              <label style="display:block;font-size:12px;font-weight:600;color:#374151;margin-bottom:4px;">Extra covers late at</label>
+              <input type="number" min="0.1" max="1" step="0.05" id="ruleOtLateFactor" style="width:100%;border:2px solid #d1d5db;border-radius:8px;padding:9px 10px;font-size:14px;">
+              <div style="font-size:11px;color:#9ca3af;margin-top:4px;">0.5 = 9h extra covers 4.5h late · 1 = equal. Used when a month is decided.</div>
+            </div>
           </div>
         </div>
       </div>
@@ -2069,8 +2075,8 @@ function renderPayrollLeaveActions() {
     ? `<div style="font-size:11.5px;color:#B45309;background:#FFFBEB;border-radius:8px;padding:8px 10px;margin-bottom:10px;">⚠ ${s.late_cut_count} employee${s.late_cut_count > 1 ? 's have' : ' has'} a late <b>salary cut</b> of Rs ${Math.round(s.late_cut_total).toLocaleString('en-PK')} this month (too late for a leave penalty). That is money — it is deducted on the Payroll screen when the salary is paid.</div>` : '';
   const all = (!open && s.pending_count > 0)
     ? `<div style="margin-bottom:10px;"><button type="button" id="laApplyAll"
-         style="background:#ECFDF5;border:1px solid #A7F3D0;color:#047857;border-radius:6px;padding:5px 13px;font-size:12px;font-weight:700;cursor:pointer;">Apply all ${s.pending_count} recommended</button>
-         <span style="font-size:11px;color:#9CA3AF;margin-left:8px;">gives the bonuses and takes the penalties</span></div>` : '';
+         style="background:#ECFDF5;border:1px solid #A7F3D0;color:#047857;border-radius:6px;padding:5px 13px;font-size:12px;font-weight:700;cursor:pointer;">Confirm all ${s.pending_count} suggested</button>
+         <span style="font-size:11px;color:#9CA3AF;margin-left:8px;">late &amp; extra: leave where possible, otherwise moved to next month · never cuts a salary</span></div>` : '';
 
   const items = [];
   (j.rows || []).forEach(r => (r.actions || []).forEach(a => {
@@ -2082,6 +2088,8 @@ function renderPayrollLeaveActions() {
     monthOpen: open,
     monthLabel: j.month_label,
     onDecide: (item, choice) => decidePayrollLeaveAction(item.user_id, item.kind, choice),
+    // ⏱ Time-bank cards save themselves (same component as Payroll); refresh after.
+    onTimeBankDone: () => refreshPayrollLeaveActions(),
     onDrill: (item) => showDateBreakdown(item.user_id, item.fullname, item.drill),
     afterPaint: () => {
       const b = document.getElementById('laApplyAll');
@@ -2109,7 +2117,7 @@ async function decidePayrollLeaveAction(userId, kind, decision) {
 
 async function applyAllPayrollLeaveActions() {
   const s = (PAYROLL_LEAVE_ACT && PAYROLL_LEAVE_ACT.summary) || {};
-  if (!confirm(`Apply all ${s.pending_count} recommended leave actions for ${PAYROLL_LEAVE_ACT.month_label}?\n\nBonus leaves are given and late penalties are deducted. Anything already decided is left alone.`)) return;
+  if (!confirm(`Confirm all ${s.pending_count} suggested leave actions for ${PAYROLL_LEAVE_ACT.month_label}?\n\nLate & extra: extra covers late first, late days come off leave where there is leave (otherwise they move to next month), extra days are given. No salary is cut by this button. Anything already decided is left alone.`)) return;
   document.querySelectorAll('#laBody button').forEach(b => b.disabled = true);
   try {
     const res = await fetch('/hr/payroll/leave-actions/apply-all', {
@@ -2201,16 +2209,28 @@ function renderMonthBody(data) {
     return `<span style="display:block;font-size:9.5px;color:#6B7280;">${fmtMinsShort(Number(u.late_raw_minutes) || 0)} · ${fmtMinsShort(w)} waived</span>`;
   };
 
+  // ⏱ Time bank (Oct-2026): the SAME chip Payroll shows (server text); a pending/decided one opens the card.
+  const attTimeBankChip = (u, uid, nm) => {
+    const t = u.time_bank;
+    if (!t || !t.chip) return '';
+    const pend = t.status === 'pending';
+    const col = pend ? (t.tone === 'extra' ? 'color:#047857;background:#ECFDF5;' : 'color:#92400E;background:#FFFBEB;') : 'color:#4B5563;background:#F3F4F6;';
+    const open = (pend || t.status === 'decided') && window.NFTimeBank;
+    return `<span ${open ? `onclick="event.stopPropagation(); NFTimeBank.open(${uid}, currentMonthValue(), '${nm}', () => { loadMonthTab(); loadPayrollLeaveBanner(); })"` : ''} title="${(t.lines || []).join(' · ').replace(/"/g, '&quot;')}" style="display:block;margin-top:3px;font-size:9.5px;font-weight:700;border-radius:5px;padding:1px 5px;${col}${open ? 'cursor:pointer;' : ''}">${pend ? '⏳ ' : ''}${t.chip}</span>`;
+  };
+
   body.innerHTML = sorted.map(u => {
     const late = Number(u.total_late_minutes) || 0;
-    const lateStyle = late > 300 ? 'background:#FEE2E2;color:#B91C1C;' : (late > 0 ? 'background:#FEF3C7;color:#92400E;' : 'background:#F3F4F6;color:#9CA3AF;');
+    // ⏱ Bank months drop the old hard-coded 5h red line — the chip below says what it costs.
+    const lateStyle = (late > 300 && !u.time_bank) ? 'background:#FEE2E2;color:#B91C1C;' : (late > 0 ? 'background:#FEF3C7;color:#92400E;' : 'background:#F3F4F6;color:#9CA3AF;');
     const uid = u.user_id;
     const nm = String(u.fullname || '').replace(/'/g, "\\'");
     // Overtime is stated with what it BUYS: the hours, and the whole bonus leave days those
     // hours have already earned (same divisor payroll grants on). Hours alone made a manager
     // do the division in his head — and made this column look unrelated to the popup's.
     const ot = Number(u.overtime_target_minutes) || 0;
-    const otBonus = Number(u.overtime_bonus_leaves) || 0;
+    // ⏱ Bank month: what the minutes become is on the ONE chip under Late, not here.
+    const otBonus = u.time_bank ? 0 : (Number(u.overtime_bonus_leaves) || 0);
     const otPer = Number(u.overtime_minutes_per_bonus) || 540;
     const otTitle = `${fmtMinsShort(ot)} beyond the daily target. ${fmtMinsShort(otPer)} = 1 bonus leave day, so this earns ${otBonus}. Click to see the days.`;
     const otCell = ot > 0
@@ -2226,7 +2246,7 @@ function renderMonthBody(data) {
       ${filterCell(u.leave_days, '#2563EB', uid, nm, 'on_leave')}
       <td class="px-4 py-3 text-center">${late > 0
         ? `<button type="button" onclick="event.stopPropagation(); openMonthDetail(${uid}, '${nm}', 'late')" title="Open this month's detail, filtered to late days" style="display:inline-block;padding:2px 8px;border-radius:5px;font-size:12px;font-weight:600;border:none;cursor:pointer;${lateStyle}">${fmtMinsShort(late)}</button>`
-        : `<span style="display:inline-block;padding:2px 8px;border-radius:5px;font-size:12px;font-weight:600;${lateStyle}">${fmtMinsShort(late)}</span>`}${lateWaivedNote(u)}${attReviewChip(u, 'late', uid, nm)}</td>
+        : `<span style="display:inline-block;padding:2px 8px;border-radius:5px;font-size:12px;font-weight:600;${lateStyle}">${fmtMinsShort(late)}</span>`}${lateWaivedNote(u)}${attReviewChip(u, 'late', uid, nm)}${attTimeBankChip(u, uid, nm)}</td>
       ${otCell}
       ${flagsTd}
       ${meterTd}
@@ -5571,6 +5591,7 @@ async function openAttendanceRules() {
       document.getElementById('ruleSamedayCap').value = data.leave_sameday_cap != null ? data.leave_sameday_cap : 4;
       document.getElementById('ruleSamedayCutoff').value = data.leave_sameday_cutoff || '10:00';
       document.getElementById('ruleTargetHours').value = data.shift_target_hours != null ? data.shift_target_hours : 9;
+      document.getElementById('ruleOtLateFactor').value = data.ot_late_offset_factor != null ? data.ot_late_offset_factor : 0.5;
       document.getElementById('ruleCheckoutEnabled').checked = (Number(data.checkout_rule_enabled) === 1);
       document.getElementById('ruleCheckoutWindow').value = data.checkout_window_mins != null ? data.checkout_window_mins : 15;
       document.getElementById('ruleCheckoutRadius').value = data.checkout_radius_m != null ? data.checkout_radius_m : 150;
@@ -5642,6 +5663,7 @@ async function saveAttendanceRules() {
         leave_sameday_cap: document.getElementById('ruleSamedayCap').value,
         leave_sameday_cutoff: document.getElementById('ruleSamedayCutoff').value,
         shift_target_hours: document.getElementById('ruleTargetHours').value,
+        ot_late_offset_factor: document.getElementById('ruleOtLateFactor').value,
         checkout_rule_enabled: document.getElementById('ruleCheckoutEnabled').checked ? 1 : 0,
         checkout_window_mins: document.getElementById('ruleCheckoutWindow').value,
         checkout_radius_m: document.getElementById('ruleCheckoutRadius').value,

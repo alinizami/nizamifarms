@@ -363,6 +363,13 @@ Route::middleware('auth:sanctum')->group(function () {
             Route::post('/pay', [\App\Http\Controllers\API\PayrollController::class, 'managerPay']);
             // Leave actions on the phone (Sep-2026): the same decisions as the web panel.
             Route::post('/decide-leave-action', [\App\Http\Controllers\API\PayrollController::class, 'decideLeaveAction']);
+            // ⏱ Time bank (Oct-2026) — the same trait as the web routes.
+            Route::get('/time-bank/preview', [\App\Http\Controllers\API\PayrollController::class, 'timeBankPreview']);
+            Route::get('/time-bank/history', [\App\Http\Controllers\API\PayrollController::class, 'timeBankHistory']);
+            Route::post('/time-bank/decide', [\App\Http\Controllers\API\PayrollController::class, 'timeBankDecide']);
+            Route::post('/time-bank/undo', [\App\Http\Controllers\API\PayrollController::class, 'timeBankUndo']);
+            Route::post('/time-bank/adjust', [\App\Http\Controllers\API\PayrollController::class, 'timeBankAdjust']);
+            Route::post('/time-bank/adjust/remove', [\App\Http\Controllers\API\PayrollController::class, 'timeBankRemoveAdjust']);
             Route::post('/settle-absence', [\App\Http\Controllers\API\PayrollController::class, 'settleAbsence']);
             Route::post('/dismiss-absence-alert', [\App\Http\Controllers\API\PayrollController::class, 'dismissAbsenceAlert']);
             // Day review (Sep-2026): the same queue and verdicts as the web bulb.
@@ -694,6 +701,16 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::get('/expenses/categories', [\App\Http\Controllers\API\RiderController::class, 'getExpenseCategoriesFromConfig']); // Fetch expense types from config (+ admin "bubbles")
     Route::post('/expenses/categories', [\App\Http\Controllers\FIN\ExpenseCategoryController::class, 'store']); // Create new expense category (reuses web controller)
     Route::post('/expenses/bubbles', [\App\Http\Controllers\API\RiderController::class, 'saveExpenseBubbles']); // Admin: choose/order the quick-select expense-type bubbles
+    // ⭐ Oct-2026 Expense Types manager — same controller + engine as the web drawer.
+    // Declared BEFORE the /expenses/{id}/… routes below.
+    Route::get('/expenses/types', [\App\Http\Controllers\FIN\ExpenseTypeController::class, 'list']);
+    Route::post('/expenses/types/reorder', [\App\Http\Controllers\FIN\ExpenseTypeController::class, 'reorder']);
+    Route::post('/expenses/types/merge-old-name', [\App\Http\Controllers\FIN\ExpenseTypeController::class, 'mergeOrphan']);
+    Route::post('/expenses/types/undo', [\App\Http\Controllers\FIN\ExpenseTypeController::class, 'undo']);
+    Route::get('/expenses/types/{id}/rename-preview', [\App\Http\Controllers\FIN\ExpenseTypeController::class, 'previewRename'])->whereNumber('id');
+    Route::post('/expenses/types/{id}/rename', [\App\Http\Controllers\FIN\ExpenseTypeController::class, 'rename'])->whereNumber('id');
+    Route::post('/expenses/types/{id}/active', [\App\Http\Controllers\FIN\ExpenseTypeController::class, 'setActive'])->whereNumber('id');
+    Route::post('/expenses/types/{id}/group', [\App\Http\Controllers\FIN\ExpenseTypeController::class, 'setGroup'])->whereNumber('id');
     Route::post('/expenses/{id}/approve', [\App\Http\Controllers\API\RiderController::class, 'approveExpense']);
     Route::post('/expenses/{id}/reject', [\App\Http\Controllers\API\RiderController::class, 'rejectExpense']);
     Route::post('/expenses/{id}/settle', [\App\Http\Controllers\API\RiderController::class, 'settleExpense']);

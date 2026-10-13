@@ -376,6 +376,35 @@ class FirebaseService
         ], 'shift_notifications');
     }
 
+    /**
+     * ⏱ Time bank (Oct-2026): ONE push to the rider when his month's late/overtime is decided.
+     * The body is the engine's own rider sentence (TimeBankService), so the push can never say
+     * something the screen does not. Dedupe (once; again only on a changed outcome) is the
+     * caller's. Existing channel on purpose — a new channel id is silent on installed APKs.
+     */
+    public function notifyTimeBankDecided(int $userId, string $month, string $sentence): void
+    {
+        $this->notifyUser($userId, [
+            'title' => '⏱ ' . date('F', strtotime($month . '-01')) . ' ka late / overtime hisaab',
+            'body'  => $sentence,
+        ], [
+            'type'  => 'time_bank_decided',
+            'month' => $month,
+        ], 'shift_notifications');
+    }
+
+    /** 💵 One push when a month's salary is paid (Oct-2026). */
+    public function notifySalaryPaid(int $userId, string $month, float $net): void
+    {
+        $this->notifyUser($userId, [
+            'title' => '💵 Tankhwah ada ho gayi',
+            'body'  => date('F', strtotime($month . '-01')) . ' ki tankhwah Rs ' . number_format($net) . ' ada ho gayi. Tafseel app mein dekhein.',
+        ], [
+            'type'  => 'salary_paid',
+            'month' => $month,
+        ], 'shift_notifications');
+    }
+
     public function notifyAbsenceDecisionsDue(string $month, int $employees, float $days): void
     {
         $label = date('F Y', strtotime($month . '-01'));

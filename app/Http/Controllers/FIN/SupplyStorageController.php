@@ -358,12 +358,15 @@ class SupplyStorageController extends Controller
             return $this->deny();
         }
 
-        $categories = ConfigModel::where('config_key', 'LIKE', 'EXPENSE_CATEGORY_%')
-            ->where(function ($q) {
-                $q->whereNull('request_category_code')->orWhere('request_category_code', 'expense');
-            })
-            ->orderBy('config_value')
-            ->get(['id', 'config_value', 'business_unit_id']);
+        // Oct-2026: the one expense-type engine — active types (Taimur's order) for the
+        // shared + Expense scope, plus an inactive type a product still points at so editing
+        // that product does not silently drop its category.
+        $linked = SupplyProductModel::whereNotNull('expense_category_name')->pluck('expense_category_name')->unique()->all();
+        $categories = collect(\App\Services\FIN\ExpenseTypeService::rows())
+            ->filter(fn ($r) => !$r['payroll'] && ($r['rcc'] === null || $r['rcc'] === 'expense')
+                && ($r['active'] || in_array($r['name'], $linked, true)))
+            ->pipe(fn ($c) => collect(\App\Services\FIN\ExpenseTypeService::sortRows($c->values()->all())))
+            ->map(fn ($r) => (object) ['id' => $r['id'], 'config_value' => $r['name'], 'business_unit_id' => $r['bu_raw']]);
 
         // ⭐ has_stock / stock_value ride along so the product form can FREEZE the fields
         // the server refuses to change (mode, PLU, barcode) and explain why, instead of

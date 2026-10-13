@@ -338,7 +338,7 @@ class LedgerPostingService
             // Get or create expense account
             // Priority: 1) expense_category (specific), 2) category name (general)
             $expenseAccountName = $request->expense_category ?? $request->category->category_name;
-            $expenseAccount = $this->getOrCreateExpenseAccount($expenseAccountName);
+            $expenseAccount = $this->getOrCreateExpenseAccount($expenseAccountName, $request->business_unit_id);
 
             if (!$expenseAccount) {
                 throw new \Exception("Expense account not found");
@@ -605,10 +605,12 @@ class LedgerPostingService
     /**
      * Get or create expense account for category
      */
-    private function getOrCreateExpenseAccount($categoryName)
+    private function getOrCreateExpenseAccount($categoryName, $businessUnitId = null)
     {
-        $code = 'EXP_' . strtoupper(str_replace([' ', '-', '.', '/', '(', ')'], '_', $categoryName));
-        $code = substr($code, 0, 50);
+        // ⭐ Oct-2026: a renamed / merged expense type keeps posting to the account it always
+        // used (its pinned account_code). An unpinned name gets the same EXP_<NAME> slug as
+        // before — ExpenseTypeService::slugCode() is this exact formula, moved.
+        $code = ExpenseTypeService::accountCodeFor((string) $categoryName, $businessUnitId);
 
         return AccountModel::firstOrCreate(
             ['account_code' => $code],

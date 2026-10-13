@@ -69,16 +69,16 @@ class ShiftController extends Controller
         try {
             $today = now()->format('Y-m-d');
             $spanEnd = $to ?: '9999-12-31';   // an open-ended change reaches forward for ever
-            $rows = UserShiftAssignmentModel::with('shiftTemplate')
-                ->where('user_id', $userId)
-                ->where(function ($q) {
-                    $q->whereNotNull('acknowledged_at')->orWhereNotNull('notified_at');
-                })
-                ->get();
+            $allRows = UserShiftAssignmentModel::with('shiftTemplate')->where('user_id', $userId)->get();
+            // ⚠ A closed REGULAR row has an end date too, and it is not "a change he was told
+            //   about" — an upcoming regular change closes the current one, and every one-day
+            //   cover that week used to trigger this question over the old regular shift.
+            $closedRegular = $this->shiftService->closedRegularIds($userId, $allRows);
+            $rows = $allRows->filter(fn ($r) => $r->acknowledged_at !== null || $r->notified_at !== null);
             foreach ($rows as $r) {
                 $f = $r->effective_from ? $r->effective_from->format('Y-m-d') : null;
                 $t = $r->effective_to ? $r->effective_to->format('Y-m-d') : null;
-                $isTemporary = $t !== null;
+                $isTemporary = $t !== null && $this->shiftService->isTemporaryRow($r, $closedRegular);
                 $isUpcoming  = $t === null && $f !== null && $f > $today;
                 if (!$isTemporary && !$isUpcoming) continue;      // a standing shift — ignore
                 if ($t !== null && $t < $today) continue;         // already elapsed
@@ -95,6 +95,9 @@ class ShiftController extends Controller
                     'label'         => $name . ' · ' . ($isTemporary
                         ? ($fmt($f) . ($t && $t !== $f ? '–' . $fmt($t) : ''))
                         : ('from ' . $fmt($f))),
+                    // 🔁 13-Oct: a temporary change only replaces the dates it covers — when the
+                    //   announced change reaches beyond the new one, only part of it changes.
+                    'partial'       => $isTemporary && (($f ?: '0000-01-01') < $from || ($t ?: '9999-12-31') > $spanEnd),
                 ];
             }
         } catch (\Throwable $e) {
@@ -415,6 +418,31 @@ class ShiftController extends Controller
             ], 400);
         }
 
+        /**
+         * 🔁 The same rule for WEEKLY DAYS (Oct-2026). A weekly day names its shift type by
+         * id inside the row's JSON — there is no foreign key to stop the delete, and deleting
+         * would quietly turn that weekday back into the row's own shift, past months included.
+         * The stored JSON is always written by WeekdayPattern::encode(), so the id is always
+         * followed by `,"location_id"` — the LIKE below is exact, not a guess.
+         */
+        if (\App\Services\Ops\WeekdayPattern::available()) {
+            $like = '%"template_id":' . (int) $shift->id . ',%';
+            $weeklyCount = UserShiftAssignmentModel::where('day_pattern', 'like', $like)->count();
+            // …and a change still WAITING for approval that names it — else the approval would
+            // later fail with "not available any more" and the request would sit there.
+            if (\App\Services\Ops\WeekdayPattern::requestColumnAvailable()) {
+                $weeklyCount += DB::table('t_ops_shift_change_request')
+                    ->where('status', ShiftChangeRequestService::STATUS_OPEN)
+                    ->where('day_pattern', 'like', $like)->count();
+            }
+            if ($weeklyCount > 0) {
+                return response()->json([
+                    'success' => false,
+                    'message' => "This shift is used on weekly days ({$weeklyCount} record(s)) and cannot be deleted — past reports would change. Deactivate it instead."
+                ], 400);
+            }
+        }
+
         // Don't allow deleting the default shift
         if ($shift->is_default) {
             return response()->json([
@@ -693,13 +721,21 @@ class ShiftController extends Controller
             return response()->json(['success' => false, 'message' => 'An end date is required for a date-range change.'], 422);
         }
 
+        // 🔁 Weekly days ("different on some days") — Regular and Date range only.
+        $pat = $this->patternFromRequest($request, $mode, $templateId, $userId);
+        if ($pat['error']) {
+            return response()->json(['success' => false, 'message' => $pat['error']], 422);
+        }
+
         /**
          * ⏳ THE GATE. Three answers: go ahead, refuse, or park it for someone above.
          * ⚠ A replay from an approval carries `shift_authority_ok` and skips all of this —
          *   the question was already answered when the approver pressed the button.
+         * 🔁 Asked for EVERY shift type the change puts him on — the one picked above and
+         *   each weekly day's — so a weekly day cannot smuggle in a shift he may not take.
          */
         if (!$request->attributes->get('shift_authority_ok')) {
-            $d = $this->authority->decide($this->actor($request), $userId, $templateId, 'assign', $this->isMobile($request));
+            $d = $this->decideAll($request, $userId, $this->templatesOf($templateId, $pat['map']));
             if ($d['verdict'] === ShiftAuthorityService::DENY) {
                 return response()->json(['success' => false, 'message' => $d['message']], 403);
             }
@@ -729,6 +765,9 @@ class ShiftController extends Controller
                     'effective_to' => $to,
                     'location_id' => $request->input('location_id'),
                     'set_default_location' => $request->boolean('set_default_location'),
+                    // 🔁 Kept verbatim, including "given but empty" (= remove them), so the
+                    //   approval replays exactly what was asked. NULL = not sent (keep).
+                    'day_pattern' => $pat['given'] ? (\App\Services\Ops\WeekdayPattern::encode($pat['map']) ?? '{}') : null,
                 ], $this->actor($request), $d['approvers'], $request->attributes->get('shift_log_source', 'web'));
 
                 // ⚠⚠ `pending: true` — NOT an assignment. An old APK simply shows the message
@@ -765,7 +804,12 @@ class ShiftController extends Controller
                     'replaces' => $clash,
                     'message' => 'He has already been told about a shift change: ' . $clash['label']
                         . ($clash['acknowledged'] ? ' — he has confirmed it' : ' — he has not confirmed it yet')
-                        . '. Yeh us ko badal dega — usko dobara batana parega.',
+                        . (!empty($clash['partial'])
+                            ? '. Sirf ' . ($to && $to !== $from
+                                ? \Carbon\Carbon::parse($from)->format('j M') . '–' . \Carbon\Carbon::parse($to)->format('j M')
+                                : \Carbon\Carbon::parse($from)->format('j M'))
+                              . ' badlega, baqi din waise hi rahenge — usko batana parega.'
+                            : '. Yeh us ko badal dega — usko dobara batana parega.'),
                 ], 409);
             }
         }
@@ -785,11 +829,14 @@ class ShiftController extends Controller
         [$rsFrom, $rsTo] = $isTemp ? $this->restampSpanForTemp($userId, $from, $to) : [$from, null];
 
         try {
-            DB::transaction(function () use ($userId, $templateId, $from, $to, $isTemp, $isHistorical, $locationId) {
+            $before = $isTemp ? null : $this->currentRegularPattern($userId, $from);
+            $written = null;
+            DB::transaction(function () use ($userId, $templateId, $from, $to, $isTemp, $isHistorical, $locationId, $pat, &$written) {
                 if ($isTemp) {
-                    $this->applyTemporaryAssignment($userId, $templateId, $from, $to, !$isHistorical, $locationId);
+                    $this->applyTemporaryAssignment($userId, $templateId, $from, $to, !$isHistorical, $locationId, $pat['map']);
+                    $written = $pat['map'];
                 } else {
-                    $this->applyAssignment($userId, $templateId, $from, $locationId);
+                    $written = $this->applyAssignment($userId, $templateId, $from, $locationId, $pat['map'], !$pat['given']);
                 }
             });
 
@@ -801,10 +848,11 @@ class ShiftController extends Controller
             // this is the correction). Notify only for changes that touch today/future.
             $this->invalidateAndRestamp($userId, $rsFrom, $rsTo);
             if (!$isHistorical) {
-                $this->pushShiftChange($userId);
+                $this->pushShiftChange($userId, !$isTemp && $before && !$written);
                 $this->dispatchShiftWhatsApp($userId);
             }
-            $this->logAssignment($userId, 'assign', $mode, $templateId, $from, $isTemp ? $to : null, $request);
+            $this->logAssignment($userId, 'assign', $mode, $templateId, $from, $isTemp ? $to : null, $request,
+                $this->patternNote($written, $before, $pat['given'], $isTemp));
 
             return response()->json([
                 'success' => true,
@@ -858,6 +906,14 @@ class ShiftController extends Controller
         $locationId = $request->filled('location_id') ? (int) $request->input('location_id') : null;
         $setDefault = $request->boolean('set_default_location');
 
+        // 🔁 Weekly days — the same rows for everybody selected (owner ruling R5, 12-Oct).
+        //    Not sent at all (Shift Types page, older APK) → each person KEEPS his own.
+        $pat = $this->patternFromRequest($request, $mode, $templateId);
+        if ($pat['error']) {
+            return response()->json(['success' => false, 'message' => $pat['error']], 422);
+        }
+        $gateTemplates = $this->templatesOf($templateId, $pat['map']);
+
         /**
          * ⏳ THE GATE, per person — owner ruling Q7 (6-Sep): a mixed selection is NOT refused
          * as a batch. Apply what may be applied, park what needs approval, skip what may
@@ -872,7 +928,7 @@ class ShiftController extends Controller
             $src = $request->attributes->get('shift_log_source', 'web');
             $go = [];
             foreach ($userIds as $uid) {
-                $d = $this->authority->decide($actor, (int) $uid, $templateId, 'assign', $mobile);
+                $d = $this->decideAll($request, (int) $uid, $gateTemplates);
                 if ($d['verdict'] === ShiftAuthorityService::DENY) {
                     $skipped[] = $this->authority->nameOf((int) $uid);
                 } elseif ($d['verdict'] === ShiftAuthorityService::APPROVAL) {
@@ -884,6 +940,7 @@ class ShiftController extends Controller
                         'effective_to' => $to,
                         'location_id' => $locationId,
                         'set_default_location' => $setDefault,
+                        'day_pattern' => $pat['given'] ? (\App\Services\Ops\WeekdayPattern::encode($pat['map']) ?? '{}') : null,
                     ], $actor, $d['approvers'], $src);
                     if ($q['ok']) $queued[] = $this->authority->nameOf((int) $uid);
                     else $skipped[] = $this->authority->nameOf((int) $uid);
@@ -916,12 +973,20 @@ class ShiftController extends Controller
         }
 
         try {
-            DB::transaction(function () use ($userIds, $templateId, $from, $to, $isTemp, $isHistorical, $locationId) {
+            $before = [];
+            $written = [];
+            if (!$isTemp) {
+                foreach ($userIds as $uid) {
+                    $before[(int) $uid] = $this->currentRegularPattern((int) $uid, $from);
+                }
+            }
+            DB::transaction(function () use ($userIds, $templateId, $from, $to, $isTemp, $isHistorical, $locationId, $pat, &$written) {
                 foreach ($userIds as $userId) {
                     if ($isTemp) {
-                        $this->applyTemporaryAssignment((int) $userId, $templateId, $from, $to, !$isHistorical, $locationId);
+                        $this->applyTemporaryAssignment((int) $userId, $templateId, $from, $to, !$isHistorical, $locationId, $pat['map']);
+                        $written[(int) $userId] = $pat['map'];
                     } else {
-                        $this->applyAssignment((int) $userId, $templateId, $from, $locationId);
+                        $written[(int) $userId] = $this->applyAssignment((int) $userId, $templateId, $from, $locationId, $pat['map'], !$pat['given']);
                     }
                 }
             });
@@ -933,10 +998,11 @@ class ShiftController extends Controller
                 [$rsFrom, $rsTo] = $isTemp ? $spans[(int) $userId] : [$from, null];
                 $this->invalidateAndRestamp((int) $userId, $rsFrom, $rsTo);
                 if (!$isHistorical) {
-                    $this->pushShiftChange((int) $userId);
+                    $this->pushShiftChange((int) $userId, !$isTemp && !empty($before[(int) $userId]) && empty($written[(int) $userId]));
                     $this->dispatchShiftWhatsApp((int) $userId);
                 }
-                $this->logAssignment((int) $userId, 'assign', $mode, $templateId, $from, $isTemp ? $to : null, $request);
+                $this->logAssignment((int) $userId, 'assign', $mode, $templateId, $from, $isTemp ? $to : null, $request,
+                    $this->patternNote($written[(int) $userId] ?? null, $before[(int) $userId] ?? null, $pat['given'], $isTemp));
             }
 
             $msg = $isHistorical
@@ -999,6 +1065,29 @@ class ShiftController extends Controller
         }
     }
 
+    /** The source stamped on audit rows written from inside the engine (set by each door). */
+    private string $logSource = 'web';
+
+    /** Audit row written from inside the engine (no Request at hand). Non-fatal. */
+    private function logRowDirect(int $userId, string $action, ?string $mode, ?int $templateId, ?string $from, ?string $to, ?string $note = null): void
+    {
+        try {
+            if (!\Illuminate\Support\Facades\Schema::hasTable('t_ops_shift_assignment_log')) return;
+            $actorId = auth()->id();
+            DB::table('t_ops_shift_assignment_log')->insert([
+                'user_id' => $userId, 'action' => $action, 'mode' => $mode,
+                'shift_template_id' => $templateId,
+                'shift_name' => $templateId ? DB::table('t_ops_shift_template')->where('id', $templateId)->value('shift_name') : null,
+                'effective_from' => $from, 'effective_to' => $to,
+                'actor_user_id' => $actorId,
+                'actor_name' => $actorId ? DB::table('t_sys_user')->where('id', $actorId)->value('fullname') : null,
+                'source' => $this->logSource, 'note' => $note ? mb_substr($note, 0, 250) : null, 'created_at' => now(),
+            ]);
+        } catch (\Throwable $e) {
+            \Log::warning('Shift assignment log (direct) failed (non-fatal)', ['error' => $e->getMessage()]);
+        }
+    }
+
     /**
      * Assignment history for a rider (append-only log), newest first. Powers the "History"
      * views on the mobile Month screen and the web Shift Planner. Each row carries a
@@ -1035,6 +1124,10 @@ class ShiftController extends Controller
             } else {
                 $label = $shift;
             }
+            // 🔁 The weekly days themselves are in the note (shown under the label).
+            if ($r->action === 'assign' && is_string($r->note) && strpos($r->note, 'Weekly days:') === 0) {
+                $label .= ' + 🔁 weekly days';
+            }
             return [
                 'id' => $r->id,
                 'action' => $r->action,
@@ -1060,11 +1153,12 @@ class ShiftController extends Controller
         $primary = $this->shiftService->getUserShift($userId, $today);
 
         $rows = UserShiftAssignmentModel::with('shiftTemplate')->where('user_id', $userId)->get();
+        $closedRegular = $this->shiftService->closedRegularIds($userId, $rows);   // ⚠ not temporary changes
         $changes = [];
         foreach ($rows as $row) {
             $f = $row->effective_from ? $row->effective_from->format('Y-m-d') : null;
             $t = $row->effective_to ? $row->effective_to->format('Y-m-d') : null;
-            if ($t !== null && $t >= $today) {
+            if ($t !== null && $t >= $today && $this->shiftService->isTemporaryRow($row, $closedRegular)) {
                 $changes[] = ['assignment_id' => $row->id, 'kind' => 'temporary',
                     'shift_name' => optional($row->shiftTemplate)->shift_name, 'from' => $f, 'to' => $t,
                     'started' => ($f === null || $f <= $today),
@@ -1115,6 +1209,8 @@ class ShiftController extends Controller
             'lock_reason' => $rowState['reason'],
             'needs_approval' => $rowState['needs_approval'],
             'allowed_template_ids' => $this->authority->allowedTemplateIdsFor($me, $userId),
+            // 🔁 His weekly days, so this popup (which cannot edit them) can SAY they stay.
+            'weekly_summary' => \App\Services\Ops\WeekdayPattern::summary($this->currentRegularPattern($userId, $today)),
         ]);
     }
 
@@ -1138,6 +1234,15 @@ class ShiftController extends Controller
             return response()->json([
                 'success' => false,
                 'message' => 'Only a temporary change can be cancelled. Change a primary shift with "Until I change it".'
+            ], 400);
+        }
+        // ⚠ A closed REGULAR row has an end date too (a newer regular began the next day).
+        //   "Cancelling" it would end it a day early and drop the person to the default shift.
+        $allRows = UserShiftAssignmentModel::where('user_id', (int) $row->user_id)->get();
+        if (!$this->shiftService->isTemporaryRow($row, $this->shiftService->closedRegularIds((int) $row->user_id, $allRows))) {
+            return response()->json([
+                'success' => false,
+                'message' => 'That is a past regular shift, not a temporary change — there is nothing to cancel.'
             ], 400);
         }
 
@@ -1183,7 +1288,9 @@ class ShiftController extends Controller
                     $userId,
                     [
                         'title' => '🗓 Shift change cancel ho gaya',
-                        'body'  => $what . ' cancel ho gaya — aap ki normal shift lagegi.',
+                        // 🔁 13-Oct: the day may go back to a RANGE, not to the regular shift —
+                        //   name what actually applies now instead of "normal shift".
+                        'body'  => $what . ' cancel ho gaya — ' . $this->nowShiftWords($userId) . '.',
                     ],
                     ['type' => 'shift_assigned'], // same type → mobile banner/screens refresh
                     'shift_notifications'
@@ -1259,11 +1366,11 @@ class ShiftController extends Controller
      */
     /**
      * The full date span that a temporary override touches = the new [$from,$to]
-     * UNIONED with any EXISTING bounded overrides it overlaps (which
-     * applyTemporaryAssignment will delete). Days trimmed off a replaced wider
-     * override revert to the primary, so they must be re-stamped too — otherwise
-     * their snapshots keep the old override's lateness. Call BEFORE the transaction
-     * (the overlapping rows still exist).
+     * UNIONED with any EXISTING bounded overrides it overlaps. Since 13-Oct an overlapped
+     * row keeps its other dates (nothing reverts to the primary any more), so this is
+     * wider than strictly needed — re-stamping is idempotent and those days simply
+     * re-stamp to the same answer. Kept wide on purpose: it is the safe side.
+     * Call BEFORE the transaction (the overlapping rows still exist unchanged).
      */
     private function restampSpanForTemp(int $userId, string $from, string $to): array
     {
@@ -1308,7 +1415,7 @@ class ShiftController extends Controller
      * the in-app banner (pending_shift_ack) is the reliable channel; this is the nudge.
      * Fires for BOTH web and mobile assigns.
      */
-    private function pushShiftChange(int $userId): void
+    private function pushShiftChange(int $userId, bool $weeklyRemoved = false): void
     {
         try {
             // Self-guard (mirrors dispatchShiftWhatsApp): only announce a pending
@@ -1324,10 +1431,20 @@ class ShiftController extends Controller
             $t = $pending->shiftTemplate;
             $time = substr($t->shift_start, 0, 5) . ($t->shift_end ? '–' . substr($t->shift_end, 0, 5) : ' onwards');
             $date = $pending->effective_from ? $pending->effective_from->format('Y-m-d') : now()->format('Y-m-d');
-            $locName = $this->shiftService->getUserShift($userId, $date)['location_name'] ?? null;
+            $weekly = \App\Services\Ops\WeekdayPattern::parse($pending->day_pattern ?? null);
+            // 🔁 With weekly days the start date may itself be a weekly day, whose place is
+            //   not the row's — so name the ROW's own place next to the row's own shift.
+            $locName = $weekly
+                ? ($this->shiftService->locationFor($userId, $pending->location_id ? (int) $pending->location_id : null)['location_name'] ?? null)
+                : ($this->shiftService->getUserShift($userId, $date)['location_name'] ?? null);
             $body = 'Aap ki shift: ' . $t->shift_name . ' (' . $time . ')'
                 . ($locName ? ' — ' . $locName : '')
-                . $this->whenSuffix($pending) . '. Confirm karne ke liye app kholein.';
+                . $this->whenSuffix($pending)
+                . ($weekly ? '. Hafte ke din: ' . \App\Services\Ops\WeekdayPattern::summary($weekly, 'ur') : '')
+                // 🔁 His weekly days were taken away — say so, or a rider who went to LaCarne
+                //    every Wednesday just reads a plain shift and keeps going there.
+                . (!$weekly && $weeklyRemoved ? '. Hafte ke alag din khatam — ab har din yahi shift' : '')
+                . '. Confirm karne ke liye app kholein.';
             app(\App\Services\FirebaseService::class)->notifyUser(
                 $userId,
                 ['title' => '🗓 Shift update ho gayi', 'body' => $body],
@@ -1336,6 +1453,19 @@ class ShiftController extends Controller
             );
         } catch (\Throwable $e) {
             \Log::warning('Shift-change push failed (non-fatal)', ['user_id' => $userId, 'error' => $e->getMessage()]);
+        }
+    }
+
+    /** "ab aap ki shift: LaCarne (09:30 onwards) — Orchard Lacarne" for today, after a change. */
+    private function nowShiftWords(int $userId): string
+    {
+        try {
+            $this->shiftService->clearUserShiftCache($userId);
+            $s = $this->shiftService->getUserShift($userId, now()->format('Y-m-d'));
+            $time = $s['shift_start'] . ($s['shift_end'] ? '–' . $s['shift_end'] : ' onwards');
+            return 'ab aap ki shift: ' . $s['shift_name'] . ' (' . $time . ')' . (!empty($s['location_name']) ? ' — ' . $s['location_name'] : '');
+        } catch (\Throwable $e) {
+            return 'aap ki normal shift lagegi';
         }
     }
 
@@ -1477,33 +1607,63 @@ class ShiftController extends Controller
         }
     }
 
-    private function applyAssignment(int $userId, int $shiftTemplateId, string $effectiveFrom, ?int $locationId = null): void
+    /**
+     * @param ?array $pattern  🔁 weekly days for the new row (WeekdayPattern map), or null
+     * @param bool   $carry    true = the screen did not send weekly days at all → the new
+     *                         row KEEPS the ones on the row it replaces (a screen that cannot
+     *                         show weekly days never removes them — older APK, Shift Types
+     *                         page, Attendance popup). $pattern is then ignored.
+     * @return ?array the weekly days now in force from $effectiveFrom
+     */
+    private function applyAssignment(int $userId, int $shiftTemplateId, string $effectiveFrom, ?int $locationId = null, ?array $pattern = null, bool $carry = false): ?array
     {
         $prevDay = date('Y-m-d', strtotime($effectiveFrom . ' -1 day'));
 
-        // No-op guard: user already on this template AND SAME location, open-ended,
-        // covering the date → don't create a redundant history row or re-prompt. A
-        // location-only change (same template, different branch) is NOT a no-op.
-        $alreadyOnIt = UserShiftAssignmentModel::where('user_id', $userId)
-            ->where('shift_template_id', $shiftTemplateId)
-            ->when($this->locationColumnExists(), function ($q) use ($locationId) {
-                return is_null($locationId) ? $q->whereNull('location_id') : $q->where('location_id', $locationId);
-            })
-            ->whereNull('effective_to')
-            ->where(function ($q) use ($effectiveFrom) {
-                $q->whereNull('effective_from')
-                  ->orWhereDate('effective_from', '<=', $effectiveFrom);
-            })
-            ->exists();
-        if ($alreadyOnIt) {
-            return;
+        // The open row that actually applies on $effectiveFrom — the resolver's own pick
+        // among open rows (latest start, newest id).
+        $current = $this->currentRegularRow($userId, $effectiveFrom);
+        if ($carry) {
+            $pattern = $current ? \App\Services\Ops\WeekdayPattern::parse($current->day_pattern ?? null) : null;
+        }
+        $patJson = \App\Services\Ops\WeekdayPattern::encode($pattern);
+
+        /**
+         * No-op guard: he is already on this template AND the same location AND the same
+         * weekly days, open-ended, on that date → don't create a redundant history row or
+         * re-prompt him. A location-only or weekly-days-only change is NOT a no-op.
+         *
+         * ⚠ Oct-2026: compared against the row that ACTUALLY applies, not "any open row".
+         *   Superseded open rows are not always closed (Kanan had four), and the old
+         *   `->exists()` could match a stale one and silently ignore a real change.
+         */
+        if ($current
+            && (int) $current->shift_template_id === $shiftTemplateId
+            && (!$this->locationColumnExists()
+                || (is_null($locationId) ? empty($current->location_id) : (int) $current->location_id === $locationId))
+            && (!\App\Services\Ops\WeekdayPattern::available() || ($current->day_pattern ?? null) === $patJson)) {
+            return $pattern;
         }
 
         // An assignment already starts exactly on this date -> update it in place
         // (avoids creating a zero-length historical row).
-        $sameDay = UserShiftAssignmentModel::where('user_id', $userId)
+        // ⚠ Since 13-Oct two rows CAN share a start day (a range and a one-day cover on its
+        //   first day). Take the open one if there is one, else the newest; every OTHER row
+        //   starting this day is superseded by the new regular — delete it, or a newer-id
+        //   cover would keep winning this very day by the resolver's tie-break and the regular
+        //   change would silently not apply to it.
+        $sameDayAll = UserShiftAssignmentModel::where('user_id', $userId)
             ->whereDate('effective_from', $effectiveFrom)
-            ->first();
+            ->orderByRaw('effective_to IS NULL DESC')->orderByDesc('id')
+            ->get();
+        $sameDay = $sameDayAll->first();
+        if ($sameDayAll->count() > 1) {
+            $extra = $sameDayAll->slice(1);
+            \Log::info('Shift assignment: superseding same-day rows', [
+                'user_id' => $userId, 'effective_from' => $effectiveFrom,
+                'removed' => $extra->map(fn ($x) => $x->only(['id', 'shift_template_id', 'effective_from', 'effective_to']))->values()->all(),
+            ]);
+            UserShiftAssignmentModel::whereIn('id', $extra->pluck('id'))->delete();
+        }
 
         // Remove rows that start AFTER the new date (this change supersedes them).
         // Log first — on a back-dated change these can be real, acknowledged history.
@@ -1520,14 +1680,26 @@ class ShiftController extends Controller
         }
 
         if ($sameDay) {
-            $sameDay->update($this->withLocation([
+            $sameDay->update($this->withKind($this->withPattern($this->withLocation([
                 'shift_template_id' => $shiftTemplateId,
                 'effective_to'      => null,
                 'notified_at'       => now(),
                 'acknowledged_at'   => null,
                 'updated_by'        => auth()->id(),
-            ], $locationId));
-            return;
+            ], $locationId), $pattern), false));
+            // ⚠ Oct-2026: also close any OLDER open row at the day before. Returning without
+            //   it is how superseded regular rows were left open (Kanan ×4, Rajab ×2). It
+            //   changes no answer — the newer row already won every date from here — but it
+            //   stops the stale rows piling up.
+            UserShiftAssignmentModel::where('user_id', $userId)
+                ->where('id', '!=', $sameDay->id)
+                ->whereNull('effective_to')
+                ->where(function ($q) use ($effectiveFrom) {
+                    $q->whereNull('effective_from')
+                      ->orWhereDate('effective_from', '<', $effectiveFrom);
+                })
+                ->update(['effective_to' => $prevDay, 'updated_by' => auth()->id()]);
+            return $pattern;
         }
 
         // Close the currently-open covering row at the day before the new one starts.
@@ -1543,7 +1715,7 @@ class ShiftController extends Controller
             ]);
 
         // Insert the new open assignment.
-        UserShiftAssignmentModel::create($this->withLocation([
+        UserShiftAssignmentModel::create($this->withKind($this->withPattern($this->withLocation([
             'user_id'           => $userId,
             'shift_template_id' => $shiftTemplateId,
             'effective_from'    => $effectiveFrom,
@@ -1552,38 +1724,192 @@ class ShiftController extends Controller
             'acknowledged_at'   => null,
             'created_by'        => auth()->id(),
             'updated_by'        => auth()->id(),
-        ], $locationId));
+        ], $locationId), $pattern), false));
+        return $pattern;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────────
+    //  🔁 WEEKLY DAYS (Oct-2026) — "different on some days" inside Regular / Date range
+    // ─────────────────────────────────────────────────────────────────────────────
+
+    /**
+     * The weekly days a request carries, checked. One-day changes never have any.
+     * @return array{given:bool, map:?array, error:?string}
+     */
+    private function patternFromRequest(Request $request, string $mode, int $templateId, ?int $userId = null): array
+    {
+        // Every door passes through here first — remember where the request came from for
+        // audit rows the engine writes on its own (see logRowDirect).
+        $this->logSource = $request->attributes->get('shift_log_source', 'web') === 'mobile' ? 'mobile' : 'web';
+        if ($mode === 'one_day') {
+            return ['given' => false, 'map' => null, 'error' => null];
+        }
+        $loc = $request->filled('location_id') ? (int) $request->input('location_id') : null;
+        // A weekly day he ALREADY has may keep a shift type that has since been deactivated —
+        // the form opens pre-filled with it, and a save that did not touch that day must not
+        // be refused for it. Picking that type fresh is still refused.
+        $keep = ($userId && $mode === 'until_changed') ? $this->currentRegularPattern($userId, $request->input('effective_from') ?: now()->format('Y-m-d')) : null;
+        $pat = \App\Services\Ops\WeekdayPattern::fromRequest($request, $templateId, $loc, $keep);
+        if (!$pat['error'] && $pat['map'] && !\App\Services\Ops\WeekdayPattern::available()) {
+            $pat['error'] = 'Weekly days are not switched on yet — the database update for them has not been run.';
+        }
+        return $pat;
+    }
+
+    /** The picked shift + every weekly day's shift — what the gate must be asked about. */
+    private function templatesOf(int $templateId, ?array $map): array
+    {
+        return array_values(array_unique(array_merge([$templateId], \App\Services\Ops\WeekdayPattern::templateIds($map))));
+    }
+
+    /**
+     * The gate asked once per shift type, folded into ONE answer of the usual shape:
+     * any refusal refuses (with that refusal's words), else any "needs approval" queues
+     * the whole change, else it goes ahead. Approvers depend on the people, never on the
+     * shift type, so the first approval's list is THE list.
+     */
+    private function decideAll(Request $request, int $userId, array $templateIds): array
+    {
+        $actor = $this->actor($request);
+        $mobile = $this->isMobile($request);
+        $approval = null;
+        $last = null;
+        foreach ($templateIds as $tid) {
+            $d = $this->authority->decide($actor, $userId, (int) $tid, 'assign', $mobile);
+            if ($d['verdict'] === ShiftAuthorityService::DENY) return $d;
+            if ($d['verdict'] === ShiftAuthorityService::APPROVAL && !$approval) $approval = $d;
+            $last = $d;
+        }
+        return $approval ?: ($last ?: $this->authority->decide($actor, $userId, null, 'assign', $mobile));
+    }
+
+    /** The open (regular) row the resolver would pick on $date, or null. */
+    private function currentRegularRow(int $userId, string $date)
+    {
+        return UserShiftAssignmentModel::where('user_id', $userId)
+            ->whereNull('effective_to')
+            ->where(function ($q) use ($date) {
+                $q->whereNull('effective_from')->orWhereDate('effective_from', '<=', $date);
+            })
+            ->orderByRaw('effective_from IS NULL, effective_from DESC')
+            ->orderByDesc('id')
+            ->first();
+    }
+
+    private function currentRegularPattern(int $userId, string $date): ?array
+    {
+        $row = $this->currentRegularRow($userId, $date);
+        return $row ? \App\Services\Ops\WeekdayPattern::parse($row->day_pattern ?? null) : null;
+    }
+
+    /** Write the weekly days only when the column exists (the PHP may go up before the SQL). */
+    private function withPattern(array $data, ?array $pattern): array
+    {
+        if (\App\Services\Ops\WeekdayPattern::available()) {
+            $data['day_pattern'] = \App\Services\Ops\WeekdayPattern::encode($pattern);
+        }
+        return $data;
+    }
+
+    /**
+     * Stamp what KIND of row this is at write time — the engine knows, and no screen should
+     * have to guess it later from dates. Guarded: the PHP may go up before the SQL.
+     */
+    private function withKind(array $data, bool $temporary): array
+    {
+        if (ShiftResolutionService::kindColumnAvailable()) {
+            $data['is_temporary'] = $temporary ? 1 : 0;
+        }
+        return $data;
+    }
+
+    /** The audit-log note for a change's weekly days ("" when none were ever involved). */
+    private function patternNote(?array $written, ?array $before, bool $given, bool $isTemp): ?string
+    {
+        $W = \App\Services\Ops\WeekdayPattern::class;
+        if ($written) {
+            $note = (!$given && !$isTemp ? 'Weekly days kept: ' : 'Weekly days: ') . $W::summary($written);
+            return mb_substr($note, 0, 250);
+        }
+        if ($before && !$isTemp) {
+            return 'Weekly days removed';
+        }
+        return null;
     }
 
     /**
      * Insert a TEMPORARY override that LAYERS on top of the primary for [$from,$to].
      * Does NOT touch the open primary — resolution picks the override for its dates and
-     * the primary resumes automatically after $to. Removes any existing OVERLAPPING
-     * bounded overrides (the "replace existing temporary change" behaviour — the UI
-     * confirms first). Must run inside a DB transaction supplied by the caller.
+     * the primary resumes automatically after $to. Must run inside a DB transaction
+     * supplied by the caller.
+     *
+     * ⭐ Owner ruling 13-Oct-2026: a temporary change replaces ONLY THE DATES IT COVERS.
+     *   A one-day cover inside a two-week range changes that one day; the range keeps every
+     *   other day, and cancelling the cover gives that day back to the range. (Before this,
+     *   any overlap deleted the whole existing range — its weekly days included.)
+     *
+     *   How, without touching the resolver's ordering (latest effective_from wins, then the
+     *   newest id): an existing bounded row that STARTS ON OR BEFORE the new one is simply
+     *   left alone — on the new row's dates the new row wins by its later start (or, on the
+     *   same start day, by being newer); on its other dates the old row still applies. An
+     *   existing row that starts INSIDE the new dates would win them instead, so it is
+     *   trimmed to begin the day after the new one ends — or deleted when nothing is left.
      *
      * $notify=false for a pure HISTORICAL correction (range entirely before today):
      * the row is stamped with notified_at=NULL so it never appears as a pending /
      * awaiting-confirmation change anywhere — it's a silent data fix, not a request.
      */
-    private function applyTemporaryAssignment(int $userId, int $shiftTemplateId, string $from, string $to, bool $notify = true, ?int $locationId = null): void
+    /** @param ?array $pattern 🔁 weekly days that apply only between $from and $to (or null). */
+    private function applyTemporaryAssignment(int $userId, int $shiftTemplateId, string $from, string $to, bool $notify = true, ?int $locationId = null, ?array $pattern = null): void
     {
-        // Remove overlapping temporary overrides (BOUNDED rows only — never the primary).
+        // Existing temporary rows that touch the new dates (BOUNDED rows only — never the primary).
         $overlapping = UserShiftAssignmentModel::where('user_id', $userId)
             ->whereNotNull('effective_to')
             ->whereNotNull('effective_from')
             ->whereDate('effective_from', '<=', $to)
             ->whereDate('effective_to', '>=', $from)
             ->get(['id', 'shift_template_id', 'effective_from', 'effective_to']);
-        if ($overlapping->isNotEmpty()) {
-            \Log::info('Temporary shift override: replacing overlapping override(s)', [
+        $dayAfter = date('Y-m-d', strtotime($to . ' +1 day'));
+        $dayBefore = date('Y-m-d', strtotime($from . ' -1 day'));
+        $removed = []; $trimmed = [];
+        foreach ($overlapping as $r) {
+            $rf = $r->effective_from->format('Y-m-d');
+            $rt = $r->effective_to->format('Y-m-d');
+            if ($rf >= $from && $rt <= $to) {
+                $removed[] = $r->toArray();                       // nothing of it is left
+                $r->delete();
+            } elseif ($rf > $from) {
+                // Starts inside the new dates, runs past them → begins the day after instead.
+                $trimmed[] = ['id' => $r->id, 'from' => $rf, 'to' => $rt, 'new_from' => $dayAfter];
+                $r->update(['effective_from' => $dayAfter, 'updated_by' => auth()->id()]);
+                // ⚠ The audit log is how closedRegularIds() tells a temporary row from a closed
+                //   regular one, and it is keyed on the row's START day — which just moved.
+                //   Record the trimmed row as what it now is, or a later regular change beginning
+                //   the day after it ends would make it read as a closed regular (no Cancel, no
+                //   "changed" cells, "nothing to cancel").
+                $this->logRowDirect($userId, 'assign', $rt === $dayAfter ? 'one_day' : 'date_range',
+                    (int) $r->shift_template_id, $dayAfter, $rt,
+                    'Now ' . \Carbon\Carbon::parse($dayAfter)->format('j M') . '–' . \Carbon\Carbon::parse($rt)->format('j M')
+                    . ' — a later change took ' . \Carbon\Carbon::parse($from)->format('j M') . '–' . \Carbon\Carbon::parse($to)->format('j M'));
+            } elseif ($rt <= $to) {
+                // Starts before, ends inside the new dates → ends the day before instead. The
+                // answers are identical either way (the new row would win those dates anyway);
+                // this keeps the dates every screen prints TRUE. Its start day is unchanged, so
+                // the audit log still identifies it.
+                $trimmed[] = ['id' => $r->id, 'from' => $rf, 'to' => $rt, 'new_to' => $dayBefore];
+                $r->update(['effective_to' => $dayBefore, 'updated_by' => auth()->id()]);
+            }
+            // else: it starts before AND ends after the new dates → untouched; the resolver's
+            //       ordering gives the new row its own dates and leaves both sides to this one.
+        }
+        if ($removed || $trimmed) {
+            \Log::info('Temporary shift override: replacing the dates of overlapping override(s)', [
                 'user_id' => $userId, 'new_from' => $from, 'new_to' => $to,
-                'removed' => $overlapping->toArray(),
+                'removed' => $removed, 'trimmed' => $trimmed,
             ]);
-            UserShiftAssignmentModel::whereIn('id', $overlapping->pluck('id'))->delete();
         }
 
-        UserShiftAssignmentModel::create($this->withLocation([
+        UserShiftAssignmentModel::create($this->withKind($this->withPattern($this->withLocation([
             'user_id'           => $userId,
             'shift_template_id' => $shiftTemplateId,
             'effective_from'    => $from,
@@ -1592,7 +1918,7 @@ class ShiftController extends Controller
             'acknowledged_at'   => null,
             'created_by'        => auth()->id(),
             'updated_by'        => auth()->id(),
-        ], $locationId));
+        ], $locationId), $pattern), true));
     }
 
     /**

@@ -76,18 +76,7 @@ class ShiftResolutionService
             // NOTE: an inactive template is still honored here — history is immutable;
             // `active` only controls whether a template is offered for NEW assignments.
             if ($assignment && $assignment->shiftTemplate) {
-                $shift = $assignment->shiftTemplate;
-                $loc = $this->resolveLocation($userId, $assignment->location_id ? (int) $assignment->location_id : null);
-                return [
-                    'shift_start' => substr($shift->shift_start, 0, 5), // HH:MM format
-                    'shift_end' => $shift->shift_end ? substr($shift->shift_end, 0, 5) : null,
-                    'working_days' => $shift->getWorkingDaysArray(),
-                    'shift_name' => $shift->shift_name,
-                    'shift_id' => $shift->id,
-                    'location_id' => $loc['location_id'],
-                    'location_name' => $loc['location_name'],
-                    'source' => 'user_assignment'
-                ];
+                return $this->shapeFromRow($userId, $assignment, $date, 'user_assignment');
             }
 
             // 1b. Backward freeze (plan R1.2): no row is effective on $date, but if the
@@ -103,18 +92,7 @@ class ShiftResolutionService
 
             if ($earliest && $earliest->shiftTemplate
                 && $date < $earliest->effective_from->format('Y-m-d')) {
-                $shift = $earliest->shiftTemplate;
-                $loc = $this->resolveLocation($userId, $earliest->location_id ? (int) $earliest->location_id : null);
-                return [
-                    'shift_start' => substr($shift->shift_start, 0, 5),
-                    'shift_end' => $shift->shift_end ? substr($shift->shift_end, 0, 5) : null,
-                    'working_days' => $shift->getWorkingDaysArray(),
-                    'shift_name' => $shift->shift_name,
-                    'shift_id' => $shift->id,
-                    'location_id' => $loc['location_id'],
-                    'location_name' => $loc['location_name'],
-                    'source' => 'earliest_backfill'
-                ];
+                return $this->shapeFromRow($userId, $earliest, $date, 'earliest_backfill');
             }
 
             // No assignment covers this date → location falls back to the user's
@@ -173,6 +151,202 @@ class ShiftResolutionService
     }
 
     /**
+     * 🔁 The shift a winning assignment row gives on $date — with its WEEKLY DAYS applied.
+     *
+     * ⭐⭐ Weekly days ride on the row (WeekdayPattern). Which row wins a date is decided
+     *    exactly as before (above); only then is that row's entry for the weekday applied:
+     *      · a shift entry → that type's times + that place, and it is a working day;
+     *      · "off"         → the day is off;
+     *      · no entry      → the row's own shift, place and off days — i.e. byte-identical
+     *                        to what this method returned before weekly days existed.
+     *    A one-day cover is its own, later row, so it still wins its day (owner ruling R3).
+     *
+     * `working_days` is the SAME array on every date the row covers, so dayKind(),
+     * calculateWorkingDays(), the planner's off cells and LaCarne access all agree without
+     * knowing weekly days exist. `shift_id` / times are the DAY's, so the attendance
+     * snapshot, lateness and the workshop pin measure against the right shift.
+     *
+     * Two keys are new and additive: `weekly` (this row has weekly days) and `pattern_day`
+     * (this date is one of them). Every older reader ignores them.
+     */
+    private static array $tplMemo = [];
+
+    private function templateById(int $id): ?ShiftTemplateModel
+    {
+        if (!array_key_exists($id, self::$tplMemo)) {
+            self::$tplMemo[$id] = ShiftTemplateModel::find($id);
+        }
+        return self::$tplMemo[$id];
+    }
+
+    private function shapeFromRow(int $userId, $row, string $date, string $source): array
+    {
+        $base = $row->shiftTemplate;
+        $tpl = $base;
+        $locId = $row->location_id ? (int) $row->location_id : null;
+        $workingDays = $base->getWorkingDaysArray();
+        $map = \App\Services\Ops\WeekdayPattern::parse($row->day_pattern ?? null);
+        $patternDay = false;
+        if ($map) {
+            $workingDays = \App\Services\Ops\WeekdayPattern::workingDays($workingDays, $map);
+            $entry = $map[(int) date('N', strtotime($date))] ?? null;
+            if ($entry !== null && empty($entry['off'])) {
+                // A deleted type cannot happen (the delete is refused while a weekly day
+                // points at it) — but if it ever does, the day falls back to the row's shift.
+                $dayTpl = $this->templateById((int) $entry['template_id']);
+                if ($dayTpl) {
+                    $tpl = $dayTpl;
+                    $locId = $entry['location_id'] ?: $locId;
+                    $patternDay = true;
+                }
+            } elseif ($entry !== null) {
+                $patternDay = true;   // an "off" weekly day
+            }
+        }
+        $loc = $this->resolveLocation($userId, $locId);
+        return [
+            'shift_start' => substr($tpl->shift_start, 0, 5), // HH:MM format
+            'shift_end' => $tpl->shift_end ? substr($tpl->shift_end, 0, 5) : null,
+            'working_days' => $workingDays,
+            'shift_name' => $tpl->shift_name,
+            'shift_id' => $tpl->id,
+            'location_id' => $loc['location_id'],
+            'location_name' => $loc['location_name'],
+            'source' => $source,
+            'weekly' => (bool) $map,
+            'pattern_day' => $patternDay,
+        ];
+    }
+
+    /**
+     * ⚠⚠ A BOUNDED ROW IS NOT ALWAYS A TEMPORARY CHANGE (Oct-2026).
+     *
+     * Every "new regular shift" CLOSES the previous regular row by giving it an end date
+     * (the day before the new one starts). The screens, though, read "has an end date" as
+     * "is a temporary change": after a regular change every day of the old regular shift
+     * was painted "changed" (the month view said "12 changed days"), and an UPCOMING regular
+     * change listed the old regular row as a temporary change with a Cancel button —
+     * cancelling it dropped the person to the default shift. With weekly days a regular
+     * change is a common act (every weekday tweak is one), so this had to be answered.
+     *
+     * The answer: the ids, among $rows (one person's assignment rows), of the bounded rows
+     * that are CLOSED REGULAR shifts — never temporary changes.
+     *   1. The audit log says how the row was made (`mode` of the assign with the same start
+     *      day): until_changed → regular; one_day / date_range → temporary.
+     *   2. No log entry (old rows, or a range whose start was trimmed): a row whose end is the
+     *      day before another REGULAR row begins is a closed regular. A row with no start
+     *      ("since forever") is always regular.
+     */
+    private static ?bool $hasKindColumn = null;
+
+    /** Is `t_ops_user_shift_assignment.is_temporary` there yet? (deploy-order safe) */
+    public static function kindColumnAvailable(): bool
+    {
+        if (self::$hasKindColumn === null) {
+            try { self::$hasKindColumn = \Illuminate\Support\Facades\Schema::hasColumn('t_ops_user_shift_assignment', 'is_temporary'); }
+            catch (\Throwable $e) { self::$hasKindColumn = false; }
+        }
+        return self::$hasKindColumn;
+    }
+
+    /** Test seam only. */
+    public static function forgetKindColumn(): void { self::$hasKindColumn = null; }
+
+    public function closedRegularIds(int $userId, $rows): array
+    {
+        $rows = collect($rows);
+        /**
+         * ⭐ Since 13-Oct the engine stamps the kind on every row it writes (`is_temporary`),
+         *    so a stamped row is never guessed. Only rows written before the column existed
+         *    (NULL) go through the audit-log + chain rules below — and in time there are none.
+         */
+        $stampedRegular = []; $stampedTemp = [];
+        if (self::kindColumnAvailable()) {
+            foreach ($rows as $r) {
+                $k = $r->is_temporary ?? null;
+                if ($k === null || $k === '') continue;
+                if ((int) $k === 1) $stampedTemp[$r->id] = true; else $stampedRegular[$r->id] = true;
+            }
+        }
+        $byFrom = [];      // 'Y-m-d' => [rows starting that day]
+        foreach ($rows as $r) {
+            $f = $r->effective_from ? substr((string) (is_object($r->effective_from) ? $r->effective_from->format('Y-m-d') : $r->effective_from), 0, 10) : null;
+            if ($f !== null) $byFrom[$f][] = $r;
+        }
+        // 'Y-m-d' (start) => list of ['mode' => …, 'to' => 'Y-m-d'|null] — ⚠ a list, not one
+        // value: a regular shift and a one-day cover can both start on the same day.
+        $logsByFrom = [];
+        try {
+            if (\Illuminate\Support\Facades\Schema::hasTable('t_ops_shift_assignment_log')) {
+                foreach (DB::table('t_ops_shift_assignment_log')->where('user_id', $userId)->where('action', 'assign')
+                            ->orderBy('id')->get(['mode', 'effective_from', 'effective_to']) as $l) {
+                    if ($l->effective_from && $l->mode) {
+                        $logsByFrom[substr((string) $l->effective_from, 0, 10)][] =
+                            ['mode' => $l->mode, 'to' => $l->effective_to ? substr((string) $l->effective_to, 0, 10) : null];
+                    }
+                }
+            }
+        } catch (\Throwable $e) { /* fall back to the chain rule */ }
+
+        $regular = [];     // id => true
+        $decided = [];
+        // Stamped rows first — no guessing.
+        foreach ($stampedRegular as $id => $_) { $regular[$id] = true; $decided[$id] = true; }
+        foreach ($stampedTemp as $id => $_) { $decided[$id] = true; }
+        // Open rows are regular by definition.
+        foreach ($rows as $r) {
+            if (is_null($r->effective_to)) { $regular[$r->id] = true; $decided[$r->id] = true; }
+        }
+        $fmt = fn ($d) => is_object($d) ? $d->format('Y-m-d') : substr((string) $d, 0, 10);
+        // Log-decided rows.
+        foreach ($rows as $r) {
+            if (isset($decided[$r->id])) continue;
+            $f = $r->effective_from ? $fmt($r->effective_from) : null;
+            if ($f === null) { $regular[$r->id] = true; $decided[$r->id] = true; continue; }
+            if (!empty($logsByFrom[$f])) {
+                $t = $fmt($r->effective_to);
+                $temps = array_filter($logsByFrom[$f], fn ($l) => $l['mode'] !== 'until_changed');
+                $hasRegular = count($temps) < count($logsByFrom[$f]);
+                $exactTemp = (bool) array_filter($temps, fn ($l) => $l['to'] === $t);
+                if ($exactTemp && $hasRegular) {
+                    // Both a regular AND a temporary change with these very dates were once
+                    // logged at this start day — the log cannot say which this row is. Leave
+                    // it to the chain rule below (a regular successor the next day → regular).
+                } elseif ($exactTemp) {
+                    $decided[$r->id] = true;                       // a temporary change with exactly these dates
+                } elseif ($hasRegular) {
+                    $regular[$r->id] = true; $decided[$r->id] = true;   // began as a regular, closed later
+                } elseif ($temps) {
+                    $decided[$r->id] = true;                       // a temporary change cancelled early
+                }
+            }
+        }
+        // Chain rule for the rest, newest end first so a chain resolves in one or two passes.
+        $pending = $rows->filter(fn ($r) => !isset($decided[$r->id]))
+            ->sortByDesc(fn ($r) => $r->effective_to ? $fmt($r->effective_to) : '9999-99-99')->values();
+        for ($pass = 0; $pass < 3 && $pending->isNotEmpty(); $pass++) {
+            $left = [];
+            foreach ($pending as $r) {
+                $next = date('Y-m-d', strtotime($fmt($r->effective_to) . ' +1 day'));
+                $successorRegular = false;
+                foreach ($byFrom[$next] ?? [] as $s) {
+                    if ($s->id !== $r->id && isset($regular[$s->id])) { $successorRegular = true; break; }
+                }
+                if ($successorRegular) { $regular[$r->id] = true; $decided[$r->id] = true; }
+                else $left[] = $r;
+            }
+            $pending = collect($left);
+        }
+        return array_keys(array_filter($regular, fn ($v, $k) => true, ARRAY_FILTER_USE_BOTH));
+    }
+
+    /** True when this bounded row is a real TEMPORARY change (not a closed regular shift). */
+    public function isTemporaryRow($row, array $closedRegularIds): bool
+    {
+        return !is_null($row->effective_to) && !in_array($row->id, $closedRegularIds, true);
+    }
+
+    /**
      * Resolve the office location that applies to a shift: the assignment's own
      * location (chosen at assign time) → the user's DEFAULT location
      * (t_ops_user_location_assignment) → the primary company location. Returns
@@ -185,6 +359,12 @@ class ShiftResolutionService
     public function userDefaultLocation(int $userId): array
     {
         return $this->resolveLocation($userId, null);
+    }
+
+    /** Public: the place a given location id resolves to for this person (row → default → primary). */
+    public function locationFor(int $userId, ?int $locationId): array
+    {
+        return $this->resolveLocation($userId, $locationId);
     }
 
     private function resolveLocation(int $userId, ?int $assignmentLocationId): array
@@ -908,6 +1088,7 @@ class ShiftResolutionService
         Cache::forever('shift_cache_ver', $ver + 1);
         self::$verMemo = $ver + 1;   // this request must not keep serving the old version
         self::$shiftMemo = [];
+        self::$tplMemo = [];         // a template was edited — weekly days must read it fresh
         self::$hireMemo = [];
         self::$tagMemo = [];
 

@@ -1006,25 +1006,38 @@ document.addEventListener('DOMContentLoaded', function() {
                            <label class="block text-base font-semibold text-gray-800 mb-3 flex items-center gap-2">
                                <span>Expense Type</span>
                                <span class="text-red-500 text-lg">*</span>
+                               @if(\App\Services\FIN\ExpenseTypeService::canManage())
+                                   {{-- ⭐ Oct-2026: rename / turn off / order / group, right where the list is used --}}
+                                   <button type="button" class="nfet-trigger" onclick="NFExpenseTypes.open('quick_expense_category')" title="Rename, turn off, reorder or group expense types">✎ Manage types</button>
+                               @endif
                            </label>
                            <select name="expense_category" id="quick_expense_category" class="form-field-enhanced w-full px-4 py-3 border-2 border-gray-300 rounded-xl focus:ring-2 focus:ring-green-500 focus:border-green-500 text-base font-medium bg-white shadow-sm" onchange="handleQuickExpenseCategoryChange()">
                         <option value="">Select Expense Type</option>
-                        @php
-                            try {
-                                $expenseCategories = \App\Models\FIN\ConfigModel::where('config_key', 'LIKE', 'EXPENSE_CATEGORY_%')
-                                    ->orderBy('config_value')
-                                    ->get(['config_value', 'business_unit_id', 'request_category_code']);
-                            } catch (\Exception $e) {
-                                $expenseCategories = \App\Models\FIN\ConfigModel::where('config_key', 'LIKE', 'EXPENSE_CATEGORY_%')
-                                    ->orderBy('config_value')
-                                    ->get(['config_value', 'business_unit_id']);
-                            }
-                        @endphp
-                        @foreach($expenseCategories as $cat)
-                            <option value="{{ $cat->config_value }}" data-business-unit-id="{{ $cat->business_unit_id ?? 1 }}" data-request-type="{{ $cat->request_category_code ?? '' }}">{{ $cat->config_value }}</option>
+                        {{-- Oct-2026: active types from the one engine (ExpenseTypeService), Taimur's order.
+                             NFExpenseTypes re-renders this list with group headings for the chosen BU + type. --}}
+                        @foreach(\App\Services\FIN\ExpenseTypeService::webPayload() as $cat)
+                            <option value="{{ $cat['name'] }}" data-business-unit-id="{{ $cat['bu'] ?? 1 }}" data-request-type="{{ $cat['rcc'] ?? '' }}">{{ $cat['name'] }}</option>
                         @endforeach
                         <option value="__ADD_NEW__" style="background-color: #f3f4f6; font-weight: bold; color: #059669;">➕ Add New Category...</option>
                     </select>
+                    @include('fin.expense-types._manager')
+                    <script>
+                        NFExpenseTypes.register('quick_expense_category', {
+                            scope: function () {
+                                var bu = document.getElementById('quick_business_unit');
+                                var cat = document.getElementById('quick_category_id');
+                                var opt = cat ? cat.options[cat.selectedIndex] : null;
+                                return {bu: bu ? bu.value : 1, rcc: (opt && opt.dataset && opt.dataset.code) || 'expense'};
+                            },
+                            label: function () {
+                                var bu = document.getElementById('quick_business_unit');
+                                var cat = document.getElementById('quick_category_id');
+                                var c = cat && cat.selectedIndex > 0 ? cat.options[cat.selectedIndex].text.trim() : 'Expense Reimbursement';
+                                var b = bu && bu.selectedIndex >= 0 ? bu.options[bu.selectedIndex].text.trim() : '';
+                                return b ? c + ' · ' + b : c;
+                            }
+                        });
+                    </script>
                 </div>
 
                        <!-- ⭐ Pay From Account (for Expense Reimbursement) - filtered by selected Business Unit -->
@@ -1421,46 +1434,10 @@ function filterRequestTypesByBU() {
 
 // Filter Expense Type options based on selected BU and request type
 function filterExpenseTypesByBU() {
-    const buSelect = document.getElementById('quick_business_unit');
-    const expenseSelect = document.getElementById('quick_expense_category');
-    const categorySelect = document.getElementById('quick_category_id');
-    if (!buSelect || !expenseSelect) return;
-    
-    const selectedBuId = buSelect.value;
-    const selectedCatCode = categorySelect ? (categorySelect.options[categorySelect.selectedIndex]?.dataset?.code || '') : '';
-    const options = expenseSelect.querySelectorAll('option');
-    let firstVisibleOption = null;
-    let hasSelectedVisible = false;
-    
-    options.forEach(option => {
-        const optionBuId = option.dataset.businessUnitId;
-        const optionReqType = option.dataset.requestType || '';
-        
-        if (!option.value || option.value === '__ADD_NEW__') {
-            option.style.display = '';
-            option.disabled = false;
-            return;
-        }
-        
-        const buMatch = optionBuId === selectedBuId;
-        const isOriginalType = (selectedCatCode === 'expense' || selectedCatCode === 'khaas_expense');
-        const typeMatch = optionReqType === selectedCatCode || (isOriginalType && !optionReqType);
-        
-        if (buMatch && typeMatch) {
-            option.style.display = '';
-            option.disabled = false;
-            if (!firstVisibleOption) firstVisibleOption = option;
-            if (option.selected) hasSelectedVisible = true;
-        } else {
-            option.style.display = 'none';
-            option.disabled = true;
-            if (option.selected) option.selected = false;
-        }
-    });
-    
-    if (!hasSelectedVisible) {
-        expenseSelect.value = '';
-    }
+    // Oct-2026: one renderer for every Expense Type list (scope = BU + request type, same
+    // rule as the phone), with Taimur's order and group headings. Keeps the current choice
+    // when it is still offered.
+    if (window.NFExpenseTypes) NFExpenseTypes.render('quick_expense_category');
 }
 
 // ⭐ Run BU filters on page load to match default BU selection
@@ -1587,6 +1564,8 @@ function submitQuickInlineCategory() {
             updateQuickExpenseTitle();
             
             closeQuickExpenseCategoryModal();
+            // Oct-2026: re-sync with the engine (order, groups) — keeps the new type selected.
+            if (window.NFExpenseTypes) NFExpenseTypes.refresh();
             alert('✓ Category "' + categoryName + '" created successfully!');
         } else {
             alert('Error: ' + (data.message || 'Failed to create category'));

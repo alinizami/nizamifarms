@@ -170,13 +170,16 @@
             </div>
         </div>
 
-        <!-- ======= EXPENSE SUB-CATEGORIES (grouped by request type) ======= -->
+        <!-- ======= EXPENSE TYPES (grouped by request type) — Oct-2026: one engine + the shared drawer ======= -->
+        @php $nfetCanManage = \App\Services\FIN\ExpenseTypeService::canManage(); @endphp
         <div class="kt-card">
             <div class="kt-card-header">
-                <h3 class="kt-card-title">Expense Sub-Categories</h3>
+                <h3 class="kt-card-title">Expense Types (Sub-Categories)</h3>
             </div>
             <div class="kt-card-body">
-                <p class="text-sm text-gray-600 mb-4">Expense sub-categories (Petrol, Food, etc.) shown when creating expense requests. Each type has its own sub-categories. Expense Reimbursement and Khaas Expense share common sub-categories; other types (Qurbani, etc.) have their own independent sub-categories.</p>
+                <p class="text-sm text-gray-600 mb-4">The Expense Type list on every expense form (web and phone), in the order shown here. Expense Reimbursement and Khaas Expense share the grey types; amber types belong to that request type only.
+                    @if($nfetCanManage) Use <b>✎ Manage types</b> to rename, turn off, reorder or group them — the same panel opens from the ✎ button next to the Expense Type dropdown. @else Renaming, turning off and ordering is done by Taimur. @endif
+                </p>
 
                 @php
                     $expenseTypes = $categories->filter(function($c) {
@@ -196,47 +199,48 @@
                         }
                     }
                     if (!$etBuId && $businessUnits->count() > 0) $etBuId = $businessUnits->first()->id;
-
-                    $isOriginalType = in_array($etype->category_code, ['expense', 'khaas_expense']);
-
-                    $typeSpecific = $expenseSubCategories->filter(function($sc) use ($etype) {
-                        return ($sc->request_category_code ?? null) === $etype->category_code;
-                    });
-
-                    $shared = $isOriginalType
-                        ? $expenseSubCategories->filter(function($sc) use ($etBuId) {
-                            return ($sc->request_category_code ?? null) === null && ($sc->business_unit_id ?? 1) == $etBuId;
-                        })
-                        : collect([]);
-
-                    $allForType = $typeSpecific->merge($shared)->sortBy('config_value')->values();
+                    $etOptions = \App\Services\FIN\ExpenseTypeService::options($etBuId, $etype->category_code);
+                    $etHasGroups = collect($etOptions)->contains(fn ($o) => !empty($o['group']));
+                    $etScopeById = collect(\App\Services\FIN\ExpenseTypeService::rows())->pluck('rcc', 'id');
+                    $etLastGroup = '__none__';
                 @endphp
                 <div class="mb-5 p-4 border border-gray-200 rounded-lg bg-gray-50">
                     <h4 class="font-semibold text-sm text-gray-800 mb-2 flex items-center gap-2">
                         <span class="text-lg">{{ $etype->icon ?: '📋' }}</span>
                         {{ $etype->category_name }}
-                        <span class="text-xs text-gray-400 font-normal">({{ $etBuType === 'khaas' ? 'Khaas' : 'NF' }} BU &middot; {{ $allForType->count() }} sub-categories)</span>
+                        <span class="text-xs text-gray-400 font-normal">({{ $etBuType === 'khaas' ? 'Khaas' : 'NF' }} BU &middot; {{ count($etOptions) }} active)</span>
+                        @if($nfetCanManage)
+                            <button type="button" class="nfet-trigger" onclick="NFExpenseTypes.open({bu: {{ (int) $etBuId }}, rcc: @js($etype->category_code), label: @js($etype->category_name)})">✎ Manage types</button>
+                        @endif
                     </h4>
 
-                    @if($allForType->count() > 0)
-                    <div class="flex flex-wrap gap-2 mb-2">
-                        @foreach($allForType as $sc)
-                        <span class="inline-flex items-center gap-1 px-3 py-1 {{ ($sc->request_category_code ?? null) ? 'bg-amber-50 border-amber-200' : 'bg-gray-100 border-gray-200' }} border rounded-full text-sm" id="subCat-{{ $sc->id }}">
-                            {{ $sc->config_value }}
-                            <button onclick="deleteSubCategory({{ $sc->id }}, '{{ addslashes($sc->config_value) }}')" class="text-red-400 hover:text-red-600 ml-1" title="Remove">&times;</button>
-                        </span>
+                    @if(count($etOptions) > 0)
+                    <div class="flex flex-wrap gap-2 mb-2 items-center">
+                        @foreach($etOptions as $sc)
+                            @if($etHasGroups && ($sc['group'] ?? 'Other') !== $etLastGroup)
+                                @php $etLastGroup = $sc['group'] ?? 'Other'; @endphp
+                                <span class="w-full text-[11px] font-bold uppercase tracking-wide text-gray-500 mt-1">{{ $sc['group'] ?? 'Other' }}</span>
+                            @endif
+                            <span class="inline-flex items-center gap-1 px-3 py-1 {{ ($etScopeById[$sc['id']] ?? null) ? 'bg-amber-50 border-amber-200' : 'bg-gray-100 border-gray-200' }} border rounded-full text-sm">
+                                {{ $sc['name'] }}@if($sc['locked']) <span title="Used by bike, fuel and workshop records">🔒</span>@endif
+                            </span>
                         @endforeach
                     </div>
                     @else
-                    <p class="text-sm text-gray-400 italic mb-2">No sub-categories yet. Add some below.</p>
+                    <p class="text-sm text-gray-400 italic mb-2">No types yet. Add some below.</p>
                     @endif
 
                     <div class="mt-2 flex items-center gap-2">
-                        <input type="text" id="newSubCat-{{ $etype->category_code }}" placeholder="New sub-category name..." class="kt-input kt-input-sm" style="max-width:220px;">
+                        <input type="text" id="newSubCat-{{ $etype->category_code }}" placeholder="New expense type name..." class="kt-input kt-input-sm" style="max-width:220px;">
                         <button onclick="addSubCategoryForType({{ $etBuId }}, '{{ $etype->category_code }}')" class="kt-btn kt-btn-xs kt-btn-primary">+ Add</button>
                     </div>
                 </div>
                 @endforeach
+                @include('fin.expense-types._manager')
+                <script>
+                    // Chips here are server-rendered: reload once after the drawer changed something.
+                    window.addEventListener('nfet:closed', function (e) { if (e.detail && e.detail.changed) location.reload(); });
+                </script>
             </div>
         </div>
 
@@ -824,7 +828,7 @@ function addSubCategoryForType(buId, requestCategoryCode) {
 
     fetch('{{ route("fin.expense-category.store") }}', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'X-CSRF-TOKEN': '{{ csrf_token() }}' },
+        headers: { 'Content-Type': 'application/json', 'Accept': 'application/json', 'X-CSRF-TOKEN': '{{ csrf_token() }}' },
         body: JSON.stringify(payload)
     })
     .then(r => r.json())
@@ -839,8 +843,10 @@ function addSubCategoryForType(buId, requestCategoryCode) {
     .catch(e => { console.error(e); alert('Failed to add.'); });
 }
 
+// Oct-2026: no longer reachable from this page (types are turned off from ✎ Manage types).
+// The endpoint now makes the type INACTIVE through ExpenseTypeService — it never deletes.
 function deleteSubCategory(id, name) {
-    if (!confirm('Remove sub-category "' + name + '"?')) return;
+    if (!confirm('Turn off "' + name + '"? It stops showing in the Expense Type dropdown; past expenses keep it.')) return;
 
     fetch('/requests/settings/expense-subcategories/' + id, {
         method: 'DELETE',

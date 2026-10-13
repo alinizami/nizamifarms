@@ -56,7 +56,9 @@ $prices = new IngredientPriceService();
 DB::beginTransaction();
 try {
     // The replica (5-Oct) still has the Tazo product ON and tagged; prod switched it off on 6-Oct.
-    DB::table('t_fin_vendor_products')->where('id', TAZO_PRODUCT)->update(['is_active' => 1, 'ingredient_id' => CHEESE]);
+    DB::table('t_fin_vendor_products')->where('id', TAZO_PRODUCT)->update(['is_active' => 1, 'ingredient_id' => CHEESE, 'pack_qty_base' => 400]);
+    // Oct-12: prod since linked the 900 g Puck product too — put it back to the Oct-5 state.
+    DB::table('t_fin_vendor_products')->where('id', 99)->update(['ingredient_id' => null, 'pack_qty_base' => null]);
     // And the Imtiaz bill is still dated 2023 — exactly the prod state before the SQL fix.
     DB::table('t_fin_ledger')->where('id', BILL_2023)->update(['transaction_date' => '2023-10-03']);
     DB::table('t_fin_vendor_products')->where('id', PUCK_1000)->update(['ingredient_id' => null, 'pack_qty_base' => null]);
@@ -94,7 +96,9 @@ try {
     ok('  …in Roman Urdu with the numbers in it',
         str_contains($rc['message'] ?? '', 'Puck Cream Cheese 1000g ke 1 purane bill (3 Oct, Rs 2,059) abhi Cheese mein nahi gin rahe'), true);
     $p = $prices->latest(BU, [CHEESE]);
-    ok('  …but the tag alone changes nothing: still no Cheese price (post-22-Sep line is never borrowed)', isset($p[CHEESE]), false);
+    // ⭐ Oct-12 (owner): the LINKED product's own bill now prices the ingredient without the restamp (price only).
+    ok('  …the link alone now PRICES Cheese from that product 3-Oct bill (source bill, Rs 4,118 a kg)',
+        [$p[CHEESE]['source'] ?? null, $p[CHEESE]['bought_on'] ?? null, $p[CHEESE]['price_text'] ?? null], ['bill', '2026-10-03', 'Rs 4,118 a kg']);
 
     $r = call('POST', '/api/vendors/' . IMTIAZ . '/products/' . PUCK_1000 . '/count-past-bills', [], 'countPastBills', IMTIAZ, PUCK_1000);
     ok('"Haan, gin lo" — count-past-bills 200, 1 line stamped', [$r['status'], $r['body']['done'] ?? null], [200, ['uncounted' => 1, 'moved' => 0]]);

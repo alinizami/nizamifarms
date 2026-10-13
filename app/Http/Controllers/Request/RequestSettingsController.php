@@ -931,52 +931,45 @@ class RequestSettingsController extends Controller
     }
 
     /**
-     * Update an expense sub-category name
+     * Rename an expense sub-category (= expense type).
+     * ⭐ Oct-2026: goes through ExpenseTypeService — the same engine as the drawer next to every
+     * Expense Type dropdown — so the account stays pinned and past expenses are relabelled.
+     * Same gate as the drawer (Taimur's `create_expense_category` key).
      */
     public function updateExpenseSubCategory(Request $request, $id)
     {
         $this->checkPermission();
-
+        if (!\App\Services\FIN\ExpenseTypeService::canManage()) {
+            return response()->json(['success' => false, 'message' => 'Only Taimur can rename expense types.'], 403);
+        }
         $validated = $request->validate([
             'config_value' => 'required|string|max:100',
         ]);
-
-        try {
-            $row = DB::table('t_fin_config')->where('id', $id)->first();
-            if (!$row || strpos($row->config_key, 'EXPENSE_CATEGORY_') !== 0) {
-                return response()->json(['success' => false, 'message' => 'Not found'], 404);
-            }
-
-            DB::table('t_fin_config')->where('id', $id)->update([
-                'config_value' => $validated['config_value'],
-                'updated_at' => now(),
-            ]);
-
-            return response()->json(['success' => true, 'message' => 'Updated']);
-        } catch (\Exception $e) {
-            return response()->json(['success' => false, 'message' => $e->getMessage()], 500);
-        }
+        $r = \App\Services\FIN\ExpenseTypeService::rename((int) $id, $validated['config_value'], $request->boolean('merge'));
+        $status = $r['ok'] ? 200 : ($r['status'] ?? 422);
+        unset($r['status']);
+        $r['success'] = $r['ok'];
+        unset($r['ok']);
+        return response()->json($r, $status);
     }
 
     /**
-     * Delete an expense sub-category
+     * "Delete" an expense sub-category.
+     * ⭐ Oct-2026: never deletes any more — makes the type INACTIVE (no longer offered in any
+     * dropdown; every past expense keeps it). Same engine and gate as the drawer.
      */
     public function deleteExpenseSubCategory($id)
     {
         $this->checkPermission();
-
-        try {
-            $row = DB::table('t_fin_config')->where('id', $id)->first();
-            if (!$row || strpos($row->config_key, 'EXPENSE_CATEGORY_') !== 0) {
-                return response()->json(['success' => false, 'message' => 'Not found'], 404);
-            }
-
-            DB::table('t_fin_config')->where('id', $id)->delete();
-
-            return response()->json(['success' => true, 'message' => 'Deleted']);
-        } catch (\Exception $e) {
-            return response()->json(['success' => false, 'message' => $e->getMessage()], 500);
+        if (!\App\Services\FIN\ExpenseTypeService::canManage()) {
+            return response()->json(['success' => false, 'message' => 'Only Taimur can switch off expense types.'], 403);
         }
+        $r = \App\Services\FIN\ExpenseTypeService::setActive((int) $id, false);
+        $status = $r['ok'] ? 200 : ($r['status'] ?? 422);
+        unset($r['status']);
+        $r['success'] = $r['ok'];
+        unset($r['ok']);
+        return response()->json($r, $status);
     }
 
     /**

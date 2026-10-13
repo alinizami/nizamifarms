@@ -713,6 +713,177 @@ class WhatsAppService
     }
 
     /**
+     * Oct-2026 — quick-reply buttons the system answers with a PICTURE.
+     *
+     * Key = the button label after quickReplyImageKey() (lowercase, punctuation
+     * dropped). Value = the image, relative to the WhatsApp media folder on the
+     * media disk (storage/app/public/whatsapp-media/), so the copy kept in the
+     * chat history renders like any other image bubble.
+     *
+     * "menu" = the Menu button on the frozen-range campaign template. EXACT label
+     * match: "Menu" fires it, nothing else can. No other template in the account
+     * has a Menu button (checked Oct-2026) — a future template that adds one would
+     * get this same picture, so give it a different label or its own entry here.
+     *
+     * To change the picture, replace the file: the cached Meta media id is keyed
+     * on the file's size + modified time, so the next tap sends the new one.
+     */
+    protected const QUICK_REPLY_IMAGES = [
+        'menu' => 'quick-reply/frozen_menu.jpg',
+    ];
+
+    /** Normalised QUICK_REPLY_IMAGES key for a button label/payload, or null. */
+    public static function quickReplyImageKey(?string $s): ?string
+    {
+        $s = strtolower(trim((string) $s));
+        $s = trim(preg_replace('/\s+/', ' ', (string) preg_replace('/[^a-z0-9]+/', ' ', $s)));
+        return ($s !== '' && isset(self::QUICK_REPLY_IMAGES[$s])) ? $s : null;
+    }
+
+    /**
+     * Oct-2026 — answer a quick-reply tap listed in QUICK_REPLY_IMAGES (the
+     * frozen campaign's "Menu") by sending its picture, instantly.
+     *
+     * Same shape as maybeAnswerBankDetailsRequest: the tap opened the 24-hour
+     * window, so this is a free-form image (no template, no approval, no Meta
+     * charge for a service message). RETURNS TRUE ONLY WHEN WE ACTUALLY SENT IT —
+     * on any failure the tap behaves like a normal customer message (unread badge
+     * + push) so a human sees that someone asked for the menu and got nothing.
+     * Webhook re-deliveries can't double-send: handleIncomingMessage drops a
+     * wa_message_id it has already stored before reaching us.
+     */
+    protected function maybeAnswerQuickReplyImage($conversation, string $from, array $msg, string $type, string $content, $savedMessage): bool
+    {
+        if (!in_array($type, ['button', 'interactive'], true) || !$conversation) {
+            return false;
+        }
+
+        $label   = (string) ($msg['button']['text'] ?? ($msg['interactive']['button_reply']['title'] ?? $content));
+        $payload = (string) ($msg['button']['payload'] ?? ($msg['interactive']['button_reply']['id'] ?? ''));
+
+        $key = self::quickReplyImageKey($label) ?? self::quickReplyImageKey($payload);
+        if ($key === null) {
+            return false;
+        }
+
+        $diskName = config('whatsapp.media_disk');
+        $relative = config('whatsapp.media_path') . '/' . self::QUICK_REPLY_IMAGES[$key];
+        $fullPath = Storage::disk($diskName)->path($relative);
+        if (!file_exists($fullPath)) {
+            Log::error('WhatsApp: quick-reply image missing on disk', ['button' => $key, 'path' => $fullPath]);
+            return false;
+        }
+
+        $resp = $this->sendQuickReplyImage($from, $fullPath);
+        $replyWaId = $resp['messages'][0]['id'] ?? null;
+        if (empty($replyWaId)) {
+            Log::warning('WhatsApp: quick-reply image send failed', [
+                'conversation_id' => $conversation->id,
+                'button'          => $key,
+                'error'           => $resp['error'] ?? null,
+                'error_code'      => $resp['error_code'] ?? null,
+            ]);
+            return false;
+        }
+
+        // Keep our answer in the chat history. ⚠⚠ sent_by MUST stay NULL — see
+        // the same note in maybeAnswerBankDetailsRequest (UnreadQuery).
+        try {
+            MessageModel::create([
+                'conversation_id' => $conversation->id,
+                'wa_message_id'   => $replyWaId,
+                'direction'       => 'outbound',
+                'type'            => 'image',
+                'content'         => '[Image]',
+                'media_url'       => $relative,
+                'media_mime_type' => @mime_content_type($fullPath) ?: 'image/jpeg',
+                'status'          => 'sent',
+                'sent_by'         => null,
+                'created_at'      => now(),
+            ]);
+            ConversationModel::where('id', $conversation->id)->update(['last_message_at' => now()]);
+        } catch (\Throwable $e) {
+            // The customer HAS the picture; only our copy of the record failed.
+            Log::warning('WhatsApp: quick-reply image not persisted', [
+                'conversation_id' => $conversation->id,
+                'error'           => $e->getMessage(),
+            ]);
+        }
+
+        // The tap needs no human: keep it out of every unread badge (still
+        // visible in the chat). No-op until the column exists.
+        try {
+            if ($savedMessage && \App\Services\WhatsApp\UnreadQuery::supported()) {
+                \Illuminate\Support\Facades\DB::table('t_wa_messages')
+                    ->where('id', $savedMessage->id)
+                    ->update([\App\Services\WhatsApp\UnreadQuery::COLUMN => 1]);
+            }
+        } catch (\Throwable $e) {
+            Log::debug('WhatsApp: could not flag tap as unread-exempt', ['error' => $e->getMessage()]);
+        }
+
+        // Which template was tapped — log only (forensics), never a gate.
+        $tappedTemplate = null;
+        try {
+            $ctxId = $msg['context']['id'] ?? null;
+            if ($ctxId) {
+                $tappedTemplate = MessageModel::where('wa_message_id', $ctxId)->value('template_name');
+            }
+        } catch (\Throwable $e) {
+            // log detail only
+        }
+
+        Log::info('WhatsApp: quick-reply image sent', [
+            'conversation_id' => $conversation->id,
+            'button'          => $key,
+            'template'        => $tappedTemplate,
+        ]);
+
+        return true;
+    }
+
+    /**
+     * Send a local image by media id, uploading it to Meta at most once per 20
+     * days (Meta expires ids at ~30). A media error on a cached id (expired or
+     * revoked early) drops it and retries ONCE with a fresh upload. Other errors
+     * are not retried — a timeout Meta actually accepted would otherwise send the
+     * picture twice.
+     */
+    protected function sendQuickReplyImage(string $to, string $fullPath): array
+    {
+        $cacheKey = 'wa_quick_reply_media:' . md5($fullPath . '|' . @filesize($fullPath) . '|' . @filemtime($fullPath));
+        $mime = @mime_content_type($fullPath) ?: 'image/jpeg';
+
+        $resp = ['success' => false, 'error' => 'media upload failed'];
+        for ($attempt = 1; $attempt <= 2; $attempt++) {
+            $mediaId = \Illuminate\Support\Facades\Cache::remember(
+                $cacheKey,
+                now()->addDays(20),
+                fn () => $this->uploadMediaToWhatsApp($fullPath, $mime)
+            );
+            if (!$mediaId) {
+                // Never cache a failed upload.
+                \Illuminate\Support\Facades\Cache::forget($cacheKey);
+                return ['success' => false, 'error' => 'media upload failed'];
+            }
+
+            $resp = $this->sendImageById($to, $mediaId);
+            if ($resp['success'] ?? false) {
+                return $resp;
+            }
+
+            $isMediaError = in_array((int) ($resp['error_code'] ?? 0), [131051, 131052, 131053], true)
+                || str_contains(strtolower((string) ($resp['error'] ?? '')), 'media');
+            if (!$isMediaError) {
+                return $resp;
+            }
+            \Illuminate\Support\Facades\Cache::forget($cacheKey);
+        }
+
+        return $resp;
+    }
+
+    /**
      * Which order does a button tap answer? WhatsApp sends context.id = the
      * wa_message_id of the template that was tapped.
      *   1. the automation log (an automated send), then
@@ -970,6 +1141,20 @@ class WhatsAppService
                     );
                 } catch (\Throwable $bankErr) {
                     Log::warning('WhatsApp: bank-details reply skipped (non-fatal)', ['error' => $bankErr->getMessage()]);
+                }
+            }
+
+            // Oct-2026 — a tap listed in QUICK_REPLY_IMAGES (the frozen
+            // campaign's "Menu") is answered with its picture. Same rules as
+            // the bank-details answer above: answered = no badge / push /
+            // out-of-office; failed = a normal customer message.
+            if (!$systemAnswered && $savedMessage && in_array($type, ['button', 'interactive'], true)) {
+                try {
+                    $systemAnswered = $this->maybeAnswerQuickReplyImage(
+                        $conversation, $from, $msg, $type, (string) $content, $savedMessage
+                    );
+                } catch (\Throwable $qrErr) {
+                    Log::warning('WhatsApp: quick-reply image skipped (non-fatal)', ['error' => $qrErr->getMessage()]);
                 }
             }
 

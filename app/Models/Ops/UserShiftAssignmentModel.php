@@ -19,7 +19,19 @@ class UserShiftAssignmentModel extends Model
         'created_by',
         'updated_by',
         'notified_at',
-        'acknowledged_at'
+        'acknowledged_at',
+        /**
+         * 🔁 Weekly days (Oct-2026) — "different on some days" on THIS row. JSON, NULL = none.
+         * Read through App\Services\Ops\WeekdayPattern only. ⚠ Written only when the column
+         * exists (ShiftController::withPattern) — the PHP may go up before the SQL.
+         */
+        'day_pattern',
+        /**
+         * ⚠ Oct-2026: 1 = a temporary change (one day / date range / workshop pin), 0 = a regular
+         * shift (open, or closed because a newer regular began). NULL = written before the column
+         * existed → ShiftResolutionService::closedRegularIds() falls back to the audit log.
+         */
+        'is_temporary',
     ];
 
     protected $casts = [

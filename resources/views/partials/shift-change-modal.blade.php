@@ -123,6 +123,13 @@
    * ⚠ Advisory only. The server refuses regardless of what this file believes.
    */
   let canChange = true, needsApproval = false, allowedIds = null, lockReason = null;
+  /**
+   * 🔁 His WEEKLY DAYS (Oct-2026), as one line from /shifts/user-summary. This popup cannot
+   * edit them — the Shift Planner and the phone can — so it only SAYS what happens to them:
+   * a new regular shift KEEPS them (the server carries them over when this form does not
+   * send any), a date range PAUSES them for those dates. '' = he has none.
+   */
+  let weeklySummary = '';
 
   const fmt = (d) => { try { return new Date(d+'T00:00:00').toLocaleDateString(undefined,{day:'numeric',month:'short'}); } catch(e){ return d; } };
   const todayStr = () => { const d=new Date(); const p=(n)=>String(n).padStart(2,'0'); return d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate()); };
@@ -185,6 +192,9 @@
     if (mode==='until_changed') msg = `→ ${who} will be on <b>${nm}</b> from <b>${fmt(from)}</b> until you change it. Past days are untouched.`;
     else if (mode==='one_day') msg = `→ ${who} on <b>${nm}</b> for <b>${fmt(from)}</b> only, then back to their normal shift automatically.`;
     else msg = `→ ${who} on <b>${nm}</b> for <b>${fmt(from)}–${fmt(to)}</b>, then back to their normal shift automatically.`;
+    // 🔁 What happens to his weekly days — this form cannot change them.
+    if (weeklySummary && mode==='until_changed') msg += `<br><span style="color:#1d4ed8;">🔁 His weekly days stay as they are (${escapeHtmlScm(weeklySummary)}). Change them in the Shift Planner.</span>`;
+    else if (weeklySummary && mode==='date_range') msg += `<br><span style="color:#1d4ed8;">🔁 His weekly days are paused for these dates — every day is <b>${nm}</b>. To keep them, use the Shift Planner.</span>`;
     // ⏳ The sentence that stops a manager assuming it has landed.
     if (needsApproval) msg += `<br><span style="color:#9A3412;font-weight:600;">⏳ This waits for approval. ${who} is not told until it is approved.</span>`;
     $('scmEffect').innerHTML = msg;
@@ -233,7 +243,10 @@
       + `<option value="not_required">🚫 Not required (day off, paid — not a shift)</option>`;
   }
 
+  function escapeHtmlScm(s){ return String(s==null?'':s).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+
   async function loadSummary(userId){
+    weeklySummary = '';   // never show the previous person's weekly days while this loads
     $('scmSummary').innerHTML = '<div class="scm-loading">Loading current shift…</div>';
     try {
       const d = await fetch('/shifts/user-summary?user_id=' + encodeURIComponent(userId)).then(r=>r.json());
@@ -258,7 +271,10 @@
       onTemplateChange();
     }
     const p = d.primary || {};
+    weeklySummary = d.weekly_summary || '';
     let html = `<div class="scm-now"><span class="scm-now-lbl">Now</span> <b>${p.shift_name||'—'}</b> · ${p.start||''}${p.end?'–'+p.end:' onwards'}</div>`;
+    if (weeklySummary) html += `<div class="scm-nochg" style="color:#1d4ed8;">🔁 Weekly days: ${escapeHtmlScm(weeklySummary)}</div>`;
+    renderEffect();
     if (d.changes && d.changes.length){
       html += '<div class="scm-changes">' + d.changes.map(c=>{
         const lbl = c.kind==='temporary'

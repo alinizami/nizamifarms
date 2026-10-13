@@ -573,8 +573,8 @@ class HubController extends Controller
     /** Expense categories for the short-cash settle path (server-rendered, no GET endpoint exists). */
     private function expenseCategories(): array
     {
-        $cats = \App\Models\FIN\ConfigModel::where('config_key', 'LIKE', 'EXPENSE_CATEGORY_%')
-            ->pluck('config_value')->toArray();
+        // Oct-2026: the one expense-type engine — active types only, Taimur's order.
+        $cats = \App\Services\FIN\ExpenseTypeService::names(1, 'expense');
         return !empty($cats) ? $cats : ['Petrol', 'Rent', 'Office Supplies'];
     }
 

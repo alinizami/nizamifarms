@@ -661,14 +661,18 @@
             </div>
             
             @php
-                $expenseCategories = \App\Models\FIN\ConfigModel::where('config_key', 'LIKE', 'EXPENSE_CATEGORY_%')
-                    ->orderBy('config_value')
-                    ->get();
+                // Oct-2026: active types from the one engine (ExpenseTypeService), Taimur's order.
+                $expenseCategories = collect(\App\Services\FIN\ExpenseTypeService::options(null, null, null, true))
+                    ->map(fn ($o) => (object) ['config_value' => $o['name']]);
             @endphp
             
             <!-- Current Categories -->
             <div class="mb-4">
-                <h3 class="text-sm font-semibold text-gray-700 mb-2">Current Categories ({{ $expenseCategories->count() }}):</h3>
+                <h3 class="text-sm font-semibold text-gray-700 mb-2 flex items-center gap-2">Current Categories ({{ $expenseCategories->count() }} active):
+                    @if(\App\Services\FIN\ExpenseTypeService::canManage())
+                        <button type="button" class="nfet-trigger" onclick="NFExpenseTypes.open({bu: 1, rcc: 'expense', label: 'Expense Reimbursement · Nizami Farms'})">✎ Manage types</button>
+                    @endif
+                </h3>
                 <div class="max-h-32 overflow-y-auto bg-gray-50 border border-gray-200 rounded p-2">
                     @if($expenseCategories->count() > 0)
                         <div class="flex flex-wrap gap-2">
@@ -688,6 +692,8 @@
                     ➕ Add New Expense Category
                 </button>
             </div>
+            @include('fin.expense-types._manager')
+            <script>window.addEventListener('nfet:closed', function (e) { if (e.detail && e.detail.changed) location.reload(); });</script>
         </div>
 
         <!-- Manage Asset Categories Card -->

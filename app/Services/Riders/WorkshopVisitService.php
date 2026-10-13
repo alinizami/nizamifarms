@@ -858,9 +858,9 @@ class WorkshopVisitService
 
             // The template he is ALREADY on that day — so only the place changes — unless a
             // planner deliberately chose a different one while approving.
+            $resolved = (new ShiftResolutionService())->getUserShift($userId, $date);
             if (!$templateId) {
-                $shift = (new ShiftResolutionService())->getUserShift($userId, $date);
-                $templateId = $shift['shift_id'] ?? null;
+                $templateId = $resolved['shift_id'] ?? null;
             }
             if (!$templateId) {
                 // Same principle as above: a silent "nothing happened" is what we are ending.
@@ -880,6 +880,30 @@ class WorkshopVisitService
                 'acknowledged_at'   => null,
                 'updated_at'        => now(),
             ];
+            /**
+             * 🔁 WEEKLY DAYS (Oct-2026). This one-day row wins the date, and on its own it would
+             * fall back to the shift TYPE's off days — flipping a weekly "off" day into a working
+             * day (absent if he does not check in), or a weekly shift on the type's off day into
+             * an off day. Carry that day's on/off status onto the pin so ONLY the place moves.
+             * ⚠ Only when he has weekly days in force that date — otherwise byte-identical.
+             */
+            // A pin is a one-day TEMPORARY row — say so (Oct-2026), guarded for deploy order.
+            if (ShiftResolutionService::kindColumnAvailable()) {
+                $row['is_temporary'] = 1;
+            }
+            if (!empty($resolved['weekly']) && \App\Services\Ops\WeekdayPattern::available()) {
+                $dow = (int) date('N', strtotime($date));
+                $worksThatDay = in_array($dow, array_map('intval', $resolved['working_days'] ?? []), true);
+                $wd = DB::table('t_ops_shift_template')->where('id', (int) $templateId)->value('working_days');
+                $typeWorks = in_array($dow, array_map('intval', is_string($wd) ? (json_decode($wd, true) ?: []) : []), true);
+                $pin = null;
+                if (!$worksThatDay && $typeWorks) {
+                    $pin = [$dow => ['off' => true]];
+                } elseif ($worksThatDay && !$typeWorks) {
+                    $pin = [$dow => ['template_id' => (int) $templateId, 'location_id' => $locationId]];
+                }
+                $row['day_pattern'] = \App\Services\Ops\WeekdayPattern::encode($pin);
+            }
             if ($existing) {
                 DB::table('t_ops_user_shift_assignment')->where('id', $existing->id)->update($row);
             } else {

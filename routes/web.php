@@ -1585,6 +1585,17 @@ Route::middleware(['auth'])->group(function () {
         // Expense Category Routes
         Route::prefix('expense-category')->name('expense-category.')->group(function () {
             Route::post('/', [\App\Http\Controllers\FIN\ExpenseCategoryController::class, 'store'])->name('store');
+            // ⭐ Oct-2026 Expense Types manager (rename / inactive / order / group / merge / undo) —
+            // the drawer next to every Expense Type dropdown. Logic: ExpenseTypeService.
+            Route::get('/types', [\App\Http\Controllers\FIN\ExpenseTypeController::class, 'list'])->name('types');
+            Route::get('/types/all', [\App\Http\Controllers\FIN\ExpenseTypeController::class, 'webList'])->name('types.all');
+            Route::post('/types/reorder', [\App\Http\Controllers\FIN\ExpenseTypeController::class, 'reorder'])->name('types.reorder');
+            Route::post('/types/merge-old-name', [\App\Http\Controllers\FIN\ExpenseTypeController::class, 'mergeOrphan'])->name('types.merge-orphan');
+            Route::post('/types/undo', [\App\Http\Controllers\FIN\ExpenseTypeController::class, 'undo'])->name('types.undo');
+            Route::get('/types/{id}/rename-preview', [\App\Http\Controllers\FIN\ExpenseTypeController::class, 'previewRename'])->whereNumber('id')->name('types.rename-preview');
+            Route::post('/types/{id}/rename', [\App\Http\Controllers\FIN\ExpenseTypeController::class, 'rename'])->whereNumber('id')->name('types.rename');
+            Route::post('/types/{id}/active', [\App\Http\Controllers\FIN\ExpenseTypeController::class, 'setActive'])->whereNumber('id')->name('types.active');
+            Route::post('/types/{id}/group', [\App\Http\Controllers\FIN\ExpenseTypeController::class, 'setGroup'])->whereNumber('id')->name('types.group');
         });
 
         // Asset Category Management
@@ -1867,6 +1878,13 @@ Route::middleware(['auth'])->group(function () {
             Route::get('/leave-actions', [\App\Http\Controllers\HR\PayrollController::class, 'leaveActions'])->name('leave-actions');
             Route::post('/leave-actions/decide', [\App\Http\Controllers\HR\PayrollController::class, 'decideLeaveAction'])->name('leave-actions.decide');
             Route::post('/leave-actions/apply-all', [\App\Http\Controllers\HR\PayrollController::class, 'applyAllLeaveActions'])->name('leave-actions.apply-all');
+            // ⏱ Time bank (Oct-2026): late + extra as one balance — card, decide, undo, manual adjust.
+            Route::get('/time-bank/preview', [\App\Http\Controllers\HR\PayrollController::class, 'timeBankPreview'])->name('time-bank.preview');
+            Route::get('/time-bank/history', [\App\Http\Controllers\HR\PayrollController::class, 'timeBankHistory'])->name('time-bank.history');
+            Route::post('/time-bank/decide', [\App\Http\Controllers\HR\PayrollController::class, 'timeBankDecide'])->name('time-bank.decide');
+            Route::post('/time-bank/undo', [\App\Http\Controllers\HR\PayrollController::class, 'timeBankUndo'])->name('time-bank.undo');
+            Route::post('/time-bank/adjust', [\App\Http\Controllers\HR\PayrollController::class, 'timeBankAdjust'])->name('time-bank.adjust');
+            Route::post('/time-bank/adjust/remove', [\App\Http\Controllers\HR\PayrollController::class, 'timeBankRemoveAdjust'])->name('time-bank.adjust-remove');
             // Custom-schedule employees (date-range / weekly salaries)
             Route::get('/custom-data', [\App\Http\Controllers\HR\PayrollController::class, 'customData'])->name('custom-data');
             Route::post('/custom-preview', [\App\Http\Controllers\HR\PayrollController::class, 'customPreview'])->name('custom-preview');
