@@ -2112,7 +2112,26 @@ class OrderController extends Controller
             $oldPaymentMethod = $order->payment_method;
             $oldCustomerId = $order->customer_id;
             $statusChangeWarning = null; // set by the full-update status discipline below
-            
+
+            // Oct-2026 — a plain edit must NOT look like a payment-method change.
+            // Orders delivered from the phone / Shopify store 'online_payment',
+            // but the edit form's dropdown only knows 'online' (and 'cash_on_delivery'
+            // vs 'cash'), so every save posted a different SPELLING of the same
+            // method. The block further down then reversed the pending invoice and
+            // re-posted it (new ledger id, new date, "changed from 'online' to
+            // 'online'") — and on 14-Oct SH-23614's re-post never landed, dropping
+            // it out of Online Approvals. Same family ⇒ keep the stored spelling so
+            // nothing downstream sees a change. A REAL switch (cash ↔ online) still
+            // goes through the reverse + re-post path exactly as before.
+            if (!$isPartialUpdate && array_key_exists('payment_method', $validated)) {
+                $submittedPm = $validated['payment_method'];
+                if ($submittedPm === null || $submittedPm === ''
+                    || (self::paymentMethodFamily($submittedPm) === self::paymentMethodFamily($oldPaymentMethod)
+                        && $submittedPm !== $oldPaymentMethod)) {
+                    $validated['payment_method'] = $oldPaymentMethod;
+                }
+            }
+
             // ================================================================
             // UPDATE ORDER (with Partial Update Support)
             // ================================================================
@@ -2317,7 +2336,7 @@ class OrderController extends Controller
 
                         // Payment method can be changed - handle it
                         try {
-                            $result = $this->handlePaymentMethodChange($order, $ledger, $newPaymentMethod);
+                            $result = $this->handlePaymentMethodChange($order, $ledger, $newPaymentMethod, $oldPaymentMethod);
                             $paymentMethodChanged = true;
                             $paymentMethodChangeMessage = "Payment method changed from '{$oldPaymentMethod}' to '{$newPaymentMethod}'. Ledger entry updated.";
                             
@@ -2790,6 +2809,17 @@ class OrderController extends Controller
                     return ($d['coupon_code'] ?? null) !== \App\Models\CRM\CustomerCreditModel::DISCOUNT_CODE
                         && trim((string) ($d['title'] ?? '')) !== 'Account balance applied';
                 }));
+            }
+
+            // 📦 Bundled products (Oct-2026): a line that still names a BUNDLE (an older
+            // phone app that doesn't know bundles) becomes one line per product inside, at
+            // the packet prices entered on the bundle — the same rule as Shopify conversion
+            // (App\Services\CRM\ProductBundle). The current web and phone forms already
+            // send the products inside, which can never be bundles, so nothing is expanded
+            // twice. Never throws: a broken bundle line is saved as it came (at the bundle
+            // total). Runs BEFORE the totals below so they see the real lines.
+            if (!empty($validated['items'])) {
+                $validated['items'] = \App\Services\CRM\ProductBundle::expandFormItems($validated['items']);
             }
 
             // ================================================================
@@ -3903,15 +3933,59 @@ class OrderController extends Controller
             $productVariant = $productVariants->first();
             $originalPrice = (float) $lineItem->unit_price;
             $newPrice = (float) $productVariant->price;
-            
+
             // Get the product name from our system
             $localProductName = $productVariant->product ? $productVariant->product->title : null;
             $quantity = (int) $lineItem->quantity;
-            
+
+            // 📦 Bundled product (Oct-2026): Shopify's "1 × EK200 @ 1,500" is really
+            // packets of the products inside (2 × Samosa @ 500 + 1 × Roll @ 500). It
+            // becomes ONE ORDER LINE PER PRODUCT INSIDE, each that product's own sku /
+            // variant / product at the packet price entered on the bundle — see
+            // App\Services\CRM\ProductBundle. resolve() never throws and never stops a
+            // conversion: a broken bundle stays one line at the bundle price (its variant
+            // price is kept = the bundle total) with a warning for staff.
+            [$bundle, $bundleWarning] = \App\Services\CRM\ProductBundle::resolve($productVariant);
+            if ($bundleWarning) {
+                $warnings[] = $bundleWarning;
+            }
+            if ($bundle) {
+                $bundleLine = $lineItem->toArray();
+                unset($bundleLine['id'], $bundleLine['order_id'], $bundleLine['created_at'], $bundleLine['updated_at']);
+                $expanded = \App\Services\CRM\ProductBundle::expandLine($bundleLine, $bundle, (float) $quantity);
+                $bundleTotal = round(array_sum(array_column($expanded, 'line_total')), 2);
+                $shopifyTotal = $quantity * $originalPrice;
+                if (abs($bundleTotal - $shopifyTotal) >= 1) {
+                    // Not blocking — our prices win, as for every line — but the packet
+                    // prices on the bundle should add up to the Shopify price.
+                    $warnings[] = "Bundle {$lineItem->sku}: Shopify charged Rs " . number_format($shopifyTotal)
+                        . ', our order says Rs ' . number_format($bundleTotal)
+                        . ' — check the packet prices on the bundle in Products';
+                }
+                $priceChanges[] = [
+                    'sku' => $lineItem->sku,
+                    'original_name' => $lineItem->name,
+                    'new_name' => implode(' + ', array_column($expanded, 'name')),
+                    'name_changed' => true,
+                    'original_price' => $originalPrice,
+                    'new_price' => null,
+                    'price_changed' => abs($bundleTotal - $shopifyTotal) >= 1,
+                    'quantity' => $quantity,
+                    'original_total' => $shopifyTotal,
+                    'new_total' => $bundleTotal,
+                    'bundle_lines' => count($expanded),
+                ];
+                foreach ($expanded as $row) {
+                    $recalculatedLineItems[] = $row;
+                }
+                $newSubtotal += $bundleTotal;
+                continue;
+            }
+
             // Calculate new line total
             $newLineTotal = $quantity * $newPrice;
             $originalLineTotal = $quantity * $originalPrice;
-            
+
             // Track price and name changes
             $originalName = $lineItem->name;
             $nameChanged = $localProductName && $localProductName !== $originalName;
@@ -3943,7 +4017,7 @@ class OrderController extends Controller
             // it tries to find ProductVariantModel by Shopify's external ID
             $lineItemData['variant_id'] = $productVariant->id;
             $lineItemData['product_id'] = $productVariant->product_id;
-            
+
             // Update with new prices
             $lineItemData['unit_price'] = $newPrice;
             $lineItemData['line_total'] = $newLineTotal;
@@ -5414,12 +5488,15 @@ class OrderController extends Controller
      * @param string $newPaymentMethod
      * @return array
      */
-    private function handlePaymentMethodChange($order, $oldLedger, $newPaymentMethod)
+    private function handlePaymentMethodChange($order, $oldLedger, $newPaymentMethod, ?string $previousPaymentMethod = null)
     {
         \DB::beginTransaction();
-        
+
         try {
-            $oldPaymentMethod = $order->payment_method;
+            // The caller has already written the NEW method onto the order, so
+            // reading it back here used to log "changed from 'online' to 'online'".
+            // Prefer the value the caller captured before the update.
+            $oldPaymentMethod = $previousPaymentMethod ?? $order->payment_method;
             
             // 1. Reverse the old ledger entry
             $this->reverseLedgerEntry($oldLedger, "Payment method changed from '{$oldPaymentMethod}' to '{$newPaymentMethod}'");
@@ -5468,8 +5545,20 @@ class OrderController extends Controller
     }
 
     /**
+     * Which side of the ledger a payment-method spelling lands on: 'online' or
+     * 'cash'. The online set is the one LedgerPostingService::postInvoiceFromOrder
+     * uses to pick the ONLINE bank account; everything else is settled in cash.
+     * Two spellings in the same family are the SAME method for invoice purposes.
+     */
+    public static function paymentMethodFamily(?string $method): string
+    {
+        $m = strtolower(trim((string) $method));
+        return in_array($m, ['online', 'online_payment', 'bank_transfer', 'card'], true) ? 'online' : 'cash';
+    }
+
+    /**
      * Reverse a ledger entry and update balances
-     * 
+     *
      * @param \App\Models\FIN\LedgerModel $ledger
      * @param string $reason
      * @return void

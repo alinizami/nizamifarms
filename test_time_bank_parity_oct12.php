@@ -50,11 +50,15 @@ foreach ($webRows as $uid => $w) {
         : (int) (($s['status'] ?? '') === 'decided'
             ? (($s['decision']['ot'] ?? null) === 'give' ? $s['decision']['ot_days'] : 0) : ($s['net']['ot_days'] ?? 0));
     $ok((int) $w['overtime_bonus_leaves'] === $expectedBonus, "$name bonus days: web board vs engine", $w['overtime_bonus_leaves'] . ' vs ' . $expectedBonus);
+    // ⭐ Tiles round: the table cells (Late / Extra / by) are ONE payload on every board.
+    $ok(json_encode($row['time_bank']['cells'] ?? null) === json_encode($s['cells'] ?? null), "$name cells: payroll = engine");
+    $ok(json_encode($w['time_bank']['cells'] ?? null) === json_encode($s['cells'] ?? null), "$name cells: web attendance = engine");
     if (isset($mobRows[$uid])) {
         $m = $mobRows[$uid];
         $ok((int) $m['late_minutes'] === (int) $row['late_minutes'], "$name late: payroll vs phone report", $m['late_minutes'] . ' vs ' . $row['late_minutes']);
         $ok(($m['time_bank']['chip'] ?? '') === ($row['time_bank']['chip'] ?? ''), "$name chip: payroll vs phone report");
         $ok((int) $m['overtime_bonus_leaves'] === (int) $w['overtime_bonus_leaves'], "$name bonus days: phone vs web");
+        $ok(json_encode($m['time_bank']['cells'] ?? null) === json_encode($s['cells'] ?? null), "$name cells: phone report = engine");
     }
     // The rider's own screens
     $rider = \App\Models\User::find($uid);
@@ -68,6 +72,16 @@ foreach ($webRows as $uid => $w) {
             $rm = $att['summary']['time_bank']['month'] ?? null;
             $ok($rm && $rm['sentence'] === $s['rider_sentence'], "$name rider sentence = engine", json_encode($rm['sentence'] ?? null));
         }
+        // ⭐ The time balance: the manager's summary (web Employee tab / card / phone history) and
+        // the rider's summary come from the SAME numbers.
+        $sum = $tb->summary($uid);
+        $hist = $tb->history($uid);
+        $ok(($hist['summary']['lines'] ?? null) === $sum['lines'], "$name summary: history = engine");
+        $ok(($att['summary']['time_bank']['summary']['lines'] ?? null) === $sum['rider_lines'], "$name rider summary = engine (attendance)");
+        $ok(($my['time_bank']['summary']['lines'] ?? null) === $sum['rider_lines'], "$name rider summary = engine (pay screen)");
+        $cur = $tb->month($uid, $sum['month']);
+        $ok($sum['bank_late'] === (int) ($cur['late']['in'] ?? 0) && $sum['own_late'] === (int) ($cur['late']['own'] ?? 0),
+            "$name summary bank/own late = the running month's card");
         if (!empty($my['success'])) {
             $ok((int) $my['row']['late_minutes'] === (int) $row['late_minutes'], "$name late: payroll vs rider pay screen");
             $ok(!array_key_exists('time_bank', $my['row']), "$name rider pay screen carries no manager suggestions");

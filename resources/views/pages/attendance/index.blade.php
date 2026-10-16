@@ -247,9 +247,9 @@
             </div>
             {{-- ⏱ Time bank (Oct-2026): how much late one minute of extra covers. --}}
             <div style="flex:1;min-width:150px;">
-              <label style="display:block;font-size:12px;font-weight:600;color:#374151;margin-bottom:4px;">Extra covers late at</label>
+              <label style="display:block;font-size:12px;font-weight:600;color:#374151;margin-bottom:4px;">Overtime covers late at (0.5 = half)</label>
               <input type="number" min="0.1" max="1" step="0.05" id="ruleOtLateFactor" style="width:100%;border:2px solid #d1d5db;border-radius:8px;padding:9px 10px;font-size:14px;">
-              <div style="font-size:11px;color:#9ca3af;margin-top:4px;">0.5 = 9h extra covers 4.5h late · 1 = equal. Used when a month is decided.</div>
+              <div style="font-size:11px;color:#9ca3af;margin-top:4px;">0.5 = 9h overtime wipes 4.5h late · 1 = equal. Applies right away to every open month's card and tables; months already decided keep the rate they were decided with.</div>
             </div>
           </div>
         </div>
@@ -1975,6 +1975,10 @@ function switchAttTab(tab) {
 }
 
 // ---- Month tab ----
+// ⏱ After a time-bank card (opened from a Late / Overtime cell) saves, refresh the month + banner.
+window.NFTimeBankOnDone = () => { try { loadMonthTab(); loadPayrollLeaveBanner(); } catch (e) {} };
+window.NFTimeBankDrill = (uid, kind, name) => showDateBreakdown(uid, name || '', kind === 'overtime' ? 'month_overtime' : 'month_late');
+
 function currentMonthValue() {
   const el = document.getElementById('monthPicker');
   if (el && el.value) return el.value;
@@ -2076,7 +2080,7 @@ function renderPayrollLeaveActions() {
   const all = (!open && s.pending_count > 0)
     ? `<div style="margin-bottom:10px;"><button type="button" id="laApplyAll"
          style="background:#ECFDF5;border:1px solid #A7F3D0;color:#047857;border-radius:6px;padding:5px 13px;font-size:12px;font-weight:700;cursor:pointer;">Confirm all ${s.pending_count} suggested</button>
-         <span style="font-size:11px;color:#9CA3AF;margin-left:8px;">late &amp; extra: leave where possible, otherwise moved to next month · never cuts a salary</span></div>` : '';
+         <span style="font-size:11px;color:#9CA3AF;margin-left:8px;">late &amp; overtime: leave where possible, otherwise moved to next month · never cuts a salary</span></div>` : '';
 
   const items = [];
   (j.rows || []).forEach(r => (r.actions || []).forEach(a => {
@@ -2117,7 +2121,7 @@ async function decidePayrollLeaveAction(userId, kind, decision) {
 
 async function applyAllPayrollLeaveActions() {
   const s = (PAYROLL_LEAVE_ACT && PAYROLL_LEAVE_ACT.summary) || {};
-  if (!confirm(`Confirm all ${s.pending_count} suggested leave actions for ${PAYROLL_LEAVE_ACT.month_label}?\n\nLate & extra: extra covers late first, late days come off leave where there is leave (otherwise they move to next month), extra days are given. No salary is cut by this button. Anything already decided is left alone.`)) return;
+  if (!confirm(`Confirm all ${s.pending_count} suggested leave actions for ${PAYROLL_LEAVE_ACT.month_label}?\n\nLate & overtime: overtime covers late first, late days come off leave where there is leave (otherwise they move to next month), overtime days are given. No salary is cut by this button. Anything already decided is left alone.`)) return;
   document.querySelectorAll('#laBody button').forEach(b => b.disabled = true);
   try {
     const res = await fetch('/hr/payroll/leave-actions/apply-all', {
@@ -2209,15 +2213,13 @@ function renderMonthBody(data) {
     return `<span style="display:block;font-size:9.5px;color:#6B7280;">${fmtMinsShort(Number(u.late_raw_minutes) || 0)} · ${fmtMinsShort(w)} waived</span>`;
   };
 
-  // ⏱ Time bank (Oct-2026): the SAME chip Payroll shows (server text); a pending/decided one opens the card.
-  const attTimeBankChip = (u, uid, nm) => {
-    const t = u.time_bank;
-    if (!t || !t.chip) return '';
-    const pend = t.status === 'pending';
-    const col = pend ? (t.tone === 'extra' ? 'color:#047857;background:#ECFDF5;' : 'color:#92400E;background:#FFFBEB;') : 'color:#4B5563;background:#F3F4F6;';
-    const open = (pend || t.status === 'decided') && window.NFTimeBank;
-    return `<span ${open ? `onclick="event.stopPropagation(); NFTimeBank.open(${uid}, currentMonthValue(), '${nm}', () => { loadMonthTab(); loadPayrollLeaveBanner(); })"` : ''} title="${(t.lines || []).join(' · ').replace(/"/g, '&quot;')}" style="display:block;margin-top:3px;font-size:9.5px;font-weight:700;border-radius:5px;padding:1px 5px;${col}${open ? 'cursor:pointer;' : ''}">${pend ? '⏳ ' : ''}${t.chip}</span>`;
-  };
+  // ⏱ Tiles round (Oct-14): the SAME Late / Overtime cell Payroll draws (server `cells`, one
+  // renderer in the shared partial) — what happened + who, or "Decide <Month> ›" (opens the card).
+  // The minutes button and the review chip above it stay: they open the days and the checks.
+  const attTimeBankChip = (u, uid, nm, kind) =>
+    (u.time_bank && u.time_bank.cells && window.NFTimeBank)
+      ? NFTimeBank.cellHtml(u.time_bank.cells, kind || 'late', { uid: uid, name: u.fullname, bare: true, center: true })
+      : '';
 
   body.innerHTML = sorted.map(u => {
     const late = Number(u.total_late_minutes) || 0;
@@ -2234,8 +2236,8 @@ function renderMonthBody(data) {
     const otPer = Number(u.overtime_minutes_per_bonus) || 540;
     const otTitle = `${fmtMinsShort(ot)} beyond the daily target. ${fmtMinsShort(otPer)} = 1 bonus leave day, so this earns ${otBonus}. Click to see the days.`;
     const otCell = ot > 0
-      ? `<td class="px-4 py-3 text-center"><button type="button" onclick="event.stopPropagation(); showDateBreakdown(${uid}, '${nm}', 'month_overtime')" title="${otTitle}" style="background:none;border:none;cursor:pointer;font-weight:700;color:#047857;text-decoration:underline;text-decoration-style:dotted;text-underline-offset:2px;font-size:13px;line-height:1.25;">${fmtMinsShort(ot)}${otBonus > 0 ? `<span style="display:block;font-size:9.5px;font-weight:700;color:#6d28d9;text-decoration:none;">= ${otBonus} bonus day${otBonus === 1 ? '' : 's'}</span>` : ''}</button>${attReviewChip(u, 'overtime', uid, nm)}</td>`
-      : `<td class="px-4 py-3 text-sm" style="text-align:center;color:#D1D5DB;">–</td>`;
+      ? `<td class="px-4 py-3 text-center"><button type="button" onclick="event.stopPropagation(); showDateBreakdown(${uid}, '${nm}', 'month_overtime')" title="${otTitle}" style="background:none;border:none;cursor:pointer;font-weight:700;color:#047857;text-decoration:underline;text-decoration-style:dotted;text-underline-offset:2px;font-size:13px;line-height:1.25;">${fmtMinsShort(ot)}${otBonus > 0 ? `<span style="display:block;font-size:9.5px;font-weight:700;color:#6d28d9;text-decoration:none;">= ${otBonus} bonus day${otBonus === 1 ? '' : 's'}</span>` : ''}</button>${attReviewChip(u, 'overtime', uid, nm)}${attTimeBankChip(u, uid, nm, 'extra')}</td>`
+      : `<td class="px-4 py-3 text-sm" style="text-align:center;color:#D1D5DB;">–${attTimeBankChip(u, uid, nm, 'extra')}</td>`;
     const flagsTd = flagsCell(u, uid, nm);
     const meterTd = meterCell(u, uid, nm);
     const offTd = offDutyCell(u, uid, nm);
@@ -2388,7 +2390,7 @@ function leaveBalCell(u, uid, nm) {
   const late = Number(u.leave_late_penalties) || 0;
   const adj = Number(u.leave_manual_adjust) || 0;
   let chips = '';
-  if (ot !== 0) chips += `<span style="color:#6d28d9;">${ot > 0 ? '+' : ''}${ot} OT</span> `;
+  if (ot !== 0) chips += `<span style="color:#6d28d9;">${ot > 0 ? '+' : ''}${ot} overtime</span> `;
   if (late < 0) chips += `<span style="color:#c2410c;">${late} late</span> `;
   if (adj !== 0) chips += `<span style="color:#6b7280;">${adj > 0 ? '+' : ''}${adj} adj</span> `;
   const cov = Number(u.leave_absence_cover) || 0;
@@ -2428,8 +2430,8 @@ async function showLeaveSummary(uid, name) {
   summary += `<div style="text-align:center;margin-bottom:6px;"><span style="font-size:26px;font-weight:800;color:${remColor};">${rem}</span><span style="font-size:13px;color:#6B7280;font-weight:600;"> leaves left</span></div>`;
   summary += fRow('Yearly quota', quotaBase);
   // Bonus can go NEGATIVE now (a correction can outweigh what was earned) — always signed.
-  if (ot !== 0) summary += fRow((ot > 0 ? '+ ' : '− ') + 'Bonus (overtime)', (ot > 0 ? '+' : '') + ot, '#6d28d9');
-  if (late < 0) summary += fRow('− Late penalty', late, '#c2410c');
+  if (ot !== 0) summary += fRow((ot > 0 ? '+ ' : '− ') + 'From overtime', (ot > 0 ? '+' : '') + ot, '#6d28d9');
+  if (late < 0) summary += fRow('− Taken for late', late, '#c2410c');
   if (adj !== 0) summary += fRow((adj > 0 ? '+ ' : '− ') + 'Yearly adjustment', (adj > 0 ? '+' : '') + adj, '#6b7280');
   const cov = Number(u.leave_absence_cover) || 0;
   if (cov !== 0) summary += fRow('− Used to cover parked absences', cov, '#b45309');
@@ -2931,7 +2933,7 @@ async function loadLeaveBalanceChip() {
     const remColor = b.remaining <= 0 ? '#dc2626' : (b.remaining <= 2 ? '#d97706' : '#15803d');
     // Where the extra/missing leaves came from — segregated so a grown quota isn't a mystery.
     let breakdown = '';
-    if (b.earned_overtime != 0) breakdown += `<span style="color:#6d28d9;">${b.earned_overtime > 0 ? '+' : ''}${b.earned_overtime} bonus</span>`;
+    if (b.earned_overtime != 0) breakdown += `<span style="color:#6d28d9;">${b.earned_overtime > 0 ? '+' : ''}${b.earned_overtime} overtime</span>`;
     if (b.late_penalties < 0) breakdown += `<span style="color:#c2410c;">${b.late_penalties} late</span>`;
     if (b.manual_adjust && b.manual_adjust != 0) breakdown += `<span style="color:#6b7280;">${b.manual_adjust > 0 ? '+' : ''}${b.manual_adjust} adj</span>`;
     if (b.absence_cover && b.absence_cover != 0) breakdown += `<span style="color:#b45309;">${b.absence_cover} absence cover</span>`;

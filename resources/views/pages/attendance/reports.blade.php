@@ -198,13 +198,14 @@
             <th class="px-4 py-3 text-center text-xs font-medium text-gray-500 uppercase">On Leave</th>
             <th class="px-4 py-3 text-center text-xs font-medium text-gray-500 uppercase">Late Days</th>
             <th class="px-4 py-3 text-center text-xs font-medium text-gray-500 uppercase">Late (mins)</th>
+            <th class="px-4 py-3 text-center text-xs font-medium text-gray-500 uppercase">Overtime</th>
             <th class="px-4 py-3 text-center text-xs font-medium text-purple-500 uppercase">Leaves (Year)</th>
             <th class="px-4 py-3 text-center text-xs font-medium text-gray-500 uppercase">Actions</th>
           </tr>
         </thead>
         <tbody id="reportBody" class="bg-white divide-y divide-gray-200">
           <tr>
-            <td colspan="9" class="px-4 py-8 text-center text-gray-500 text-sm">Loading report...</td>
+            <td colspan="10" class="px-4 py-8 text-center text-gray-500 text-sm">Loading report...</td>
           </tr>
         </tbody>
       </table>
@@ -368,6 +369,18 @@ function loadSavedConfiguration() {
   }
 }
 
+// ⏱ Oct-2026 — the time-bank Late / Extra cells: the SAME renderer (partials/leave-actions-panel →
+// NFTimeBank.cellHtml) and the same server payload as Attendance › Month and the payroll grid.
+// The outcome / "Decide <Month> ›" opens the card; after a decision the table reloads.
+window.NFTimeBankOnDone = () => loadMonthlyReport();
+window.NFTimeBankDrill = (uid) => showDailyDetails(uid);
+function tbCell(emp, kind) {
+  return (emp.time_bank && emp.time_bank.cells && window.NFTimeBank)
+    ? NFTimeBank.cellHtml(emp.time_bank.cells, kind, { uid: emp.user_id, name: emp.fullname, bare: true, center: true })
+    : '';
+}
+function fmtHm(m) { m = Math.round(Number(m) || 0); const h = Math.floor(m / 60); return h > 0 ? h + 'h ' + (m % 60) + 'm' : m + 'm'; }
+
 async function loadMonthlyReport() {
   const month = document.getElementById('reportMonth').value;
   currentMonth = month;
@@ -383,7 +396,7 @@ async function loadMonthlyReport() {
     }
   } catch(e) {
     console.error('Error loading monthly report', e);
-    document.getElementById('reportBody').innerHTML = '<tr><td colspan="9" class="px-4 py-8 text-center text-red-500 text-sm">Error loading report</td></tr>';
+    document.getElementById('reportBody').innerHTML = '<tr><td colspan="10" class="px-4 py-8 text-center text-red-500 text-sm">Error loading report</td></tr>';
   }
 }
 
@@ -428,7 +441,8 @@ function renderReportTable(data) {
           (Number(emp.late_waived_minutes) || 0) > 0
             ? `<span style="display:block;font-size:9.5px;font-weight:600;color:#6B7280;">${emp.late_raw_minutes}m · ${emp.late_waived_minutes}m waived</span>`
             : ''
-        }</td>
+        }${tbCell(emp, 'late')}</td>
+        <td class="px-4 py-3 text-sm text-center ${totalOTMins > 0 ? 'text-emerald-700 font-semibold' : 'text-gray-400'}">${totalOTMins > 0 ? fmtHm(totalOTMins) : '-'}${tbCell(emp, 'extra')}</td>
         <td class="px-4 py-3 text-sm text-center ${(emp.leaves_taken_year || 0) > 0 ? 'text-purple-600 font-semibold' : 'text-gray-400'}">${(emp.leaves_taken_year || 0) > 0 ? emp.leaves_taken_year + 'd' : '-'}</td>
         <td class="px-4 py-3 text-sm text-center">
           <button 
@@ -978,5 +992,6 @@ function renderHolidays() {
   }).join('');
 }
 </script>
+@include('partials.leave-actions-panel')
 @endsection
 

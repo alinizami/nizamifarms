@@ -711,6 +711,10 @@
 <script>
 (function () {
   const csrf = document.querySelector('meta[name="csrf-token"]').content;
+  // ⏱ After a time-bank card (opened from any cell) saves, reload whichever view is open.
+  window.NFTimeBankOnDone = () => { if (typeof TAB !== 'undefined' && TAB === 'employee') { empLoad(); } else { load(); } };
+  window.NFTimeBankDrill = (uid, kind, name) => loadDateList(uid, kind === 'overtime' ? 'month_overtime' : 'month_late',
+    (kind === 'overtime' ? 'Overtime days — ' : 'Late days — ') + (name || ''));
   const fmt = (n) => 'Rs ' + Math.round(Number(n) || 0).toLocaleString('en-PK');
   const el = (id) => document.getElementById(id);
   let ROWS = [];        // computed rows from server (monthly)
@@ -1143,18 +1147,10 @@
           ? '<span class="pr-chip late" data-drill="month_late" data-uid="' + r.user_id + '" title="Click to see the late days">' + lateTxt + '</span>'
           : '<span class="pr-chip muted">0m</span>')
         + (lw > 0 ? '<div class="pr-formula">' + hm(Number(r.late_raw_minutes || 0)) + ' late · ' + hm(lw) + ' waived</div>' : '')
-        + reviewChip(r, 'late');
-      const tone = tb.status === 'pending' ? (tb.chip_tone === 'extra' ? '#047857;background:#ecfdf5;border-color:#a7f3d0'
-                                                                       : '#b45309;background:#fffbeb;border-color:#fcd34d')
-                 : '#4b5563;background:#f3f4f6;border-color:#e5e7eb';
-      const clickable = tb.status === 'pending' || tb.status === 'decided';
-      if (tb.chip) {
-        lateCell += '<div style="margin-top:4px;"><span ' + (clickable ? 'data-tbopen="' + i + '" ' : '')
-          + 'style="display:inline-block;font-size:10.5px;font-weight:700;border:1px solid;border-radius:6px;padding:2px 7px;'
-          + 'color:' + tone + ';' + (clickable ? 'cursor:pointer;' : '') + '"'
-          + (clickable ? ' title="Open the late &amp; extra card"' : '') + '>'
-          + (tb.status === 'pending' ? '⏳ ' : '') + esc(tb.chip) + (clickable && tb.status === 'pending' ? ' ›' : '') + '</span></div>';
-      }
+        + reviewChip(r, 'late')
+        // ⏱ Tiles round (Oct-14): the SAME cell every table draws (server `cells`) — what
+        // happened to the minutes + who, or "Decide <Month> ›". Clicking it opens the card.
+        + (tb.cells ? NFTimeBank.cellHtml(tb.cells, 'late', { uid: r.user_id, name: r.fullname, bare: true }) : '');
       (r.time_bank_cuts || []).forEach(c => {
         lateCell += '<div class="pr-formula" style="color:#b91c1c;">' + esc(c.label) + ' · − ' + fmt(c.amount) + '</div>';
       });
@@ -1222,8 +1218,8 @@
       ot = (otMin > 0
           ? '<span class="pr-chip ot" data-drill="month_overtime" data-uid="' + r.user_id + '" title="Click to see the overtime days">' + hm(otMin) + '</span>'
           : '<span class="pr-chip muted">—</span>')
-        + (Number(r.ot_carry_in || 0) > 0 ? '<div class="pr-formula">+ ' + hm(Number(r.ot_carry_in)) + ' from before</div>' : '')
-        + reviewChip(r, 'overtime');
+        + reviewChip(r, 'overtime')
+        + (tb.cells ? NFTimeBank.cellHtml(tb.cells, 'extra', { uid: r.user_id, name: r.fullname, bare: true }) : '');
     }
 
     // advances (+ always offer "give advance")
@@ -1348,13 +1344,8 @@
     document.querySelectorAll('[data-lareview="' + i + '"]').forEach(t => {
       t.onclick = () => openLeavePanel(r.user_id);
     });
-    // ⏱ time-bank chip → decide right here (owner, Oct-12: "he can do the action from payroll")
-    document.querySelectorAll('[data-tbopen="' + i + '"]').forEach(t => {
-      t.onclick = () => {
-        if (!confirmLosingGridEdits('Saving this decision')) return;
-        NFTimeBank.open(r.user_id, CURMONTH, r.fullname, async () => { await load(); });
-      };
-    });
+    // ⏱ time-bank cells open the card through the partial's one delegate (data-tbopen-uid);
+    // after a decision the month reloads (NFTimeBankOnDone, set once below).
     // bypass toggles: overtime bonus + late-leave deduction (in-place, no full re-render)
     const sot = document.querySelector('[data-skipot="' + i + '"]');
     if (sot) sot.onclick = () => {
@@ -1753,7 +1744,7 @@
       (totals.length ? '<div style="font-size:12.5px;color:#374151;margin-bottom:5px;">' + totals.join(' · ') + '</div>' : '') +
       (open
         ? '⏳ <b>' + esc(monthLabel()) + ' is still running.</b> These are previews — overtime and lateness can still change, so they can be decided once the month ends. Paying a salary now works exactly as before.'
-        : 'Late &amp; extra are settled on each card (leave, salary or next month). Absent deductions and advances are money — they move when you pay the salary.') +
+        : 'Late &amp; overtime are settled on each card (leave, salary or next month). Absent deductions and advances are money — they move when you pay the salary.') +
       (s.late_cut_count
         ? '<div style="margin-top:6px;color:#b45309;">⚠ ' + s.late_cut_count + ' employee' + (s.late_cut_count > 1 ? 's have' : ' has') +
           ' a late <b>salary cut</b> of ' + fmt(s.late_cut_total) + ' this month (too late for a leave penalty) — that is deducted at pay, not here.</div>'
@@ -1763,7 +1754,7 @@
     if (!open && s.pending_count > 0 && !LA_FILTER) {
       note += '<div style="padding:10px 14px;border-bottom:1px solid #eef0f2;">' +
         '<button type="button" class="pr-la-btn pr-la-give" id="prLaAll">Confirm all ' + s.pending_count + ' suggested</button>' +
-        '<span style="font-size:11px;color:#9ca3af;margin-left:8px;">late &amp; extra: leave where possible, otherwise moved to next month · never cuts a salary</span></div>';
+        '<span style="font-size:11px;color:#9ca3af;margin-left:8px;">late &amp; overtime: leave where possible, otherwise moved to next month · never cuts a salary</span></div>';
     }
     if (LA_FILTER) {
       note = '<div class="pr-la-back" id="prLaAllEmp">‹ all employees</div>' + note;
@@ -1822,6 +1813,8 @@
     return out;
   }
 
+  // The time-bank card / Adjust reload the month after a save — ask first if the grid has edits.
+  window.NFTimeBankBeforeSave = (what) => confirmLosingGridEdits(what);
   function confirmLosingGridEdits(whatFor) {
     const lost = unsavedGridEdits();
     if (!lost.length) return true;
@@ -1860,7 +1853,7 @@
     // ⚠ Absences are NOT in this count and cannot be "applied" — say so, because the red
     //   absence rows sit in the same list directly under this button.
     if (!confirm('Apply all ' + s.pending_count + ' recommended leave actions for ' + monthLabel() + '?'
-      + '\n\nLate & extra: extra covers late first, late days come off leave where there is leave (otherwise they move to next month), extra days are given. This button never cuts a salary. Anything you already decided is left alone.'
+      + '\n\nLate & overtime: overtime covers late first, late days come off leave where there is leave (otherwise they move to next month), overtime days are given. This button never cuts a salary. Anything you already decided is left alone.'
       + (Number(s.absence_pending || 0) > 0
           ? '\n\nThis does NOT touch the ' + s.absence_pending + ' absence decision'
             + (s.absence_pending > 1 ? 's' : '') + ' — each one has to be deducted, parked or excused itself.'
@@ -2434,7 +2427,7 @@
     }
     if (tbWarn) {
       if (tbPending.length) {
-        tbWarn.innerHTML = '⏳ <b>' + tbPending.length + ' still have late / extra to decide</b>: '
+        tbWarn.innerHTML = '⏳ <b>' + tbPending.length + ' still have late / overtime to decide</b>: '
           + tbPending.map(r => '<span data-tbpay="' + r.user_id + '" style="cursor:pointer;text-decoration:underline dotted;font-weight:700;">'
               + esc(r.fullname) + ' (' + esc(r.time_bank.chip.replace(' · choose', '')) + ')</span>').join(', ')
           + '. Paying now takes no late cut — decide later and any cut comes off the next salary.';
@@ -2737,7 +2730,7 @@
     const otBits = [];
     if (Number(r.ot_carry_in || 0) > 0) otBits.push(hm(r.ot_carry_in) + ' carried in');
     if (r.time_bank) {
-      otBits.push('see the late &amp; extra card');
+      otBits.push('see the late &amp; overtime card');
     } else {
       otBits.push('÷ ' + hm(OT_PER_DAY) + ' = ' + (r.bonus_leaves > 0 ? '+' + r.bonus_leaves + ' leave' + (r.bonus_leaves > 1 ? 's' : '') : 'no leave yet'));
       if (Number(r.ot_carry_out || 0) > 0) otBits.push(hm(r.ot_carry_out) + ' carried on');
@@ -2769,8 +2762,9 @@
     // ── Leave position ─────────────────────────────────────────────────────
     let leave = '<div class="pr-emp-card"><h4>Leave</h4>';
     leave += empLine('Yearly quota', (bal.quota_total ?? '—'));
-    leave += empLine('Earned from overtime', '+' + (bal.earned_overtime ?? 0));
-    leave += empLine('Taken off for lateness', (bal.late_penalties ?? 0));
+    // Same words as the late & extra card (owner, Oct-13).
+    leave += empLine('From overtime', '+' + (bal.earned_overtime ?? 0));
+    leave += empLine('Taken for late', (bal.late_penalties ?? 0));
     if (Number(bal.absence_cover ?? 0) !== 0) leave += empLine('Used to cover parked absences', bal.absence_cover);
     leave += empLine('Taken', (bal.taken_total ?? 0), { drill: 'month_leave' });
     leave += empLine('Remaining', (bal.remaining ?? '—'), { total: true });
@@ -2895,15 +2889,28 @@
     el('prEmpBody').style.display = '';
     el('prEmpBody').innerHTML = empHeader(u, 'Monthly salary · ' + EMP.month_label)
       + '<div class="pr-emp-grid"><div>' + month + hist + '</div><div>' + leave + la
-      + '<div class="pr-emp-card" id="prEmpTb"><h4>⏱ Late &amp; extra bank</h4><div class="pr-emp-why">Loading…</div></div>'
+      + '<div class="pr-emp-card" id="prEmpTb"><h4>⏱ Late &amp; overtime bank</h4><div class="pr-emp-why">Loading…</div></div>'
       + absc + adv + '</div></div>';
 
     wireEmployee();
     // ⏱ The time-bank card for this month (same component as the panel) …
+    // Tiles round (Oct-14): the tiles show for EVERY time-bank month — pending, decided, running
+    // ("if it ended today") and under-a-day — not only when something waits for a click.
     const tbAct = (r.leave_actions || []).find(a => a.kind === 'time_bank');
-    const slot = el('prEmpBody').querySelector('[data-emptb]');
-    if (tbAct && slot) {
-      NFTimeBank.mount(slot, tbAct.statement, { fullname: u.fullname || r.fullname, paid: !!paid, onDone: () => empLoad() });
+    const tbSt = (tbAct && tbAct.statement)
+      || (r.time_bank && ['pending', 'decided', 'clear', 'running', 'folded'].indexOf(r.time_bank.status) > -1 ? r.time_bank : null);
+    let slot = el('prEmpBody').querySelector('[data-emptb]');
+    if (tbSt && !slot && el('prEmpTb')) {
+      slot = document.createElement('div');
+      slot.className = 'pr-emp-card';
+      el('prEmpTb').parentNode.insertBefore(slot, el('prEmpTb'));
+    }
+    if (tbSt && slot) {
+      NFTimeBank.mount(slot, tbSt, {
+        fullname: u.fullname || r.fullname, paid: !!paid, onDone: () => empLoad(),
+        onDrill: (kind) => loadDateList(EMP_ID, kind === 'overtime' ? 'month_overtime' : 'month_late',
+          (kind === 'overtime' ? 'Overtime days — ' : 'Late days — ') + (u.fullname || r.fullname)),
+      });
     }
     // … and its history + Taimur's manual adjust (owner, Oct-12).
     empTimeBankHistory();
@@ -2914,7 +2921,7 @@
   async function empTimeBankHistory() {
     const box = el('prEmpTb');
     if (!box) return;
-    NFTimeBank.history(box, EMP_ID, { title: '⏱ Late &amp; extra bank', onChange: () => empLoad() });
+    NFTimeBank.history(box, EMP_ID, { title: '⏱ Late &amp; overtime bank', onChange: () => empLoad() });
   }
 
   function monthName(ym) {

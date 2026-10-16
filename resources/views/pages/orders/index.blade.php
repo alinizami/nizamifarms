@@ -2450,7 +2450,9 @@ document.addEventListener('DOMContentLoaded', function(){
         var amt = (li.line_total != null) ? money(li.line_total) : '';
         return '<div class="nfad-li"><span class="nfad-li-q">'+esc(qty(li.quantity))+'\u00D7</span>'
              + '<span class="nfad-li-n">'+esc(nm)
-             + (li.sku ? ' <span class="nfad-dim">'+esc(li.sku)+'</span>' : '')+'</span>'
+             + (li.sku ? ' <span class="nfad-dim">'+esc(li.sku)+'</span>' : '')
+             // \uD83D\uDCE6 bundle: what this line becomes on Accept (server-computed)
+             + (li.bundle_hint ? '<br><span style="color:#92400e;font-size:11px;">\uD83D\uDCE6 '+esc(li.bundle_hint)+'</span>' : '')+'</span>'
              + '<span class="nfad-li-a">'+esc(amt)+'</span></div>';
       }).join('');
     } else {
@@ -3583,7 +3585,9 @@ function viewOrderDetails(orderId) {
                     }
                     
                     var freeBadge = isFreeItem ? ' <span style="display: inline-block; padding: 2px 6px; background: #dcfce7; color: #16a34a; border-radius: 4px; font-size: 10px; font-weight: 700; margin-left: 6px;">FREE</span>' : '';
-                    html += '<td style="padding: 8px; border-bottom: 1px solid #f3f4f6;">' + name + freeBadge + '</td>';
+                    // 📦 bundle (approval queue only): what this line becomes on Accept
+                    var bundleHint = it.bundle_hint ? '<div style="color:#92400e; font-size:11px; margin-top:2px;">📦 ' + escapeHtml(String(it.bundle_hint)) + '</div>' : '';
+                    html += '<td style="padding: 8px; border-bottom: 1px solid #f3f4f6;">' + name + freeBadge + bundleHint + '</td>';
                     
                     // Only show status badge for open non-Shopify orders
                     if (showPreparationControls) {
@@ -9623,6 +9627,7 @@ function popoutOrder() {
         newWindow.updateDropdownHighlight = updateDropdownHighlight;
         newWindow.showProductResults = showProductResults;
         newWindow.selectProduct = selectProduct;
+        newWindow.selectBundle = selectBundle; // 📦 bundle rows call this
         newWindow.hideProductDropdown = hideProductDropdown;
         newWindow.autoAddNextLineItem = autoAddNextLineItem;
         newWindow.showProductDropdown = showProductDropdown;
@@ -10380,8 +10385,28 @@ function showProductResults(products, index) {
             const attr1 = (product.attribute_1 || '').replace(/'/g, "\\'");
             const attr2 = (product.attribute_2 || '').replace(/'/g, "\\'");
             const attr3 = (product.attribute_3 || '').replace(/'/g, "\\'");
+            // 📦 Bundled product (Oct-2026): picking it adds every product INSIDE,
+            // packets × the packet price entered on the bundle — selectBundle() below,
+            // ProductBundle on the server.
+            const b = product.bundle || null;
+            if (b && Array.isArray(b.items) && b.items.length) {
+                const key = rememberBundlePick(b, product.sku);
+                const what = b.items.map(it => `${it.qty} × ${it.name} @ PKR ${it.unit_price}`).join(' + ');
+                return `
+            <div onclick="selectBundle(${index}, '${key}')"
+                 data-product-index="${idx}"
+                 style="padding: 8px; cursor: pointer; border-bottom: 1px solid #f3f4f6; transition: background-color 0.1s;"
+                 onmouseover="this.style.backgroundColor='#f9fafb'; currentDropdownIndex=${idx};"
+                 onmouseout="this.style.backgroundColor='white';">
+                <div style="font-weight: 500; font-size: 13px;">${product.name}</div>
+                <div style="font-size: 11px; color: #92400e;">
+                    📦 Bundle${product.sku ? ' ' + product.sku : ''} (PKR ${b.total}) → adds ${what}
+                </div>
+            </div>
+        `;
+            }
             return `
-            <div onclick="selectProduct(${index}, '${product.id}', '${product.name.replace(/'/g, "\\'")}', ${product.price}, '${sku}', '${variantId}', '${attr1}', '${attr3}', '${attr2}')" 
+            <div onclick="selectProduct(${index}, '${product.id}', '${product.name.replace(/'/g, "\\'")}', ${product.price}, '${sku}', '${variantId}', '${attr1}', '${attr3}', '${attr2}')"
                  data-product-index="${idx}"
                  style="padding: 8px; cursor: pointer; border-bottom: 1px solid #f3f4f6; transition: background-color 0.1s;"
                  onmouseover="this.style.backgroundColor='#f9fafb'; currentDropdownIndex=${idx};" 
@@ -10396,7 +10421,30 @@ function showProductResults(products, index) {
     
     dropdown.style.display = 'block';
 }
-function selectProduct(index, productId, productName, price, sku = '', variantId = '', attribute1 = '', attribute3 = '', attribute2 = '') {
+// 📦 Bundled product (Oct-2026): the dropdown remembers each bundle result by key so a
+// click can add EVERY product inside — the first fills this line, each other one gets a
+// new line. Every line is an ordinary product line (sku / variant / packet price).
+var nfBundlePicks = {};
+var nfBundlePickSeq = 0;
+function rememberBundlePick(bundle, bundleSku) {
+    const key = 'b' + (++nfBundlePickSeq);
+    nfBundlePicks[key] = { items: bundle.items, bundle_sku: bundle.bundle_sku || bundleSku || '' };
+    return key;
+}
+function selectBundle(index, key) {
+    const b = nfBundlePicks[key];
+    if (!b || !Array.isArray(b.items) || !b.items.length) return;
+    b.items.forEach((it, k) => {
+        let target = index;
+        if (k > 0) {
+            addLineItem();
+            target = lineItemIndex - 1; // addLineItem() used lineItemIndex, then advanced it
+        }
+        selectProduct(target, it.id, it.name, it.unit_price, it.sku || '', String(it.variant_id), '', '', '', parseInt(it.qty, 10) || 0, b.bundle_sku);
+    });
+}
+
+function selectProduct(index, productId, productName, price, sku = '', variantId = '', attribute1 = '', attribute3 = '', attribute2 = '', bundleQty = 0, bundleSku = '') {
     const lineItem = document.querySelector(`.line-item[data-index="${index}"]`);
     if (!lineItem) {
         console.error('Line item not found for index:', index);
@@ -10422,12 +10470,15 @@ function selectProduct(index, productId, productName, price, sku = '', variantId
     
     // ⭐ Display SKU if available
     if (skuDisplay && sku) {
-        skuDisplay.textContent = `SKU: ${sku}`;
+        // 📦 A bundle pick names the bundle it came from, so "3" next to it reads as packets.
+        skuDisplay.textContent = bundleQty > 0
+            ? `SKU: ${sku} · 📦 ${bundleSku ? 'bundle ' + bundleSku : 'bundle'} = ${bundleQty} packets`
+            : `SKU: ${sku}`;
         skuDisplay.style.display = 'inline-block';
     } else if (skuDisplay) {
         skuDisplay.style.display = 'none';
     }
-    
+
     if (priceInput) {
         priceInput.value = price;
         // Make price readonly when selected from product dropdown
@@ -10437,21 +10488,27 @@ function selectProduct(index, productId, productName, price, sku = '', variantId
         priceInput.setAttribute('data-from-product', 'true');
         priceInput.title = 'Price is set from product catalog and cannot be edited';
     }
-    
+
+    // 📦 Bundle: one bundle = bundleQty packets of the product inside.
+    if (bundleQty > 0 && qtyInput) {
+        qtyInput.value = bundleQty;
+    }
+
     // Update the line total
     updateLineTotal(index);
-    
+
     // Hide dropdown
     hideProductDropdown(index);
-    
+
     // Freeze the product name immediately after selection
     setTimeout(() => {
         freezeProductName(index);
     }, 50);
-    
+
     // ⭐ Focus on quantity field after product selection
+    // (not for a bundle: typing "1" over the pre-filled packets would sell ONE packet)
     setTimeout(() => {
-        if (qtyInput) {
+        if (qtyInput && !(bundleQty > 0)) {
             qtyInput.focus();
             qtyInput.select(); // Select the value so user can type new qty directly
         }

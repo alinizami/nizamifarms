@@ -319,6 +319,9 @@
                         <span class="form-hint text-danger">{{ $message }}</span>
                     @enderror
                 </div>
+
+                <!-- 📦 Bundled product (Oct-2026) -->
+                @include('pages.products.partials.bundle-section', ['bundleProduct' => null])
             </div>
         </div>
 

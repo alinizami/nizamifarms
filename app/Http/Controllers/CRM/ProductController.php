@@ -1218,6 +1218,10 @@ class ProductController extends Controller
         $changes = []; // Preview changes WITHOUT saving
 
         foreach ($products as $product) {
+            // 📦 Bundles are skipped by the real run too (their price = Σ packet prices).
+            if (\App\Services\CRM\ProductBundle::isBundle($product)) {
+                continue;
+            }
             foreach ($product->variants as $variant) {
                 $old = (float) $variant->price;
                 $new = $old;
@@ -1335,6 +1339,10 @@ class ProductController extends Controller
         $changes = []; // Track all price changes for detailed summary
 
         foreach ($products as $product) {
+            // 📦 A bundle's price is the total of its packet prices — never bulk-adjusted.
+            if (\App\Services\CRM\ProductBundle::isBundle($product)) {
+                continue;
+            }
             $productUpdated = false;
             foreach ($product->variants as $variant) {
                 $old = (float) $variant->price;
@@ -2040,9 +2048,17 @@ class ProductController extends Controller
             
             $results = [];
             foreach ($products as $product) {
+                // 📦 Bundled product: tell the order forms what picking it REALLY adds
+                // (the product inside × packets at this variant's price). null = ordinary.
+                $isBundleProduct = \App\Services\CRM\ProductBundle::isBundle($product);
                 // Only add variants, not the parent product (to avoid duplicates)
                 foreach ($product->variants as $variant) {
                     if ($variant->available) {
+                        $bundleInfo = null;
+                        if ($isBundleProduct) {
+                            $variant->setRelation('product', $product);
+                            $bundleInfo = \App\Services\CRM\ProductBundle::searchInfo($variant);
+                        }
                         // For single variants, use just the product title
                         // For multiple variants, append variant title if it's different
                         $displayName = $product->title;
@@ -2061,6 +2077,7 @@ class ProductController extends Controller
                             'attribute_1' => $product->attribute_1,
                             'attribute_2' => $product->attribute_2,
                             'attribute_3' => $product->attribute_3,
+                            'bundle' => $bundleInfo,
                         ];
                     }
                 }
@@ -2367,6 +2384,12 @@ class ProductController extends Controller
                 'unit_weight_kg' => 'nullable|numeric|min:0.001|max:99999',
                 'czerlop_product_id' => 'nullable|integer|min:1|max:99999',
                 'sell_unit' => 'nullable|in:kg,pcs', // 📦 kg = weighed | pcs = counted boxes
+                // 📦 Bundled product (Oct-2026) — rows checked in bundlePlan()
+                'is_bundle' => 'nullable|boolean',
+                'bundle_items' => 'nullable|array|max:' . \App\Services\CRM\ProductBundle::MAX_ITEMS,
+                'bundle_items.*.variant_id' => 'nullable|string|max:40',
+                'bundle_items.*.qty' => 'nullable',
+                'bundle_items.*.unit_price' => 'nullable',
                 'business_unit_id' => 'nullable|exists:t_fin_business_units,id',
 
                 // Variants
@@ -2394,9 +2417,13 @@ class ProductController extends Controller
                 }
             }
 
+            // 📦 Bundled set-up (new product: absent = not a bundle). May pin the
+            // variant price to the bundle total; throws a ValidationException.
+            $bundlePlan = $this->bundlePlan($validated, null);
+
             // Format data to match API structure
             $productData = $this->formatManualProductData($validated);
-            
+
             // For single-variant products, default variant title to product title if empty
             if (isset($productData['variants'])) {
                 foreach ($productData['variants'] as $index => $variantData) {
@@ -2405,10 +2432,16 @@ class ProductController extends Controller
                     }
                 }
             }
-            
-            // Use the same function as API to maintain consistency
-            $product = ProductModel::storeProductFromApi($productData);
-            
+
+            // Use the same function as API to maintain consistency.
+            // 📦 Product + its bundle rows commit together — a bundle must never exist
+            // half-saved (a Shopify order would then bill the bundle as one line).
+            $product = \DB::transaction(function () use ($productData, $bundlePlan) {
+                $product = ProductModel::storeProductFromApi($productData);
+                $this->applyBundlePlan($product, $bundlePlan);
+                return $product;
+            });
+
             // Set business unit (defaults to Nizami Farms id=1 if not provided)
             $product->business_unit_id = $request->business_unit_id ?? 1;
             $product->save();
@@ -2532,6 +2565,12 @@ class ProductController extends Controller
                 'unit_weight_kg' => 'nullable|numeric|min:0.001|max:99999',
                 'czerlop_product_id' => 'nullable|integer|min:1|max:99999',
                 'sell_unit' => 'nullable|in:kg,pcs', // 📦 kg = weighed | pcs = counted boxes
+                // 📦 Bundled product (Oct-2026) — rows checked in bundlePlan()
+                'is_bundle' => 'nullable|boolean',
+                'bundle_items' => 'nullable|array|max:' . \App\Services\CRM\ProductBundle::MAX_ITEMS,
+                'bundle_items.*.variant_id' => 'nullable|string|max:40',
+                'bundle_items.*.qty' => 'nullable',
+                'bundle_items.*.unit_price' => 'nullable',
                 'business_unit_id' => 'nullable|exists:t_fin_business_units,id',
 
                 // Variants
@@ -2589,6 +2628,10 @@ class ProductController extends Controller
             if (!array_key_exists('sell_unit', $validated) && ProductModel::supportsSellUnit()) {
                 $validated['sell_unit'] = $product->sell_unit;
             }
+            // 📦 Same trap, for the bundle set-up: the phone's product form does not
+            // send it, so key-absent keeps the product's bundle exactly as it is (and
+            // keeps its price pinned to the bundle total).
+            $bundlePlan = $this->bundlePlan($validated, $product);
 
             // Format data to match API structure
             $productData = $this->formatManualProductData($validated);
@@ -2611,8 +2654,13 @@ class ProductController extends Controller
                 }
             }
             
-            // Use the same function as API to maintain consistency
-            $updatedProduct = ProductModel::storeProductFromApi($productData);
+            // Use the same function as API to maintain consistency.
+            // 📦 Product + its bundle rows commit together (see store()).
+            $updatedProduct = \DB::transaction(function () use ($productData, $bundlePlan) {
+                $updatedProduct = ProductModel::storeProductFromApi($productData);
+                $this->applyBundlePlan($updatedProduct, $bundlePlan);
+                return $updatedProduct;
+            });
             
             // Update business unit if provided
             if ($request->has('business_unit_id')) {
@@ -2768,6 +2816,86 @@ class ProductController extends Controller
     }
 
     /**
+     * 📦 Settle the bundle set-up for a product save (create: $product = null).
+     *
+     *   is_bundle ABSENT → keep the product's bundle rows as they are (the phone's
+     *                      product form and older clients never send them; a new
+     *                      product is not a bundle)
+     *   is_bundle = 0    → not a bundle any more (rows removed)
+     *   is_bundle = 1    → these rows, after ProductBundle::setupError()
+     *
+     * Whenever the product IS (or stays) a bundle, its variant price is pinned to the
+     * bundle total — the Shopify price — so any path that does not split the bundle
+     * still bills the right money. Removes the bundle keys from $validated.
+     *
+     * @return array{action:string, rows:array}  action: keep | clear | set
+     * @throws \Illuminate\Validation\ValidationException (the save's own catch turns it
+     *         into the form error / 422 JSON)
+     */
+    private function bundlePlan(array &$validated, ?ProductModel $product): array
+    {
+        $flag = $validated['is_bundle'] ?? null;
+        $posted = $validated['bundle_items'] ?? [];
+        unset($validated['is_bundle'], $validated['bundle_items']);
+
+        if (!\App\Services\CRM\ProductBundle::supported()) {
+            return ['action' => 'keep', 'rows' => []];
+        }
+
+        if ($flag === null) {
+            $rows = $product ? \App\Services\CRM\ProductBundle::itemRows((int) $product->id) : [];
+            if ($rows) {
+                $this->pinBundlePrice($validated, \App\Services\CRM\ProductBundle::totalOf($rows));
+            }
+            return ['action' => 'keep', 'rows' => $rows];
+        }
+        if (!filter_var($flag, FILTER_VALIDATE_BOOLEAN)) {
+            return ['action' => 'clear', 'rows' => []];
+        }
+
+        $rows = \App\Services\CRM\ProductBundle::normaliseRows($posted);
+        $error = \App\Services\CRM\ProductBundle::setupError(
+            $product ? (int) $product->id : null,
+            $rows,
+            count($validated['variants'] ?? [])
+        );
+        if ($error) {
+            throw \Illuminate\Validation\ValidationException::withMessages(['bundle_items' => $error]);
+        }
+        $this->pinBundlePrice($validated, \App\Services\CRM\ProductBundle::totalOf($rows));
+        return ['action' => 'set', 'rows' => $rows];
+    }
+
+    /** 📦 A bundle's own (only) variant price = the bundle total. */
+    private function pinBundlePrice(array &$validated, float $total): void
+    {
+        foreach (array_keys($validated['variants'] ?? []) as $i) {
+            $validated['variants'][$i]['price'] = $total;
+        }
+    }
+
+    /** 📦 Write the plan's rows for a just-saved product + one history line if it changed. */
+    private function applyBundlePlan(ProductModel $product, array $plan): void
+    {
+        if ($plan['action'] === 'keep' || !\App\Services\CRM\ProductBundle::supported()) {
+            return;
+        }
+        $before = \App\Services\CRM\ProductBundle::summary((int) $product->id);
+        \App\Services\CRM\ProductBundle::saveRows((int) $product->id, $plan['rows'], auth()->id());
+        $after = \App\Services\CRM\ProductBundle::summary((int) $product->id);
+        if ($before !== $after) {
+            \App\Models\CRM\ProductChangeHistory::logChange([
+                'product_id' => $product->id,
+                'change_type' => \App\Models\CRM\ProductChangeHistory::TYPE_BUNDLE_CHANGE,
+                'field_name' => 'Bundle',
+                'old_value' => $before !== '' ? $before : null,
+                'new_value' => $after !== '' ? $after : null,
+                'change_source' => \App\Models\CRM\ProductChangeHistory::detectSource(),
+            ]);
+        }
+    }
+
+    /**
      * Get product change history
      */
     public function getHistory($id)
@@ -2835,6 +2963,18 @@ class ProductController extends Controller
                 return request()->expectsJson()
                     ? response()->json(['success' => false, 'message' => $message], 422)
                     : redirect()->back()->with('error', $message);
+            }
+
+            // 📦 A product INSIDE a bundle: deleting it would leave every Shopify order
+            // for that bundle unconvertible (App\Services\CRM\ProductBundle).
+            if ($product->variants->isNotEmpty()) {
+                $bundleTitle = \App\Services\CRM\ProductBundle::bundleHolding($product->variants->pluck('id'), (int) $product->id);
+                if ($bundleTitle) {
+                    $message = "Cannot delete \"{$product->title}\" — it is inside the bundle \"{$bundleTitle}\". Change or remove that bundle first.";
+                    return request()->expectsJson()
+                        ? response()->json(['success' => false, 'message' => $message], 422)
+                        : redirect()->back()->with('error', $message);
+                }
             }
 
             // Check if product is referenced in warehouse inventory
@@ -2935,6 +3075,11 @@ class ProductController extends Controller
                 \DB::table('t_crm_prod_product_variant')
                     ->where('product_id', $product->id)
                     ->delete();
+
+                // 📦 If this product IS a bundle, its rows go with it
+                if (\App\Services\CRM\ProductBundle::supported()) {
+                    \App\Services\CRM\ProductBundle::saveRows((int) $product->id, [], null);
+                }
 
                 // Delete the product itself
                 $product->delete();

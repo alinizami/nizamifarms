@@ -820,14 +820,18 @@ window.editCustomer = function(id) {
     });
 };
 
-window.saveCustomer = function(event, customerId) {
-    event.preventDefault();
-    const form = event.target;
+window.saveCustomer = function(event, customerId, confirmedShopConversion) {
+    if (event && event.preventDefault) event.preventDefault();
+    const form = (event && event.target) || document.getElementById('editCustomerForm');
     const formData = new FormData(form);
-    
+
     // Add _method field for Laravel to recognize PUT request
     formData.append('_method', 'PUT');
-    
+    // Oct-2026 — second round-trip after the user agreed that a Shop save may
+    // remove pending online invoices from Online Approvals (server refuses
+    // the first attempt with needs_confirmation and the exact list).
+    if (confirmedShopConversion) formData.append('confirm_shop_conversion', '1');
+
     fetch(`/customers/${customerId}`, {
         method: 'POST',  // Use POST with _method override for FormData
         body: formData,
@@ -842,6 +846,11 @@ window.saveCustomer = function(event, customerId) {
             closeModal('editCustomerModal');
             // Refresh the page to show updated data
             window.location.reload();
+        } else if (data.needs_confirmation) {
+            // Nothing was saved. Ask once, with the server's own list, then resend.
+            if (confirm(data.message + '\n\nContinue and make this customer a Shop?')) {
+                window.saveCustomer({ target: form }, customerId, true);
+            }
         } else {
             alert('Error saving customer: ' + (data.message || 'Unknown error'));
         }
@@ -4809,14 +4818,53 @@ function searchProducts(input, index) {
     }, 300);
 }
 
+// 📦 Bundled product (Oct-2026): the dropdown row for a bundle. Picking it adds every
+// product INSIDE, packets × the packet price entered on the bundle — the same rule as
+// Shopify conversion (App\Services\CRM\ProductBundle). Used by both renderers below.
+var nfBundlePicks = {};
+var nfBundlePickSeq = 0;
+function bundleProductRow(product, index, idx) {
+    const b = product.bundle;
+    const key = 'b' + (++nfBundlePickSeq);
+    nfBundlePicks[key] = { items: b.items || [], bundle_sku: b.bundle_sku || product.sku || '' };
+    const navAttr = idx === null ? '' : `data-product-index="${idx}"`;
+    const navHover = idx === null ? '' : `; currentDropdownIndex=${idx}`;
+    const what = (b.items || []).map(it => `${it.qty} × ${it.name} @ PKR ${it.unit_price}`).join(' + ');
+    return `
+            <div onclick="selectBundle(${index}, '${key}')"
+                 ${navAttr}
+                 style="padding: 8px; cursor: pointer; border-bottom: 1px solid #f3f4f6;"
+                 onmouseover="this.style.backgroundColor='#f9fafb'${navHover};"
+                 onmouseout="this.style.backgroundColor='white'">
+                <div style="font-weight: 500; font-size: 13px;">${(product.name || '').toString()}</div>
+                <div style="font-size: 11px; color: #92400e;">
+                    📦 Bundle${product.sku ? ' ' + product.sku : ''} (PKR ${b.total}) → adds ${what}
+                </div>
+            </div>`;
+}
+// The first product inside fills this line; each other one gets a new line.
+function selectBundle(index, key) {
+    const b = nfBundlePicks[key];
+    if (!b || !b.items.length) return;
+    b.items.forEach((it, k) => {
+        let target = index;
+        if (k > 0) {
+            addLineItem();
+            target = lineItemIndex - 1; // addLineItem() used lineItemIndex, then advanced it
+        }
+        selectProduct(target, it.id, it.name, it.unit_price, it.sku || '', String(it.variant_id), String(it.product_id || ''), parseInt(it.qty, 10) || 0, b.bundle_sku);
+    });
+}
+
 function showProductResults(products, index) {
     const dropdown = document.getElementById(`productDropdown_${index}`);
     if (!dropdown) return;
-    
+
     if (!Array.isArray(products) || products.length === 0) {
         dropdown.innerHTML = '<div style="padding: 8px; color: #6b7280; font-size: 12px;">No products found</div>';
     } else {
         dropdown.innerHTML = products.map(product => {
+            if (product.bundle) return bundleProductRow(product, index, null);
             const displayName = (product.name || product.title || '').toString();
             const safeName = displayName.replace(/'/g, "\\'");
             const price = (product.price ?? product.price_min ?? 0);
@@ -4859,7 +4907,7 @@ function hideProductDropdown(index) {
     }
 }
 
-function selectProduct(index, productId, productName, price, sku = '', variantId = '', productIdFromSearch = '') {
+function selectProduct(index, productId, productName, price, sku = '', variantId = '', productIdFromSearch = '', bundleQty = 0, bundleSku = '') {
     // Fill in the product details
     const nameInput = document.querySelector(`input[name="items[${index}][name]"]`);
     const priceInput = document.querySelector(`input[name="items[${index}][unit_price]"]`);
@@ -4887,21 +4935,30 @@ function selectProduct(index, productId, productName, price, sku = '', variantId
     
     // ⭐ Display SKU if available
     if (skuDisplay && sku) {
-        skuDisplay.textContent = `SKU: ${sku}`;
+        // 📦 A bundle pick names the bundle it came from, so "3" next to it reads as packets.
+        skuDisplay.textContent = bundleQty > 0
+            ? `SKU: ${sku} · 📦 ${bundleSku ? 'bundle ' + bundleSku : 'bundle'} = ${bundleQty} packets`
+            : `SKU: ${sku}`;
         skuDisplay.style.display = 'inline-block';
     } else if (skuDisplay) {
         skuDisplay.style.display = 'none';
     }
-    
+
+    // 📦 Bundle: one bundle = bundleQty packets of the product inside.
+    if (bundleQty > 0 && qtyInput) {
+        qtyInput.value = bundleQty;
+    }
+
     // Update the line total
     updateLineTotal(index);
-    
+
     // Hide dropdown
     hideProductDropdown(index);
-    
+
     // ⭐ Focus on quantity field after product selection
+    // (not for a bundle: typing "1" over the pre-filled packets would sell ONE packet)
     setTimeout(() => {
-        if (qtyInput) {
+        if (qtyInput && !(bundleQty > 0)) {
             qtyInput.focus();
             qtyInput.select(); // Select the value so user can type new qty directly
         }
@@ -5002,9 +5059,10 @@ let currentProducts = [];
 
 // Enhance existing selectProduct to add auto-add functionality
 const originalSelectProduct = selectProduct;
-selectProduct = function(index, productId, productName, price) {
-    // Call original function
-    originalSelectProduct(index, productId, productName, price);
+selectProduct = function(...args) {
+    // Call original function — with EVERY argument: a 📦 bundle row passes the
+    // inside product's sku / variant and the packet count after the price.
+    originalSelectProduct(...args);
     
     // Auto-add new line item
     setTimeout(() => {
@@ -5090,11 +5148,18 @@ showProductResults = function(products, index) {
         dropdown.innerHTML = '<div style="padding: 8px; color: #6b7280; font-size: 12px;">No products found</div>';
     } else {
         dropdown.innerHTML = products.map((product, idx) => {
+            if (product.bundle) return bundleProductRow(product, index, idx);
             const displayName = (product.name || product.title || '').toString();
             const safeName = displayName.replace(/'/g, "\\'");
             const price = (product.price ?? product.price_min ?? 0);
+            // Oct-2026: pass sku / variant / product like the first renderer does — this
+            // override used to pass only 4 args, so every line saved from this page was
+            // unlinked from its product (no stock, no Open Quantities, no box scan).
+            const variantId = product.id && product.id.toString().startsWith('variant_') ? product.id.toString().replace('variant_', '') : (product.variant_id || '');
+            const productId = product.product_id || '';
+            const sku = (product.sku || '').replace(/'/g, "\\'");
             return `
-            <div onclick="selectProduct(${index}, '${product.id}', '${safeName}', ${price})" 
+            <div onclick="selectProduct(${index}, '${product.id}', '${safeName}', ${price}, '${sku}', '${variantId}', '${productId}')"
                  data-product-index="${idx}"
                  style="padding: 8px; cursor: pointer; border-bottom: 1px solid #f3f4f6; transition: background-color 0.1s;"
                  onmouseover="this.style.backgroundColor='#f9fafb'; currentDropdownIndex=${idx};" 

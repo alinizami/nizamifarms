@@ -80,6 +80,7 @@ class TimeBankService
         self::$adjMemo = [];
         self::$ownMemo = [];
         self::$stmtMemo = [];
+        self::$checkMemo = [];
         self::$customMemo = null;
     }
 
@@ -279,8 +280,8 @@ class TimeBankService
                 $d = (float) $g->days;
                 $who = $g->fullname ? ' (' . $g->fullname . ($g->created_at ? ', ' . date('j M', strtotime((string) $g->created_at)) : '') . ')' : '';
                 $out[] = $g->source === 'overtime'
-                    ? ($d > 0 ? 'Extra already settled the old way: +' . self::leaves((int) $d) . ' given' . $who
-                              : 'Extra already settled the old way: skipped' . $who)
+                    ? ($d > 0 ? 'Overtime already settled the old way: +' . self::leaves((int) $d) . ' given' . $who
+                              : 'Overtime already settled the old way: skipped' . $who)
                     : ($d < 0 ? 'Late already settled the old way: ' . self::leaves((int) abs($d)) . ' taken' . $who
                               : 'Late already settled the old way: waived' . $who);
             }
@@ -488,15 +489,21 @@ class TimeBankService
     {
         $by = [];
         foreach ($lots as $l) {
-            $tag = self::mon((string) $l['from']);
-            if (in_array($l['src'] ?? '', ['unacted', 'own'], true)) { $tag .= ', not decided'; }
-            if (in_array($l['src'] ?? '', ['manual', 'returned'], true)) { $tag = 'added by hand'; }
-            if (($l['src'] ?? '') === 'drift') { $tag = self::mon((string) $l['from']) . ' change'; }
+            $src = $l['src'] ?? '';
+            $tag = 'from ' . self::mon((string) $l['from']);
+            // (No ", not decided": an under-a-day month needs no decision; a month that really
+            // waits is named by the bank box / "Decide <Month> ›" instead.)
+            if ($src === 'legacy' && (string) $l['from'] >= self::START_MONTH) { $tag .= ', old rule'; }
+            if ($src === 'manual') { $tag = 'added by hand'; }
+            if ($src === 'returned') { $tag = 'cut not taken at pay'; }
+            if ($src === 'drift') { $tag = self::mon((string) $l['from']) . ' changed after its decision'; }
             $by[$tag] = ($by[$tag] ?? 0) + (int) $l['minutes'];
         }
+        // One source → no number repeated ("extra 7h 45m (from Aug)"); several → each with its minutes.
+        if (count($by) === 1) { return (string) array_key_first($by); }
         $parts = [];
-        foreach ($by as $tag => $m) { $parts[] = self::hm($m) . ' from ' . $tag; }
-        return implode(' + ', str_replace('from added by hand', 'added by hand', $parts));
+        foreach ($by as $tag => $m) { $parts[] = self::hm($m) . ' ' . $tag; }
+        return implode(' + ', $parts);
     }
 
     // =====================================================================
@@ -558,16 +565,76 @@ class TimeBankService
         $rows = $this->rows($userId);
         foreach ($rows as $m => $r) {
             if ($m > $month && in_array($month, $r['folded_months'], true)) {
-                return self::$stmtMemo[$key] = $base + ['status' => 'folded', 'folded_into' => $m,
+                return self::$stmtMemo[$key] = $this->withCells($userId, $month, $base + ['status' => 'folded', 'folded_into' => $m,
+                    'folded_label' => self::monthName($m),
                     'chip' => '→ in ' . self::mon($m) . ' decision',
-                    'rider_sentence' => self::mon($month) . ' ka hisaab ' . self::mon($m) . ' ke faisle mein shamil hai.'];
+                    'rider_sentence' => self::mon($month) . ' ka hisaab ' . self::mon($m) . ' ke faisle mein shamil hai.']);
             }
         }
         $row = $rows[$month] ?? null;
         if ($row && empty($opts['redecide'])) {
-            return self::$stmtMemo[$key] = $this->decidedStatement($userId, $month, $row, $base);
+            return self::$stmtMemo[$key] = $this->withCells($userId, $month, $this->decidedStatement($userId, $month, $row, $base));
         }
-        return self::$stmtMemo[$key] = $this->previewStatement($userId, $month, $row, $opts, $base);
+        return self::$stmtMemo[$key] = $this->withCells($userId, $month, $this->previewStatement($userId, $month, $row, $opts, $base));
+    }
+
+    /**
+     * ⭐ `cells` — what the LATE and OVERTIME columns show on EVERY table: Attendance › Month, the
+     * payroll grid, the popups, Reports, and the phone's report/detail/payroll screens. One shape:
+     *   minutes (this month's own) · check (✓ / ⚠) · sub (carried in) · outcome · by · chip
+     */
+    private function withCells(int $userId, string $month, array $s): array
+    {
+        $status = (string) ($s['status'] ?? '');
+        if (in_array($status, ['off', 'excluded', 'before_start'], true)) { $s['cells'] = null; return $s; }
+        $running = !$this->isClosed($month);
+        $own = $this->ownMinutes($userId, $month);
+        $next = self::mon(self::nextMonth($month));
+        $lc = $this->check($userId, $month, 'late', $running);
+        $oc = $this->check($userId, $month, 'overtime', $running);
+        $tl = $s['tiles']['late'] ?? []; $te = $s['tiles']['extra'] ?? [];
+        $lateOut = ''; $extraOut = ''; $by = ''; $chip = '';
+        if ($status === 'decided') {
+            $lateOut = (string) ($tl['outcome'] ?? ''); $extraOut = (string) ($te['outcome'] ?? '');
+            $by = (string) ($s['tiles']['result']['by'] ?? '');
+        } elseif ($status === 'folded') {
+            $lateOut = $extraOut = 'in ' . self::mon((string) $s['folded_into']) . ' decision';
+        } elseif ($status === 'clear') {
+            $a = $s['net'] ?? [];
+            $l = []; $e = [];
+            if ((int) ($a['cancel'] ?? 0) > 0) { $l[] = self::hm((int) $a['cancel']) . ' wiped by overtime'; $e[] = self::hm((int) $a['spent']) . ' used for late'; }
+            if ((int) ($a['late_left'] ?? 0) > 0) { $l[] = self::hm((int) $a['late_left']) . ' → ' . $next; }
+            if ((int) ($a['ot_left'] ?? 0) > 0) { $e[] = self::hm((int) $a['ot_left']) . ' → ' . $next; }
+            $lateOut = implode(' · ', $l); $extraOut = implode(' · ', $e);
+            // Only when there was something to settle — an empty month says nothing at all.
+            $by = ((int) ($s['late']['total'] ?? 0) > 0 || (int) ($s['ot']['total'] ?? 0) > 0) ? 'under a day — nothing to decide' : '';
+        } elseif ($status === 'pending') {
+            $chip = 'Decide ' . date('F', strtotime($month . '-01')) . ' ›';
+        }
+        // The pending chip sits in the cell that HAS the whole days and says what they are.
+        $chipIn = (int) ($s['net']['late_days'] ?? 0) > 0 ? 'late' : 'extra';
+        $chipSub = $chip !== '' ? (string) ($s['tiles']['result']['big'] ?? '') : '';
+        // A kind the OLD rule already settled: its own muted line, never inside the outcome.
+        $lateLeg = ($tl['legacy'] ?? '') !== '' ? str_replace('Late already settled the old way: ', 'old rule: ', (string) $tl['legacy']) : '';
+        $extraLeg = ($te['legacy'] ?? '') !== '' ? str_replace('Overtime already settled the old way: ', 'old rule: ', (string) $te['legacy']) : '';
+        // A kind the OLD rule already settled: the tile shows only what is left in the bank while
+        // the tables show the minutes worked — the tile says how the two connect.
+        foreach (['late' => 'late', 'extra' => 'ot'] as $tk => $okey) {
+            if (isset($s['tiles'][$tk]) && ($s['tiles'][$tk]['legacy'] ?? '') !== '' && $own[$okey] > 0) {
+                $s['tiles'][$tk]['sub'] = self::hm($own[$okey]) . ' in ' . self::mon($month) . ' — settled the old way';
+            }
+        }
+        $lateIn = (int) ($s['late']['in'] ?? 0); $otIn = (int) ($s['ot']['in'] ?? 0);
+        $s['cells'] = [
+            'status' => $status, 'month' => $month, 'chip' => $chip, 'chip_in' => $chipIn, 'chip_sub' => $chipSub, 'by' => $by,
+            'late'  => ['minutes' => $own['late'], 'big' => self::hm($own['late']), 'check' => $lc,
+                        'sub' => $running ? 'so far' : ($lateIn > 0 ? '+ ' . self::hm($lateIn) . ' carried in' : ''),
+                        'outcome' => $lateOut, 'legacy' => $lateLeg],
+            'extra' => ['minutes' => $own['ot'], 'big' => self::hm($own['ot']), 'check' => $oc,
+                        'sub' => $running ? 'so far' : ($otIn > 0 ? '+ ' . self::hm($otIn) . ' carried in' : ''),
+                        'outcome' => $extraOut, 'legacy' => $extraLeg],
+        ];
+        return $s;
     }
 
     private function previewStatement(int $userId, string $month, ?array $row, array $opts, array $base): array
@@ -584,12 +651,14 @@ class TimeBankService
         $otIn = $O - $own['ot'];
         $waive = max(0, min($L0, (int) ($opts['waive'] ?? 0)));
         $L = $L0 - $waive;
+        // ⭐ T1 (owner, Oct-14): extra ALWAYS pays for late first, at the half rate. There is no
+        // tick any more — keeping them separate gave overtime full value against late through the
+        // leave balance (Farooq Sep: covered = 0 leaves, separate = +1 net). `cover` input ignored.
         $canCover = $L > 0 && $O > 0;
-        $cover = $canCover && ($opts['cover'] ?? true);
+        $cover = $canCover;
         $a = self::arithmetic($L, $O, $cover, $factor, $per);
-        $plain = self::arithmetic($L, $O, false, $factor, $per);
         $running = !$this->isClosed($month);
-        $needs = !$running && ($plain['late_days'] > 0 || $plain['ot_days'] > 0);
+        $needs = !$running && ($a['late_days'] > 0 || $a['ot_days'] > 0);
 
         $bal = $this->usableLeave($userId, $row);
         $usable = $bal['usable'];
@@ -604,10 +673,15 @@ class TimeBankService
             if ($usable >= $ld) {
                 $lateChoices[] = ['value' => 'leave', 'label' => 'Take ' . self::leaves($ld), 'tone' => 'good'];
             } elseif ($k > 0) {
-                $lateChoices[] = ['value' => 'leave', 'label' => 'Take ' . self::leaves($k) . ' + move ' . ($ld - $k) . ' to ' . $next, 'tone' => 'good'];
+                $lateChoices[] = ['value' => 'leave', 'label' => 'Take ' . self::leaves($k) . ' + move ' . ($ld - $k) . ' day' . ($ld - $k === 1 ? '' : 's') . ' to ' . $next, 'tone' => 'good'];
                 if ($dayRate > 0) {
                     $lateChoices[] = ['value' => 'leave_salary', 'label' => 'Take ' . self::leaves($k) . ' + cut Rs ' . number_format(($ld - $k) * $dayRate), 'tone' => 'danger'];
                 }
+            }
+            if ($usable < 1) {
+                $lateChoices[] = ['value' => 'leave', 'label' => 'Take leave', 'tone' => 'good', 'disabled' => true,
+                                  'hint' => ((float) $bal['remaining'] > 0 ? 'only ' . $bal['remaining'] . ' leave left' : 'no leave left')
+                                      . ' — ' . ($dayRate > 0 ? 'cut salary or move to ' . $next : 'move to ' . $next)];
             }
             $lateChoices[] = $dayRate > 0
                 ? ['value' => 'salary', 'label' => 'Cut Rs ' . number_format($ld * $dayRate) . ' from salary', 'tone' => 'danger']
@@ -620,7 +694,7 @@ class TimeBankService
                 ['value' => 'give', 'label' => 'Give +' . self::leaves($a['ot_days']), 'tone' => 'good'],
                 ['value' => 'carry', 'label' => 'Move to ' . $next, 'tone' => 'muted'],
                 ['value' => 'skip', 'label' => 'Skip', 'tone' => 'muted',
-                 'hint' => 'no bonus — all ' . self::hm($a['O'] - $a['spent']) . ' extra is dropped'],
+                 'hint' => 'no bonus — all ' . self::hm($a['O'] - $a['spent']) . ' overtime is dropped'],
             ];
         }
         $willCover = 0;
@@ -628,19 +702,17 @@ class TimeBankService
             try { $willCover = (int) min($a['ot_days'], floor((new AbsenceDecisionService())->outstandingDays($userId))); } catch (\Throwable $e) { $willCover = 0; }
         }
 
-        // ── Words.
-        $lines = [];
-        if ($L0 > 0 || $lateIn > 0) {
-            $lines[] = 'Late ' . self::hm($L0) . ($lateIn > 0 ? ' (' . self::describe($in['late']) . ')' : '')
-                . ($waive > 0 ? ' − ' . self::hm($waive) . ' waived' : '');
-        }
-        if ($O > 0) {
-            $lines[] = 'Extra ' . self::hm($O) . ($otIn > 0 ? ' (' . self::describe($in['ot']) . ')' : '');
-        }
+        // ── Words (server-owned; the installed phone shows `lines` / `result` as they come).
+        $lines = self::factLines($month, $own['late'], $own['ot'], $lateIn, $otIn, $in['late'], $in['ot'], $waive);
         foreach ($this->legacyNotes($userId, $month) as $ln) { $lines[] = $ln; }
         $result = $this->resultSentence($a, $next);
         if ($willCover > 0) {
-            $result .= ' · ' . $willCover . ' of the extra leaves settle a parked absence';
+            $result .= ' · ' . $willCover . ' of the overtime leaves settle a parked absence';
+        }
+        // A card with no whole day has no leave buttons — say so, or it reads as "math only".
+        $nothingWhole = !$running && $ld === 0 && (int) $a['ot_days'] === 0;
+        if ($nothingWhole) {
+            $result .= ' · nothing to take from leave this month';
         }
 
         $suggestLate = $ld > 0 ? ($usable > 0 ? 'leave' : 'carry') : null;
@@ -648,21 +720,42 @@ class TimeBankService
         if ($running) {
             // This month's OWN minutes — the same figures the rider and the attendance board show.
             $ol = $own['late']; $oo = $own['ot'];
-            $chip = 'so far: ' . ($ol > 0 ? 'late ' . self::hm($ol) : '') . ($ol > 0 && $oo > 0 ? ' · ' : '') . ($oo > 0 ? 'extra ' . self::hm($oo) : '');
+            $chip = 'so far: ' . ($ol > 0 ? 'late ' . self::hm($ol) : '') . ($ol > 0 && $oo > 0 ? ' · ' : '') . ($oo > 0 ? 'overtime ' . self::hm($oo) : '');
             if ($ol === 0 && $oo === 0) { $chip = ''; }
         } elseif ($ld > 0) {
             $chip = 'Late: −' . self::leaves($ld) . ' · choose';
         } elseif ($a['ot_days'] > 0) {
-            $chip = 'Extra: +' . self::leaves($a['ot_days']) . ' · choose';
-        } elseif ($needs) {
-            // Whole days exist only if extra does NOT cover late — the choice is the cover itself.
-            $chip = 'Extra covers late · choose';
+            $chip = 'Overtime: +' . self::leaves($a['ot_days']) . ' · choose';
         } elseif ($a['late_left'] > 0) {
             $chip = self::hm($a['late_left']) . ' late → ' . $next;
         } elseif ($a['ot_left'] > 0) {
-            $chip = self::hm($a['ot_left']) . ' extra → ' . $next;
+            $chip = self::hm($a['ot_left']) . ' overtime → ' . $next;
         }
         $status = $running ? 'running' : ($needs ? 'pending' : 'clear');
+
+        // ── T2/T3: tiles, the Confirm sentence for every button combination, the unchecked warning.
+        $lateCheck = $this->check($userId, $month, 'late', $running);
+        $otCheck = $this->check($userId, $month, 'overtime', $running);
+        $legacy = ['late' => '', 'extra' => ''];
+        foreach ($this->legacyNotes($userId, $month) as $ln) {
+            $legacy[str_starts_with($ln, 'Late') ? 'late' : 'extra'] = $ln;
+        }
+        $tiles = [
+            'late'  => ['minutes' => $L0, 'big' => self::hm($L0), 'sub' => self::tileSub($month, $own['late'], $lateIn, $in['late'], $waive, 'late'),
+                        'check' => $lateCheck, 'outcome' => '', 'legacy' => $legacy['late']],
+            'extra' => ['minutes' => $O, 'big' => self::hm($O), 'sub' => self::tileSub($month, $own['ot'], $otIn, $in['ot'], 0, 'extra'),
+                        'check' => $otCheck, 'outcome' => '', 'legacy' => $legacy['extra']],
+            'result' => self::resultTile($a, $factor, $next, $running, $willCover),
+        ];
+        $confirmMap = self::confirmMap($a, $lateChoices, $otChoices, $usable, $dayRate, $next, $willCover, self::monthName($month));
+        $suggestKey = ($suggestLate ?? '') . '|' . ($a['ot_days'] > 0 ? 'give' : '');
+        $unchecked = [];
+        if ($L0 > 0 && in_array($lateCheck['state'], ['some', 'none'], true)) {
+            $unchecked[] = ($lateCheck['total'] - $lateCheck['done']) . ' late day' . ($lateCheck['total'] - $lateCheck['done'] === 1 ? '' : 's');
+        }
+        if ($O > 0 && in_array($otCheck['state'], ['some', 'none'], true)) {
+            $unchecked[] = ($otCheck['total'] - $otCheck['done']) . ' overtime day' . ($otCheck['total'] - $otCheck['done'] === 1 ? '' : 's');
+        }
 
         $expect = sha1(json_encode([$L0, $O, $own, $lateIn, $otIn, $bal['usable'], $per, $factor, $dayRate, $in['folded'],
             $row ? [(int) $row['id'], (string) $row['decided_at']] : null]));
@@ -682,13 +775,14 @@ class TimeBankService
                               'in_settled' => $in['folded'] ? 0 : self::sumSettled($in['ot']), 'total' => $O],
             'folded'      => $in['folded'],
             'notes'       => $in['notes'],
-            'cover'       => ['offered' => $canCover, 'on' => $cover, 'factor' => $factor,
+            // Kept for the installed APK: `offered` false hides its checkbox; the rule always applies.
+            'cover'       => ['offered' => false, 'on' => $cover, 'factor' => $factor,
                               'cancel' => $a['cancel'], 'spent' => $a['spent'],
-                              'label' => 'Use extra to cover late',
+                              'label' => 'Use overtime to cover late',
                               'hint' => $canCover
                                   ? 'covers ' . self::hm(self::arithmetic($L, $O, true, $factor, $per)['cancel'])
                                     . ' late with ' . self::hm(self::arithmetic($L, $O, true, $factor, $per)['spent'])
-                                    . ' extra (' . rtrim(rtrim(number_format($factor, 2), '0'), '.') . ' rate)'
+                                    . ' overtime · rate ' . rtrim(rtrim(number_format($factor, 2), '0'), '.') . ' (Attendance › Settings)'
                                   : ''],
             'net'         => $a,
             'per_day_minutes' => $per,
@@ -696,12 +790,27 @@ class TimeBankService
             'day_rate'    => $dayRate,
             'next_label'  => $next,
             'choices'     => ['late' => $lateChoices, 'ot' => $otChoices],
-            'suggested'   => ['cover' => $canCover, 'late' => $suggestLate, 'ot' => $a['ot_days'] > 0 ? 'give' : null],
+            'suggested'   => ['cover' => true, 'late' => $suggestLate, 'ot' => $a['ot_days'] > 0 ? 'give' : null],
+            'tiles'       => $tiles,
+            'confirm_map' => $confirmMap,
+            // The RESULT tile's big line for each choice pair (same keys) — it follows the buttons.
+            'result_map'  => self::resultMap($a, $lateChoices, $otChoices, $usable, $dayRate),
+            // …and its "left → Oct" line: Skip drops the extra leftover, so only late is left.
+            'leftover_skip' => (int) $a['late_left'] > 0 ? self::hm((int) $a['late_left']) . ' late left → ' . $next : 'nothing left over',
+            'clear_note'  => ($a['late_left'] > 0 || $a['ot_left'] > 0)
+                ? 'Under a day — nothing to decide. The leftover moves to ' . $next . ' by itself.'
+                : 'Nothing to decide — nothing left over.',
+            'confirm_will'=> $confirmMap[$suggestKey] ?? ($confirmMap['|'] ?? ''),
+            'unchecked_warning' => $unchecked
+                ? implode(' and ', $unchecked) . ' not checked yet — they count in full. Confirm anyway?' : '',
+            'opens_on'    => $running ? date('j M', strtotime(self::nextMonth($month) . '-01')) : null,
             'will_cover_absence' => $willCover,
             'lines'       => $lines,
             'result'      => $result,
+            'nothing_whole' => $nothingWhole,
+            'remainder'   => self::remainderLabel((int) $a['late_left'], (int) $a['ot_left'], $next),
             'chip'        => $chip,
-            'chip_tone'   => $running ? 'muted' : ($ld > 0 ? 'late' : ($a['ot_days'] > 0 ? 'extra' : ($needs ? 'late' : 'muted'))),
+            'chip_tone'   => $running ? 'muted' : ($ld > 0 ? 'late' : ($a['ot_days'] > 0 ? 'extra' : 'muted')),
             'rider_sentence' => $running
                 ? 'Is mahine abhi tak: late ' . self::hm($own['late']) . ' · overtime ' . self::hm($own['ot'])
                 : ($needs ? self::mon($month) . ' ka faisla abhi baqi hai.' : $this->riderResult($a, $next)),
@@ -710,15 +819,211 @@ class TimeBankService
         ];
     }
 
+    /**
+     * The card's fact lines — ONE format for pending, decided and running months:
+     *   "September: late 14h 05m · extra 3h 17m"
+     *   "Carried in: extra 7h 45m (from Aug)"
+     *   "Waived: 30m late"
+     */
+    private static function factLines(string $month, int $ownLate, int $ownOt, int $lateIn, int $otIn,
+                                      array $lateLots, array $otLots, int $waive): array
+    {
+        $mon = date('F', strtotime($month . '-01'));
+        $own = [];
+        if ($ownLate > 0) { $own[] = 'late ' . self::hm($ownLate); }
+        if ($ownOt > 0) { $own[] = 'overtime ' . self::hm($ownOt); }
+        $lines = [$mon . ': ' . ($own ? implode(' · ', $own) : 'no late, no overtime')];
+        $in = [];
+        if ($lateIn !== 0) { $in[] = 'late ' . self::hm($lateIn) . ' (' . self::describe($lateLots) . ')'; }
+        if ($otIn !== 0) { $in[] = 'overtime ' . self::hm($otIn) . ' (' . self::describe($otLots) . ')'; }
+        if ($in) { $lines[] = 'Carried in: ' . implode(' · ', $in); }
+        if ($waive > 0) { $lines[] = 'Waived: ' . self::hm($waive) . ' late'; }
+        return $lines;
+    }
+
+    /** "8h 34m late + 1m extra → Oct" — what moves on whatever is chosen ('' when nothing). */
+    private static function remainderLabel(int $lateLeft, int $otLeft, string $next): string
+    {
+        $p = [];
+        if ($lateLeft > 0) { $p[] = self::hm($lateLeft) . ' late'; }
+        if ($otLeft > 0) { $p[] = self::hm($otLeft) . ' overtime'; }
+        return $p ? implode(' + ', $p) . ' → ' . $next : '';
+    }
+
+    private static array $checkMemo = [];
+
+    /**
+     * The day-review standing of one kind for a month — the tick on the LATE / EXTRA tile and in
+     * every table cell. From DayReviewService::summary (the same counts the payroll grid shows)
+     * plus who did the checking.
+     */
+    public function check(int $userId, string $month, string $kind, bool $running = false): array
+    {
+        $k = $userId . '|' . $month . '|' . $kind;
+        if (isset(self::$checkMemo[$k])) { return self::$checkMemo[$k]; }
+        $off = ['state' => 'off', 'done' => 0, 'total' => 0, 'by' => [], 'label' => '', 'rider_label' => ''];
+        try {
+            $sum = app(DayReviewService::class)->summary($userId, $month);
+        } catch (\Throwable $e) { $sum = null; }
+        if (!$sum || empty($sum['enabled'])) { return self::$checkMemo[$k] = $off; }
+        $d = $sum[$kind === 'late' ? 'late' : 'overtime'] ?? [];
+        $total = (int) ($d['days'] ?? 0);
+        $done = min($total, (int) ($d['reviewed'] ?? 0));
+        $by = [];
+        try {
+            $by = DB::table('t_hr_day_review as r')->join('t_sys_user as u', 'u.id', '=', 'r.reviewed_by')
+                ->where('r.user_id', $userId)->where('r.kind', $kind)
+                ->whereBetween('r.review_date', [$month . '-01', date('Y-m-t', strtotime($month . '-01'))])
+                ->whereNull('r.superseded_at')->distinct()->orderBy('u.fullname')->pluck('u.fullname')->all();
+        } catch (\Throwable $e) { $by = []; }
+        $extra = '';
+        if ($kind === 'overtime' && (int) ($d['changed'] ?? 0) > 0) { $extra = ' · ' . (int) $d['changed'] . ' adjusted'; }
+        if ($kind === 'late' && (int) ($d['waived_minutes'] ?? 0) > 0) { $extra = ' · ' . self::hm((int) $d['waived_minutes']) . ' waived'; }
+        $soFar = $running ? ' so far' : '';
+        if ($total === 0) {
+            $state = 'nothing'; $label = $kind === 'late' ? 'no late days' : 'no overtime days'; $rider = '';
+        } elseif ($done >= $total) {
+            $state = 'all'; $label = 'all ' . $total . ' day' . ($total === 1 ? '' : 's') . ' checked' . $extra . $soFar;
+            $rider = 'sab ' . $total . ' din check ho gaye';
+        } elseif ($done === 0) {
+            $state = 'none'; $label = 'not checked yet (' . $total . ' day' . ($total === 1 ? '' : 's') . ')';
+            $rider = 'abhi check nahi hue';
+        } else {
+            $state = 'some'; $label = $done . ' of ' . $total . ' days checked' . $extra . $soFar;
+            $rider = $total . ' mein se ' . $done . ' din check';
+        }
+        return self::$checkMemo[$k] = ['state' => $state, 'done' => $done, 'total' => $total, 'by' => $by,
+            'by_label' => $by ? 'by ' . implode(', ', $by) : '', 'label' => $label, 'rider_label' => $rider];
+    }
+
+    /** "September only" · "3h 17m Sep + 7h 45m from Aug" · "no late in September" (+ "· 30m waived"). */
+    private static function tileSub(string $month, int $own, int $in, array $inLots, int $waive, string $kind): string
+    {
+        $mon = date('F', strtotime($month . '-01'));
+        if ($in === 0) {
+            $s = $own > 0 ? $mon . ' only' : 'no ' . ($kind === 'late' ? 'late' : 'overtime') . ' in ' . $mon;
+        } else {
+            // One source → "7h 45m from Aug"; several already carry their own minutes.
+            $d = self::describe($inLots);
+            $s = ($own > 0 ? self::hm($own) . ' ' . self::mon($month) . ' + ' : '') . (str_contains($d, ' + ') ? $d : self::hm($in) . ' ' . $d);
+        }
+        return $s . ($waive > 0 ? ' · ' . self::hm($waive) . ' waived' : '');
+    }
+
+    private static function rateLabel(float $factor): string
+    {
+        return abs($factor - 0.5) < 0.001 ? '½ rate' : (abs($factor - 1.0) < 0.001 ? 'full rate' : rtrim(rtrim(number_format($factor, 2), '0'), '.') . ' rate');
+    }
+
+    /** The RESULT tile — net in leaves first, then how, then what moves on. */
+    private static function resultTile(array $a, float $factor, string $next, bool $running, int $willCover): array
+    {
+        $net = (int) $a['ot_days'] - (int) $a['late_days'];
+        $big = $net === 0 ? '0 leaves' : (($net > 0 ? '+' : '−') . self::leaves(abs($net)));
+        if ((int) $a['cancel'] > 0) {
+            $how = 'overtime wiped ' . self::hm((int) $a['cancel']) . ' late (' . self::rateLabel($factor) . ')';
+        } elseif ((int) $a['late_days'] > 0) {
+            $how = (int) $a['late_days'] . ' whole day' . ((int) $a['late_days'] === 1 ? '' : 's') . ' of late';
+        } elseif ((int) $a['ot_days'] > 0) {
+            $how = (int) $a['ot_days'] . ' whole day' . ((int) $a['ot_days'] === 1 ? '' : 's') . ' of overtime';
+        } else {
+            $how = 'less than a day either way';
+        }
+        $left = [];
+        if ((int) $a['late_left'] > 0) { $left[] = self::hm((int) $a['late_left']) . ' late'; }
+        if ((int) $a['ot_left'] > 0) { $left[] = self::hm((int) $a['ot_left']) . ' overtime'; }
+        return [
+            'net' => $net, 'big' => $big, 'how' => $how,
+            'leftover' => $left ? implode(' + ', $left) . ' left → ' . $next : 'nothing left over',
+            'note' => $willCover > 0 ? $willCover . ' of these settle' . ($willCover === 1 ? 's' : '') . ' a parked absence first' : '',
+            'title' => $running ? 'IF IT ENDED TODAY' : 'RESULT',
+            'decided' => false,
+        ];
+    }
+
+    /**
+     * "Confirm will: …" for EVERY late × extra button combination, keyed "late|ot" — the clients
+     * pick a key, they never compose the sentence (one vocabulary on web and phone).
+     */
+    /**
+     * The RESULT tile's big line for every late × extra pair (keys as confirm_map): "−1 leave",
+     * "Rs 2,400 cut", "+2 leaves · Rs 2,400 cut", "0 leaves" — so the tile follows the buttons.
+     */
+    private static function resultMap(array $a, array $lateChoices, array $otChoices, int $usable, float $dayRate): array
+    {
+        $ld = (int) $a['late_days']; $od = (int) $a['ot_days'];
+        $k = min($ld, $usable);
+        $lateEff = ['' => [0, 0], 'leave' => [$k, 0], 'leave_salary' => [$k, max(0, $ld - $k)], 'salary' => [0, $ld], 'carry' => [0, 0]];
+        $lv = array_merge([''], array_values(array_map(fn ($c) => $c['value'], array_filter($lateChoices, fn ($c) => empty($c['disabled'])))));
+        $ov = array_merge([''], array_values(array_map(fn ($c) => $c['value'], $otChoices)));
+        $map = [];
+        foreach ($lv as $l) {
+            foreach ($ov as $o) {
+                [$taken, $cutDays] = $lateEff[$l] ?? [0, 0];
+                $netL = ($o === 'give' ? $od : 0) - $taken;
+                $p = [];
+                if ($netL !== 0 || $cutDays === 0) { $p[] = ($netL > 0 ? '+' : ($netL < 0 ? '−' : '')) . self::leaves(abs($netL)); }
+                if ($cutDays > 0) { $p[] = 'Rs ' . number_format($cutDays * $dayRate) . ' cut'; }
+                $map[$l . '|' . $o] = implode(' · ', $p);
+            }
+        }
+        return $map;
+    }
+
+    private static function confirmMap(array $a, array $lateChoices, array $otChoices, int $usable, float $dayRate,
+                                       string $next, int $willCover, string $monthName): array
+    {
+        $ld = (int) $a['late_days']; $od = (int) $a['ot_days'];
+        $k = min($ld, $usable);
+        $days = fn ($n) => $n . ' day' . ($n === 1 ? '' : 's');
+        $lateText = [
+            'leave'        => 'Take ' . self::leaves($k) . ($ld - $k > 0 ? ' + move ' . $days($ld - $k) . ' of late to ' . $next : ''),
+            'leave_salary' => 'Take ' . self::leaves($k) . ' + cut Rs ' . number_format(max(0, $ld - $k) * $dayRate),
+            'salary'       => 'Cut Rs ' . number_format($ld * $dayRate) . ' from salary',
+            'carry'        => 'Move ' . $days($ld) . ' of late to ' . $next,
+        ];
+        $otText = [
+            'give'  => 'Give ' . self::leaves($od) . ($willCover > 0 ? ' (' . $willCover . ' settle' . ($willCover === 1 ? 's' : '') . ' a parked absence)' : ''),
+            'carry' => 'Move ' . $days($od) . ' of overtime to ' . $next,
+            'skip'  => 'Skip overtime — ' . self::hm(max(0, (int) $a['O'] - (int) $a['spent'])) . ' dropped',
+        ];
+        $left = [];
+        if ((int) $a['late_left'] > 0) { $left[] = self::hm((int) $a['late_left']) . ' late'; }
+        if ((int) $a['ot_left'] > 0) { $left[] = self::hm((int) $a['ot_left']) . ' overtime'; }
+        $move = $left ? 'move ' . implode(' + ', $left) . ' to ' . $next : '';
+        $lateLeftTxt = (int) $a['late_left'] > 0 ? self::hm((int) $a['late_left']) . ' late' : '';
+        $lv = array_merge([''], array_values(array_map(fn ($c) => $c['value'], array_filter($lateChoices, fn ($c) => empty($c['disabled'])))));
+        $ov = array_merge([''], array_values(array_map(fn ($c) => $c['value'], $otChoices)));
+        $map = [];
+        foreach ($lv as $l) {
+            foreach ($ov as $o) {
+                $p = [];
+                if ($l !== '' && isset($lateText[$l])) { $p[] = $lateText[$l]; }
+                if ($o !== '' && isset($otText[$o])) { $p[] = $otText[$o]; }
+                // Skip drops ALL the extra (its leftover too) — never also say "move … extra".
+                $mv = $o === 'skip' ? ($lateLeftTxt ? 'move ' . $lateLeftTxt . ' to ' . $next : '') : $move;
+                if ($p) {
+                    $s = implode(' · ', $p) . ($mv ? ' · ' . $mv : '');
+                } elseif ($move) {
+                    $s = ucfirst($move) . ' · no leave touched';
+                } else {
+                    $s = 'Close ' . $monthName . ' — nothing left over';
+                }
+                $map[$l . '|' . $o] = $s;
+            }
+        }
+        return $map;
+    }
+
     private function resultSentence(array $a, string $next): string
     {
         $parts = [];
-        if ($a['cancel'] > 0) { $parts[] = 'extra covers ' . self::hm($a['cancel']) . ' late (uses ' . self::hm($a['spent']) . ')'; }
+        if ($a['cancel'] > 0) { $parts[] = 'overtime covers ' . self::hm($a['cancel']) . ' late (uses ' . self::hm($a['spent']) . ')'; }
         $res = [];
         if ($a['late_days'] > 0) { $res[] = '−' . self::leaves($a['late_days']) . ' for late'; }
-        if ($a['ot_days'] > 0) { $res[] = '+' . $a['ot_days'] . ' extra leave' . ($a['ot_days'] === 1 ? '' : 's'); }
+        if ($a['ot_days'] > 0) { $res[] = '+' . $a['ot_days'] . ' overtime leave' . ($a['ot_days'] === 1 ? '' : 's'); }
         if ($a['late_left'] > 0) { $res[] = self::hm($a['late_left']) . ' late → ' . $next; }
-        if ($a['ot_left'] > 0) { $res[] = self::hm($a['ot_left']) . ' extra → ' . $next; }
+        if ($a['ot_left'] > 0) { $res[] = self::hm($a['ot_left']) . ' overtime → ' . $next; }
         $s = $res ? '= ' . implode(' · ', $res) : '= nothing left';
         return $parts ? ucfirst($parts[0]) . ' ' . $s : ucfirst($s);
     }
@@ -757,17 +1062,17 @@ class TimeBankService
             $rider[] = 'Rs ' . number_format((float) $r['salary_amount']) . ' ' . ($salMon ?: '') . ' ki tankhwah se kata';
         }
         if (($r['ot_decision'] ?? null) === 'give' && (int) $r['ot_days'] > 0) {
-            $chips[] = '+' . (int) $r['ot_days'] . ' extra leave' . ((int) $r['ot_days'] === 1 ? '' : 's') . ' given';
-            $rider[] = '+' . self::chhutti((int) $r['ot_days']) . ' extra mili'
+            $chips[] = '+' . (int) $r['ot_days'] . ' overtime leave' . ((int) $r['ot_days'] === 1 ? '' : 's') . ' given';
+            $rider[] = '+' . self::chhutti((int) $r['ot_days']) . ' overtime mili'
                 . ((float) $r['absence_covered'] > 0 ? ' (' . rtrim(rtrim(number_format((float) $r['absence_covered'], 1), '0'), '.') . ' ne purani ghair-hazri poori ki)' : '');
         }
         if (($r['ot_decision'] ?? null) === 'skip') {
-            $chips[] = 'extra skipped';
+            $chips[] = 'overtime skipped';
             $rider[] = 'Overtime ka bonus nahi diya gaya';
         }
         if ($lateOut > 0 || $otOut > 0) {
             $chips[] = ($lateOut > 0 ? self::hm($lateOut) . ' late' : '') . ($lateOut > 0 && $otOut > 0 ? ' + ' : '')
-                . ($otOut > 0 ? self::hm($otOut) . ' extra' : '') . ' → ' . $next;
+                . ($otOut > 0 ? self::hm($otOut) . ' overtime' : '') . ' → ' . $next;
             $rider[] = ($lateOut > 0 ? self::hm($lateOut) . ' late' : '') . ($lateOut > 0 && $otOut > 0 ? ' aur ' : '')
                 . ($otOut > 0 ? self::hm($otOut) . ' overtime' : '') . ' ' . $next . ' mein gaya';
         }
@@ -776,26 +1081,68 @@ class TimeBankService
         }
         if (!$chips) { $chips[] = 'settled'; }
 
-        $lines = [];
-        $lateTotal = (int) $r['late_own'] + $lateIn;
-        if ($lateTotal > 0) {
-            $lines[] = 'Late ' . self::hm($lateTotal) . ($lateIn > 0 ? ' (' . self::describe($r['late_lots_in']) . ')' : '')
-                . ((int) $r['month_waive'] > 0 ? ' − ' . self::hm((int) $r['month_waive']) . ' waived' : '');
-        }
-        $otTotal = (int) $r['ot_own'] + $otIn;
-        if ($otTotal > 0) {
-            $lines[] = 'Extra ' . self::hm($otTotal) . ($otIn > 0 ? ' (' . self::describe($r['ot_lots_in']) . ')' : '');
-        }
+        $lateTotal = max(0, (int) $r['late_own'] + $lateIn);
+        $otTotal = max(0, (int) $r['ot_own'] + $otIn);
+        $lines = self::factLines($month, (int) $r['late_own'], (int) $r['ot_own'], $lateIn, $otIn,
+            $r['late_lots_in'], $r['ot_lots_in'], (int) $r['month_waive']);
         if ((int) $r['late_cancelled'] > 0) {
-            $lines[] = 'Extra covered ' . self::hm((int) $r['late_cancelled']) . ' late (used ' . self::hm((int) $r['ot_spent']) . ')';
+            $lines[] = 'Overtime covered ' . self::hm((int) $r['late_cancelled']) . ' late (used ' . self::hm((int) $r['ot_spent']) . ')';
         }
 
         $laterDecided = false;
-        foreach ($this->rows($userId) as $m => $x) { if ($m > $month) { $laterDecided = true; } }
+        $laterMonth = null;
+        foreach ($this->rows($userId) as $m => $x) { if ($m > $month) { $laterDecided = true; $laterMonth = $laterMonth ?? (string) $m; } }
         $returned = $this->returnedFor($userId, $month);
         if ($returned > 0) {
             $chips[] = self::hm($returned) . ' late cut not taken → back in the bank';
         }
+
+        // ── T2: tiles. Each tile's last line says what happened to ITS minutes.
+        $nextFull = self::mon(self::nextMonth($month));
+        $lo = [];
+        if ((int) $r['late_cancelled'] > 0) { $lo[] = self::hm((int) $r['late_cancelled']) . ' wiped by overtime'; }
+        if ((int) $r['month_waive'] > 0) { $lo[] = self::hm((int) $r['month_waive']) . ' waived'; }
+        if ((int) $r['leave_days'] > 0) { $lo[] = self::leaves((int) $r['leave_days']) . ' taken'; }
+        if ((int) $r['salary_days'] > 0) { $lo[] = 'Rs ' . number_format((float) $r['salary_amount']) . ' cut'; }
+        if ($returned > 0) { $lo[] = 'cut not taken at pay → back in bank'; }
+        if ($lateOut > 0) { $lo[] = self::hm($lateOut) . ' → ' . $nextFull; }
+        $eo = [];
+        if ((int) $r['ot_spent'] > 0) { $eo[] = self::hm((int) $r['ot_spent']) . ' used for late'; }
+        if (($r['ot_decision'] ?? null) === 'give' && (int) $r['ot_days'] > 0) {
+            $eo[] = self::leaves((int) $r['ot_days']) . ' given'
+                . ((float) $r['absence_covered'] > 0 ? ' (' . rtrim(rtrim(number_format((float) $r['absence_covered'], 1), '0'), '.') . ' settled a parked absence)' : '');
+        }
+        if (($r['ot_decision'] ?? null) === 'skip') { $eo[] = 'skipped'; }
+        if ($otOut > 0) { $eo[] = self::hm($otOut) . ' → ' . $nextFull; }
+        $legacy = ['late' => '', 'extra' => ''];
+        foreach ($this->legacyNotes($userId, $month) as $ln) { $legacy[str_starts_with($ln, 'Late') ? 'late' : 'extra'] = $ln; }
+        $net = []; $netNum = 0;
+        if ((int) $r['leave_days'] > 0) { $net[] = '−' . self::leaves((int) $r['leave_days']); $netNum -= (int) $r['leave_days']; }
+        if (($r['ot_decision'] ?? null) === 'give' && (int) $r['ot_days'] > 0) { $net[] = '+' . self::leaves((int) $r['ot_days']); $netNum += (int) $r['ot_days']; }
+        if ((int) $r['salary_days'] > 0) { $net[] = 'Rs ' . number_format((float) $r['salary_amount']) . ' cut'; }
+        $coverOff = !(bool) $r['cover'] && ($lateTotal > 0 && $otTotal > 0);
+        $canChangeD = !$laterDecided && $r['salary_paid_at'] === null && $returned === 0 && $this->isClosed($month);
+        $leftParts = [];
+        if ($lateOut > 0) { $leftParts[] = self::hm($lateOut) . ' late'; }
+        if ($otOut > 0) { $leftParts[] = self::hm($otOut) . ' overtime'; }
+        $tiles = [
+            'late'  => ['minutes' => $lateTotal, 'big' => self::hm($lateTotal),
+                        'sub' => self::tileSub($month, (int) $r['late_own'], $lateIn, $r['late_lots_in'], (int) $r['month_waive'], 'late'),
+                        'check' => $this->check($userId, $month, 'late'), 'outcome' => $lo ? implode(' · ', $lo) : ($lateTotal > 0 ? '' : 'no late'),
+                        'legacy' => $legacy['late']],
+            'extra' => ['minutes' => $otTotal, 'big' => self::hm($otTotal),
+                        'sub' => self::tileSub($month, (int) $r['ot_own'], $otIn, $r['ot_lots_in'], 0, 'extra'),
+                        'check' => $this->check($userId, $month, 'overtime'), 'outcome' => $eo ? implode(' · ', $eo) : ($otTotal > 0 ? '' : 'no overtime'),
+                        'legacy' => $legacy['extra']],
+            'result' => [
+                'net' => $netNum, 'big' => $net ? implode(' · ', $net) : '0 leaves',
+                'how' => $coverOff ? ($canChangeD ? 'overtime kept separate (old option — "change" applies the ' . self::rateLabel($this->factor()) . ' rule)' : 'overtime kept separate (old option)')
+                    : ((int) $r['late_cancelled'] > 0 ? 'overtime paid for late (' . self::rateLabel((float) $r['factor']) . ')' : ''),
+                'leftover' => $leftParts ? implode(' + ', $leftParts) . ' left → ' . $nextFull : 'nothing left over',
+                'by' => trim(($by ? 'by ' . $by : '') . ($r['decided_at'] ? ' · ' . date('j M', strtotime((string) $r['decided_at'])) : ''), ' ·'),
+                'title' => '✓ DECIDED', 'decided' => true, 'note' => '',
+            ],
+        ];
 
         return $base + [
             'status'   => 'decided',
@@ -812,6 +1159,7 @@ class TimeBankService
                            'late_days' => (int) $r['late_days'], 'ot_days' => (int) $r['ot_days'],
                            'late_left' => $lateOut, 'ot_left' => $otOut],
             'rider_sentence' => self::mon($month) . ': ' . ($rider ? implode(' · ', $rider) : 'koi asar nahi'),
+            'tiles'    => $tiles,
             'decision' => [
                 'cover'        => (bool) $r['cover'],
                 'leave'        => (int) $r['leave_days'],
@@ -828,9 +1176,9 @@ class TimeBankService
                 'by'           => $by,
                 'at'           => $r['decided_at'] ? substr((string) $r['decided_at'], 0, 10) : null,
                 'can_change'   => !$laterDecided && $r['salary_paid_at'] === null && $returned === 0 && $this->isClosed($month),
-                'change_blocked' => $laterDecided ? 'a later month is already decided'
-                    : ($r['salary_paid_at'] !== null ? 'the salary cut is already paid'
-                    : ($returned > 0 ? 'its salary cut went back to the bank at payment' : null)),
+                'change_blocked' => $laterDecided ? self::monthName((string) $laterMonth) . ' is already decided — undo ' . self::mon((string) $laterMonth) . ' first'
+                    : ($r['salary_paid_at'] !== null ? 'the salary cut is already paid — use “Adjust time bank” for anything missed'
+                    : ($returned > 0 ? 'its salary cut went back to the bank at payment — use “Adjust time bank” for anything missed' : null)),
             ],
         ];
     }
@@ -871,9 +1219,17 @@ class TimeBankService
         $out = [];
         foreach ($this->rows($userId) as $m => $r) {
             if ((string) $r['salary_month'] === $month && (float) $r['salary_amount'] > 0) {
-                $out[] = ['from_month' => $m, 'days' => (int) $r['salary_days'],
+                $by = null;
+                try { $by = $r['decided_by'] ? DB::table('t_sys_user')->where('id', $r['decided_by'])->value('fullname') : null; } catch (\Throwable $e) { $by = null; }
+                $at = $r['decided_at'] ? date('j M', strtotime((string) $r['decided_at'])) : null;
+                $days = (int) $r['salary_days'];
+                $out[] = ['from_month' => $m, 'days' => $days,
                           'amount' => (float) $r['salary_amount'], 'paid' => $r['salary_paid_at'] !== null,
-                          'label' => self::mon($m) . ' late · ' . self::leaves((int) $r['salary_days'])];
+                          'label' => self::mon($m) . ' late · ' . $days . ' day' . ($days === 1 ? '' : 's'),
+                          // The receipt line (T5): where the money came from, who decided, when.
+                          'receipt' => 'Late cut Rs ' . number_format((float) $r['salary_amount']) . ' — '
+                              . self::monthName($m) . ' time bank (' . $days . ' day' . ($days === 1 ? '' : 's') . ')'
+                              . ($by ? ' · ' . $by : '') . ($at ? ' · ' . $at : '')];
             }
         }
         return $out;
@@ -911,7 +1267,7 @@ class TimeBankService
         }
         foreach ($this->rows($userId) as $m => $r) {
             if ($m > $month) {
-                return ['success' => false, 'message' => self::monthName($m) . ' is already decided for this employee and it counted what ' . self::mon($month) . ' passed on. Change ' . self::mon($m) . ' first.'];
+                return ['success' => false, 'message' => self::monthName($m) . ' is already decided for this employee and it counted what ' . self::mon($month) . ' passed on. Undo ' . self::mon($m) . ' first.'];
             }
         }
         $existing = $this->rows($userId)[$month] ?? null;
@@ -932,7 +1288,7 @@ class TimeBankService
         if ($waive > 0 && $reason === '') {
             return ['success' => false, 'message' => 'Give a reason for waiving ' . self::hm($waive) . '.'];
         }
-        $opts = ['cover' => (bool) ($in['cover'] ?? true), 'waive' => $waive, 'redecide' => (bool) $existing];
+        $opts = ['cover' => true, 'waive' => $waive, 'redecide' => (bool) $existing];   // T1: half rate always
         $s = $this->month($userId, $month, $opts);
         if (($s['status'] ?? '') === 'folded') {
             return ['success' => false, 'message' => self::monthName($month) . ' is already part of ' . self::monthName($s['folded_into']) . "'s decision."];
@@ -968,7 +1324,7 @@ class TimeBankService
         if ((int) $a['ot_days'] > 0) {
             $otChoice = (string) ($in['ot_choice'] ?? '');
             if (!in_array($otChoice, ['give', 'carry', 'skip'], true)) {
-                return ['success' => false, 'message' => 'Choose what happens to the +' . self::leaves((int) $a['ot_days']) . ' extra.'];
+                return ['success' => false, 'message' => 'Choose what happens to the +' . self::leaves((int) $a['ot_days']) . ' overtime.'];
             }
         }
 
@@ -978,7 +1334,7 @@ class TimeBankService
             + ($otChoice === 'give' ? (int) $a['ot_days'] - (int) ($s['will_cover_absence'] ?? 0) : 0);
         if ($existing && $after < 0) {
             return ['success' => false, 'message' => 'This change would push the leave balance below zero (leave already used). '
-                . 'Keep the extra as given, or use "Adjust time bank" instead.'];
+                . 'Keep the overtime as given, or use "Adjust time bank" instead.'];
         }
 
         // ── Lots out (oldest first).
@@ -1016,7 +1372,7 @@ class TimeBankService
                 $waive, $reason, $opts, $leave, $salary, $carry, $salaryAmount, $salaryMonth, $dayRate, $per,
                 $otChoice, $lateQ, $otQ, $relabel, &$covered
             ) {
-                if ($existing) { $this->undoInside($userId, $month, $existing, $payroll); }
+                if ($existing) { $this->undoInside($userId, $month, $existing, $payroll, $actorId); }
 
                 // Leave effects (status lives on the bank row; the grant is only the ledger).
                 if ($leave > 0 || $this->grantExists($userId, 'late_penalty', $grantReason, $eff)) {
@@ -1101,15 +1457,15 @@ class TimeBankService
     }
 
     /** Reverse a decided month inside the caller's transaction. */
-    private function undoInside(int $userId, string $month, array $row, PayrollService $payroll): void
+    private function undoInside(int $userId, string $month, array $row, PayrollService $payroll, int $actorId): void
     {
         $reason = 'Time bank ' . date('M Y', strtotime($month . '-01'));
         $eff = $month . '-01';
         if ($this->grantExists($userId, 'late_penalty', $reason, $eff)) {
-            $payroll->recordLeaveDecision($userId, 0, 'late_penalty', $reason, $eff, $userId, true);
+            $payroll->recordLeaveDecision($userId, 0, 'late_penalty', $reason, $eff, $actorId, true);
         }
         if ($this->grantExists($userId, 'overtime', $reason, $eff)) {
-            $payroll->recordLeaveDecision($userId, 0, 'overtime', $reason, $eff, $userId, true);
+            $payroll->recordLeaveDecision($userId, 0, 'overtime', $reason, $eff, $actorId, true);
         }
         if ((float) $row['absence_covered'] > 0) {
             $payroll->uncoverAbsencesFor($userId, $month);
@@ -1144,6 +1500,9 @@ class TimeBankService
         if ($row['salary_paid_at'] !== null) {
             return ['success' => false, 'message' => 'The salary cut is already paid — use "Adjust time bank" instead.'];
         }
+        if ($this->returnedFor($userId, $month) > 0) {
+            return ['success' => false, 'message' => 'This month\'s salary cut went back to the bank at payment, so it can no longer change. Use "Adjust time bank" instead.'];
+        }
         if (($row['ot_decision'] ?? null) === 'give') {
             $bal = $this->usableLeave($userId, null)['remaining'];
             $back = (int) $row['ot_days'] - (float) $row['absence_covered'] - (int) $row['leave_days'];
@@ -1153,7 +1512,7 @@ class TimeBankService
             }
         }
         try {
-            DB::transaction(fn () => $this->undoInside($userId, $month, $row, new PayrollService()));
+            DB::transaction(fn () => $this->undoInside($userId, $month, $row, new PayrollService(), $actorId));
         } catch (\Throwable $e) {
             return ['success' => false, 'message' => 'Could not undo: ' . $e->getMessage()];
         }
@@ -1167,7 +1526,7 @@ class TimeBankService
     public function adjust(int $userId, string $kind, int $minutes, string $reason, int $actorId): array
     {
         if (!$this->enabled()) { return ['success' => false, 'message' => 'The time bank is not switched on yet.']; }
-        if (!in_array($kind, ['late', 'ot'], true)) { return ['success' => false, 'message' => 'Choose late or extra.']; }
+        if (!in_array($kind, ['late', 'ot'], true)) { return ['success' => false, 'message' => 'Choose late or overtime.']; }
         if ($minutes === 0 || abs($minutes) > 200 * 60) { return ['success' => false, 'message' => 'Enter the minutes (up to 200 hours).']; }
         $reason = trim($reason);
         if ($reason === '') { return ['success' => false, 'message' => 'Give a reason — it shows on the card and to the rider.']; }
@@ -1181,7 +1540,7 @@ class TimeBankService
         (new PayrollService())->forgetAll();
         \Log::info('TimeBank adjusted', ['user_id' => $userId, 'kind' => $kind, 'minutes' => $minutes, 'by' => $actorId]);
         return ['success' => true, 'message' => ($minutes > 0 ? '+' : '') . self::hm($minutes) . ' '
-            . ($kind === 'late' ? 'late' : 'extra') . ' added — it counts in the next decision.'];
+            . ($kind === 'late' ? 'late' : 'overtime') . ' added — it counts in the next decision.'];
     }
 
     /** Remove an OPEN manual adjustment (mistyped). Absorbed ones are history. */
@@ -1231,6 +1590,87 @@ class TimeBankService
         self::forget();
     }
 
+    /**
+     * ⭐ The person's TIME BALANCE in one place (owner, Oct-13): what is in the bank now, this
+     * month so far, which months still wait for a decision, and what was settled since the
+     * cut-over (leaves given / taken, rupees cut, minutes waived — old-rule September grants
+     * included, so the totals are the whole truth). Manager lines + Roman-Urdu rider lines.
+     */
+    public function summary(int $userId): array
+    {
+        if (!$this->enabled() || $this->isExcluded($userId)) { return ['enabled' => false]; }
+        $cur = $this->currentMonth();
+        $s = $this->month($userId, $cur);
+        $bankLate = (int) ($s['late']['in'] ?? 0);
+        $bankOt = (int) ($s['ot']['in'] ?? 0);
+        $ownLate = (int) ($s['late']['own'] ?? 0);
+        $ownOt = (int) ($s['ot']['own'] ?? 0);
+        $waiting = [];
+        foreach ((array) ($s['folded'] ?? []) as $fm) {
+            if (($this->month($userId, (string) $fm)['status'] ?? '') === 'pending') { $waiting[] = (string) $fm; }
+        }
+
+        $given = 0; $taken = 0; $cut = 0.0; $waived = 0; $decided = 0;
+        foreach ($this->rows($userId) as $r) {
+            $decided++;
+            $taken += (int) $r['leave_days'];
+            if (($r['ot_decision'] ?? null) === 'give') { $given += (int) $r['ot_days']; }
+            $cut += (float) $r['salary_amount'];
+            $waived += (int) $r['month_waive'];
+        }
+        $oldGiven = 0; $oldTaken = 0;
+        for ($m = self::START_MONTH; $m <= $cur; $m = self::nextMonth($m)) {
+            try {
+                foreach (DB::table('t_hr_leave_grant')->where('user_id', $userId)->whereDate('effective_date', $m . '-01')
+                             ->whereIn('reason', [$this->legacyReason('overtime', $m), $this->legacyReason('late_penalty', $m)])
+                             ->get(['days', 'source']) as $g) {
+                    if ($g->source === 'overtime' && (float) $g->days > 0) { $oldGiven += (int) $g->days; }
+                    if ($g->source === 'late_penalty' && (float) $g->days < 0) { $oldTaken += (int) abs((float) $g->days); }
+                }
+            } catch (\Throwable $e) { /* none */ }
+        }
+        $given += $oldGiven; $taken += $oldTaken;
+
+        $wMon = array_map(fn ($m) => self::mon($m), $waiting);
+        $bank = [];
+        if ($bankLate !== 0) { $bank[] = 'late ' . self::hm($bankLate); }
+        if ($bankOt !== 0) { $bank[] = 'overtime ' . self::hm($bankOt); }
+        $sinceBits = [];
+        if ($given > 0) { $sinceBits[] = '+' . $given . ' overtime leave' . ($given === 1 ? '' : 's') . ' given'; }
+        if ($taken > 0) { $sinceBits[] = self::leaves($taken) . ' taken for late'; }
+        if ($cut > 0) { $sinceBits[] = 'Rs ' . number_format($cut) . ' cut'; }
+        if ($waived > 0) { $sinceBits[] = self::hm($waived) . ' late waived'; }
+        $thisMon = date('F', strtotime($cur . '-01'));
+
+        $lines = [
+            'In the bank: ' . ($bank ? implode(' · ', $bank) : 'nothing')
+                . ($wMon ? ' — ' . implode(', ', $wMon) . ' waiting for a decision' : ''),
+            $thisMon . ' so far: ' . ($ownLate || $ownOt
+                ? trim(($ownLate ? 'late ' . self::hm($ownLate) : '') . ($ownLate && $ownOt ? ' · ' : '') . ($ownOt ? 'overtime ' . self::hm($ownOt) : ''))
+                : 'no late, no overtime'),
+            'Since Sep: ' . ($sinceBits ? implode(' · ', $sinceBits) : 'nothing settled yet'),
+        ];
+        $rBits = [];
+        if ($given > 0) { $rBits[] = '+' . self::chhutti($given) . ' overtime mili'; }
+        if ($taken > 0) { $rBits[] = self::chhutti($taken) . ' late ki wajah se kati'; }
+        if ($cut > 0) { $rBits[] = 'Rs ' . number_format($cut) . ' tankhwah se kata'; }
+        if ($waived > 0) { $rBits[] = self::hm($waived) . ' late maaf'; }
+        $riderLines = [
+            'Bank mein abhi: ' . ($bankLate || $bankOt
+                ? trim(($bankLate ? 'late ' . self::hm($bankLate) : '') . ($bankLate && $bankOt ? ' · ' : '') . ($bankOt ? 'overtime ' . self::hm($bankOt) : ''))
+                : 'kuch nahi') . ($wMon ? ' (' . implode(', ', $wMon) . ' ka faisla baqi)' : ''),
+            'Is mahine abhi tak: late ' . self::hm($ownLate) . ' · overtime ' . self::hm($ownOt),
+            'Sep se ab tak: ' . ($rBits ? implode(' · ', $rBits) : 'abhi koi faisla nahi'),
+        ];
+        return [
+            'enabled' => true, 'month' => $cur,
+            'bank_late' => $bankLate, 'bank_ot' => $bankOt, 'own_late' => $ownLate, 'own_ot' => $ownOt,
+            'waiting' => $waiting, 'decided_months' => $decided,
+            'given' => $given, 'taken' => $taken, 'cut' => round($cut, 2), 'waived' => $waived,
+            'lines' => $lines, 'rider_lines' => $riderLines,
+        ];
+    }
+
     /** A person's bank history: decided months (newest first) + every adjustment. */
     public function history(int $userId): array
     {
@@ -1245,7 +1685,7 @@ class TimeBankService
         }
         $adj = array_map(fn ($a) => [
             'id' => (int) $a['id'], 'kind' => $a['kind'], 'minutes' => (int) $a['minutes'],
-            'label' => ((int) $a['minutes'] > 0 ? '+' : '') . self::hm((int) $a['minutes']) . ' ' . ($a['kind'] === 'late' ? 'late' : 'extra'),
+            'label' => ((int) $a['minutes'] > 0 ? '+' : '') . self::hm((int) $a['minutes']) . ' ' . ($a['kind'] === 'late' ? 'late' : 'overtime'),
             'source' => $a['source'], 'reason' => $a['reason'], 'by' => $a['by_name'] ?? null,
             'at' => $a['created_at'] ? substr((string) $a['created_at'], 0, 10) : null,
             'open' => $a['absorbed_in_month'] === null,
@@ -1253,7 +1693,7 @@ class TimeBankService
             'removable' => $a['source'] === 'manual' && $a['absorbed_in_month'] === null,
         ], array_reverse($this->adjustRows($userId)));
         return ['enabled' => true, 'start_month' => $this->startMonth($userId), 'excluded' => $this->isExcluded($userId),
-                'months' => $months, 'adjustments' => $adj];
+                'summary' => $this->summary($userId), 'months' => $months, 'adjustments' => $adj];
     }
 
     // =====================================================================
@@ -1277,7 +1717,10 @@ class TimeBankService
             $s = $this->month($userId, $month);
             if (!in_array($s['status'], ['before_start', 'off', 'excluded'], true)) { $one = self::riderSlice($s); }
         }
-        return ['enabled' => true, 'months' => $months, 'month' => $one];
+        // `summary` (rider lines only) is ready for the next APK; the installed app ignores it.
+        $sum = $this->summary($userId);
+        return ['enabled' => true, 'months' => $months, 'month' => $one,
+                'summary' => ['lines' => $sum['rider_lines'] ?? []]];
     }
 
     /** Minutes carried from DECIDED months (lots that are not an undecided month's own). */
@@ -1302,6 +1745,12 @@ class TimeBankService
             'ot_total'    => (int) ($running ? ($s['ot']['own'] ?? 0) + $otIn : ($s['ot']['total'] ?? 0)),
             'ot_in'       => $otIn,
             'sentence'    => (string) ($s['rider_sentence'] ?? ''),
+            'late_check'  => (string) ($s['cells']['late']['check']['rider_label'] ?? ''),
+            'ot_check'    => (string) ($s['cells']['extra']['check']['rider_label'] ?? ''),
+            'late_check_ok' => ($s['cells']['late']['check']['state'] ?? '') === 'all',
+            'ot_check_ok' => ($s['cells']['extra']['check']['state'] ?? '') === 'all',
+            'late_outcome'=> ($s['status'] ?? '') === 'decided' ? (string) ($s['tiles']['late']['outcome'] ?? '') : '',
+            'ot_outcome'  => ($s['status'] ?? '') === 'decided' ? (string) ($s['tiles']['extra']['outcome'] ?? '') : '',
             'decided_by'  => $s['decision']['by'] ?? null,
             'decided_at'  => $s['decision']['at'] ?? null,
         ];

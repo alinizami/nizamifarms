@@ -1021,7 +1021,8 @@ class AttendanceController extends Controller
             // Dated, attributed leave adjustments (overtime bonus / late penalty / manual) for
             // the current cycle — the "who/when/why" history. Cycle-scoped inside the service.
             $adj = (new \App\Services\HR\LeavePolicyService())->adjustments($userId);
-            $srcLabels = ['overtime' => 'bonus (overtime)', 'late_penalty' => 'late penalty', 'manual' => 'yearly adjustment', 'half_day' => 'half day', 'absence_cover' => 'covered a parked absence'];
+            // Same words as the late & extra card (Oct-13).
+            $srcLabels = ['overtime' => 'from overtime', 'late_penalty' => 'taken for late', 'manual' => 'yearly adjustment', 'half_day' => 'half day', 'absence_cover' => 'covered a parked absence'];
             $items = [];
             foreach ($adj as $a) {
                 if (empty($a['date'])) { continue; }
@@ -1030,8 +1031,12 @@ class AttendanceController extends Controller
                 // Show the manager's typed reason, but not payroll's auto-reasons ("Overtime
                 // bonus Jul 2026") — those just repeat the source label.
                 $reason = (string) ($a['reason'] ?? '');
-                $showReason = $reason !== '' && !preg_match('/^(Overtime bonus|Late penalty) /', $reason);
-                $lbl = ($days >= 0 ? '+' : '−') . $num . ' leave · ' . ($srcLabels[$a['source']] ?? $a['source'])
+                $showReason = $reason !== '' && !preg_match('/^(Overtime bonus|Late penalty|Time bank) /', $reason);
+                // ⏱ Time-bank rows say where they came from (Oct-14): "Time bank Sep 2026 · taken for late".
+                $what = str_starts_with($reason, 'Time bank ')
+                    ? (string) ($a['label'] ?? $reason)
+                    : ($srcLabels[$a['source']] ?? $a['source']);
+                $lbl = ($days >= 0 ? '+' : '−') . $num . ' leave · ' . $what
                     . ($showReason ? ' · “' . $reason . '”' : '')
                     . ($a['by_name'] ? ' · by ' . $a['by_name'] : '');
                 $items[] = ['date' => $a['date'], 'label' => $lbl];
@@ -3136,6 +3141,8 @@ class AttendanceController extends Controller
                 $userData['time_bank'] = in_array($tbS['status'] ?? '', ['off', 'excluded', 'before_start'], true) ? null : [
                     'status' => $tbS['status'], 'chip' => $tbS['chip'] ?? '', 'tone' => $tbS['chip_tone'] ?? 'muted',
                     'lines' => $tbS['lines'] ?? [], 'result' => $tbS['result'] ?? '',
+                    // Tiles round (Oct-14): the Late / Overtime cells every table draws.
+                    'cells' => $tbS['cells'] ?? null,
                 ];
             } catch (\Throwable $e) { $userData['time_bank'] = null; }
             // Stamp the per-DAY figure onto the day rows too. The Reports page used to derive

@@ -569,6 +569,22 @@ class PayrollService
                     }
                     continue;
                 }
+                // ⏱ A time-bank card counts what it SUGGESTS (pending) or DID (decided) — in
+                // leaves — so the summary box never reads "all waived" after a +2 was given.
+                if ($a['kind'] === 'time_bank') {
+                    $st = $a['statement'] ?? [];
+                    if ($a['status'] === 'pending') {
+                        $sum['pending_count']++;
+                        $sum['give_pending'] += (int) ($st['net']['ot_days'] ?? 0);
+                        $sum['deduct_pending'] += (int) ($st['net']['late_days'] ?? 0);
+                    } else {
+                        $sum['settled_count']++;
+                        $d = $st['decision'] ?? [];
+                        $sum['given'] += ($d['ot'] ?? null) === 'give' ? (int) ($d['ot_days'] ?? 0) : 0;
+                        $sum['deducted'] += (int) ($d['leave'] ?? 0);
+                    }
+                    continue;
+                }
                 if ($a['status'] === 'pending') {
                     $sum['pending_count']++;
                     if ($a['kind'] === 'overtime') { $sum['give_pending'] += (int) $a['recommended_days']; }
@@ -2448,11 +2464,15 @@ class PayrollService
                         (new TimeBankService())->returnCuts($userId, $month, $actorId);
                         $noteBits[] = 'Late cut not taken — the days went back to the time bank';
                     } else {
+                        // The receipt names where each cut came from (T5, Oct-14).
+                        foreach (($row['time_bank_cuts'] ?? []) as $cut) {
+                            if (!empty($cut['receipt'])) { $noteBits[] = $cut['receipt']; }
+                        }
                         (new TimeBankService())->markCutsPaid($userId, $month);
                     }
                 }
                 if ($isBank && (($row['time_bank']['status'] ?? '') === 'pending')) {
-                    $noteBits[] = 'Late / extra not decided yet (time bank)';
+                    $noteBits[] = 'Late / overtime not decided yet (time bank)';
                 }
 
                 // Stamp any manager bypass onto the receipt so a paid month explains itself later

@@ -65,10 +65,7 @@ class OpenOrderDemandService
     {
         return DB::table('t_crm_shopify_order_line_item as li')
             ->join('t_crm_shopify_order as so', 'so.id', '=', 'li.order_id')
-            ->join(DB::raw('(SELECT sku, MIN(product_id) AS product_id
-                             FROM t_crm_prod_product_variant
-                             WHERE sku IS NOT NULL AND sku <> \'\'
-                             GROUP BY sku) as v'), 'v.sku', '=', 'li.sku')
+            ->join(DB::raw('(' . $this->stagingSkuMapSql() . ') as v'), 'v.sku', '=', 'li.sku')
             ->join('t_crm_prod_product as p', 'p.id', '=', 'v.product_id')
             ->where(function ($q) {
                 $q->whereNull('so.converted')->orWhere('so.converted', 0);
@@ -86,6 +83,38 @@ class OpenOrderDemandService
             ->where(function ($q) {
                 $q->whereNull('p.attribute_1')->orWhereRaw('LOWER(p.attribute_1) <> ?', ['qurbani']);
             });
+    }
+
+    /**
+     * SKU → local product for staging lines, plus `pack` = how many of that product ONE
+     * staging unit is. Every ordinary SKU: one row, its own product, pack 1.
+     * 📦 A BUNDLE SKU (see App\Services\CRM\ProductBundle) gives one row PER PRODUCT
+     * INSIDE with its packets — EK200 = 2 × Samosa + 1 × Roll → (Samosa, 2), (Roll, 1) —
+     * the same lines Shopify conversion will create. The callers SUM(li.quantity × pack)
+     * per product, so each product inside gets its share.
+     * Before the bundle SQL has run (or with no bundles) this is exactly the old subquery.
+     */
+    private function stagingSkuMapSql(): string
+    {
+        if (!\App\Services\CRM\ProductBundle::supported()) {
+            return "SELECT sku, MIN(product_id) AS product_id, 1 AS pack
+                    FROM t_crm_prod_product_variant
+                    WHERE sku IS NOT NULL AND sku <> ''
+                    GROUP BY sku";
+        }
+        $items = \App\Services\CRM\ProductBundle::TABLE;
+        return "SELECT pv.sku, MIN(pv.product_id) AS product_id, 1 AS pack
+                FROM t_crm_prod_product_variant pv
+                WHERE pv.sku IS NOT NULL AND pv.sku <> ''
+                  AND NOT EXISTS (SELECT 1 FROM {$items} bx WHERE bx.bundle_product_id = pv.product_id)
+                GROUP BY pv.sku
+                UNION ALL
+                SELECT pv.sku, iv.product_id, SUM(bi.qty) AS pack
+                FROM t_crm_prod_product_variant pv
+                JOIN {$items} bi ON bi.bundle_product_id = pv.product_id
+                JOIN t_crm_prod_product_variant iv ON iv.id = bi.variant_id AND iv.product_id <> pv.product_id
+                WHERE pv.sku IS NOT NULL AND pv.sku <> ''
+                GROUP BY pv.sku, iv.product_id";
     }
 
     private function bucketSql(): string
@@ -115,7 +144,7 @@ class OpenOrderDemandService
             if ($withShopify) {
                 $staging = $this->stagingLinesQuery($buId)
                     ->groupBy('p.id')
-                    ->selectRaw('p.id as product_id, SUM(li.quantity) as qty')
+                    ->selectRaw('p.id as product_id, SUM(li.quantity * v.pack) as qty')
                     ->get();
                 foreach ($staging as $row) {
                     $demand[(int) $row->product_id]['shopify'] = (float) $row->qty;
@@ -170,7 +199,7 @@ class OpenOrderDemandService
             ->where('p.id', $productId)
             ->groupBy('so.id', 'so.order_number', 'so.name', 'so.order_date')
             ->selectRaw('so.id as order_id, so.order_number, so.name as customer_name,
-                         so.order_date, SUM(li.quantity) as qty')
+                         so.order_date, SUM(li.quantity * v.pack) as qty')
             ->orderBy('so.order_date')
             ->get()
             ->map(fn ($r) => [

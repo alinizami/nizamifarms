@@ -50,6 +50,7 @@ class ProductChangeHistory extends Model
     const TYPE_LEAN_STATUS_CHANGE = 'lean_status_change';
     const TYPE_CZERLOP_CHANGE = 'czerlop_change';
     const TYPE_SELL_UNIT_CHANGE = 'sell_unit_change';
+    const TYPE_BUNDLE_CHANGE = 'bundle_change';
     const TYPE_PRODUCT_CREATED = 'product_created';
     const TYPE_VARIANT_CREATED = 'variant_created';
     const TYPE_VARIANT_DELETED = 'variant_deleted';

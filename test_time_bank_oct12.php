@@ -29,7 +29,7 @@ ok($a['cancel'] === 330 && $a['spent'] === 660 && $a['ot_left'] === 1, 'odd extr
 $a = TB::arithmetic(600, 600, true, 1.0, 540);
 ok($a['cancel'] === 600 && $a['spent'] === 600, 'factor 1 = equal');
 $a = TB::arithmetic(1200, 0, true, 0.5, 540);
-ok($a['late_days'] === 2 && $a['late_left'] === 120 && $a['cancel'] === 0, 'no extra: cover does nothing');
+ok($a['late_days'] === 2 && $a['late_left'] === 120 && $a['cancel'] === 0, 'no overtime: cover does nothing');
 $a = TB::arithmetic(0, 0, true, 0.5, 540);
 ok($a['late_days'] === 0 && $a['ot_days'] === 0, 'empty month');
 
@@ -51,13 +51,49 @@ ok($ar8['status'] === 'before_start', 'August is before the cut-over', $ar8['sta
 $s = $tb->month($danish, '2026-09');
 ok($s['ot']['in'] === 0 && !str_contains($s['ot']['in_label'], 'Aug'), 'Danish: un-decided AUGUST extra is NOT pulled in (before the cut-over)', $s['ot']['in_label']);
 $s = $tb->month($haider, '2026-09');
-ok($s['status'] === 'pending', 'Haider Sep pending', $s['status']);
 ok($s['late']['total'] === 845, 'Haider late 14h05', (string) $s['late']['total']);
 ok($s['ot']['in'] === 465 + 0 || $s['ot']['in'] > 0, 'Haider extra includes Aug carry', (string) $s['ot']['in']);
-echo "     card: " . implode(' | ', $s['lines']) . " | " . $s['result'] . " | chip=" . $s['chip'] . "\n";
+// ⭐ T1 (Oct-14): half rate is THE rule — extra always pays for late first; a "cover off" request is ignored.
+ok($s['status'] === 'clear' && $s['net']['cancel'] === 331 && $s['net']['late_days'] === 0, 'Haider Sep: extra pays for 5h31m late at ½ → under a day → no decision needed', $s['status']);
 $s2 = $tb->month($haider, '2026-09', ['cover' => false]);
-echo "     cover off: " . $s2['result'] . " | chip=" . $s2['chip'] . "\n";
-ok($s2['net']['late_days'] >= 1, 'cover off shows whole late days');
+ok($s2['net'] === $s['net'], 'a "cover off" request changes nothing (the loophole is closed)');
+ok($s['cover']['offered'] === false, 'the installed APK hides its tick (cover.offered = false)');
+$fa = $tb->month($farooq, '2026-09', ['cover' => false]);
+ok($fa['net']['late_days'] === 0 && $fa['net']['ot_days'] === 0, 'Farooq Sep = 0 leaves (was −1 · +2 with the tick off)', json_encode($fa['net']));
+echo "     tiles: " . $s['tiles']['late']['big'] . ' | ' . $s['tiles']['extra']['big'] . ' | ' . $s['tiles']['result']['big'] . ' — ' . $s['tiles']['result']['how'] . "\n";
+ok($s['tiles']['result']['big'] === '0 leaves' && str_contains($s['tiles']['result']['how'], '½ rate'), 'RESULT tile: "0 leaves · overtime wiped 5h 31m late (½ rate)"');
+ok($s['tiles']['late']['check']['state'] === 'all' && $s['tiles']['late']['check']['total'] === 21, 'LATE tile tick: all 21 days checked', $s['tiles']['late']['check']['label']);
+ok(in_array('Shabib', $s['tiles']['late']['check']['by'], true), 'LATE tile names who checked', json_encode($s['tiles']['late']['check']['by']));
+ok($s['confirm_will'] === 'Move 8h 34m late to Oct · no leave touched', 'Confirm sentence for a month with nothing whole', $s['confirm_will']);
+ok($s['cells']['late']['outcome'] === '5h 31m wiped by overtime · 8h 34m → Oct' && $s['cells']['by'] === 'under a day — nothing to decide', 'table cell for an under-a-day month', json_encode($s['cells']['late']));
+$dn9 = $tb->month($danish, '2026-09');
+ok($dn9['status'] === 'pending' && $dn9['tiles']['result']['big'] === '+2 leaves', 'Danish Sep: +2 leaves, waiting for a decision');
+ok($dn9['confirm_will'] === 'Give 2 leaves · move 2h 28m overtime to Oct', 'Danish suggested Confirm sentence', $dn9['confirm_will']);
+ok(isset($dn9['confirm_map']['|carry'], $dn9['confirm_map']['|skip']) && str_starts_with($dn9['confirm_map']['|skip'], 'Skip overtime'), 'a Confirm sentence exists for every button (carry / skip)');
+ok($dn9['cells']['chip'] === 'Decide September ›' && $dn9['cells']['chip_in'] === 'extra' && $dn9['cells']['chip_sub'] === '+2 leaves',
+   'pending month: the table cell offers "+2 leaves — Decide September ›" in the EXTRA cell', json_encode([$dn9['cells']['chip_in'], $dn9['cells']['chip_sub']]));
+$ar9 = $tb->month($arslan, '2026-09');
+ok(($ar9['cells']['extra']['legacy'] ?? '') !== '' && !str_contains($ar9['cells']['extra']['outcome'], 'old rule'),
+   'old-rule note is its own cell line, not inside the outcome', json_encode($ar9['cells']['extra']));
+// Review fixes (Oct-15)
+ok(!str_contains($dn9['confirm_map']['|skip'], 'extra to'), 'Skip moves NO extra — its sentence never says "move … extra"', $dn9['confirm_map']['|skip']);
+ok(($dn9['result_map']['|give'] ?? '') === '+2 leaves' && ($dn9['result_map']['|carry'] ?? '') === '0 leaves' && ($dn9['result_map']['|skip'] ?? '') === '0 leaves',
+   'RESULT tile follows the buttons (result_map)', json_encode($dn9['result_map'] ?? null));
+ok(($dn9['confirm_map']['|carry'] ?? '') === 'Move 2 days of overtime to Oct · move 2h 28m overtime to Oct', 'one verb: "Move"', $dn9['confirm_map']['|carry'] ?? '');
+$dw = $tb->month($danish, '2026-09', ['waive' => 45]);
+ok((int) $dw['late']['waive'] === 0, 'a waive bigger than the late total is clamped by the server (clients take this number)', (string) $dw['late']['waive']);
+ok(str_starts_with((string) ($s['clear_note'] ?? ''), 'Under a day — nothing to decide. The leftover moves to Oct'), 'clear note names the leftover', (string) ($s['clear_note'] ?? ''));
+$mash = uid('Mashood');
+$ms = $mash ? $tb->month($mash, '2026-09') : null;
+if ($ms && ($ms['status'] ?? '') === 'clear' && (int) ($ms['net']['late_left'] ?? 0) === 0 && (int) ($ms['net']['ot_left'] ?? 0) === 0) {
+    ok($ms['clear_note'] === 'Nothing to decide — nothing left over.', 'an empty month does not talk about a leftover', $ms['clear_note']);
+}
+// Folded month: cells still drawn + a readable month to open (reflection — the replica has no closed later month).
+$wc = new ReflectionMethod(TB::class, 'withCells'); $wc->setAccessible(true);
+$fold = $wc->invoke($tb, $haider, '2026-09', ['user_id' => $haider, 'month' => '2026-09', 'status' => 'folded', 'folded_into' => '2026-10', 'folded_label' => 'October 2026']);
+ok(is_array($fold['cells']) && $fold['cells']['late']['outcome'] === 'in Oct decision' && $fold['cells']['extra']['minutes'] > 0, 'folded month keeps its table cells ("in Oct decision")', json_encode($fold['cells']['late'] ?? null));
+$kn9 = $tb->month($kanan, '2026-09');
+ok(str_contains((string) $kn9['tiles']['extra']['check']['label'], 'of') && $kn9['tiles']['extra']['check']['state'] === 'some', 'Kanan extra: some days unchecked → amber', $kn9['tiles']['extra']['check']['label']);
 $ar = $tb->month($arslan, '2026-10');
 ok(in_array($ar['status'], ['running', 'pending', 'clear'], true), 'Arslan Oct readable: ' . $ar['status']);
 ok($ar['late']['in'] === 52 || $ar['folded'] === ['2026-09'], 'Arslan Oct folds the undecided Sep (52m late) in', json_encode($ar['folded']));
@@ -115,20 +151,31 @@ try {
     $o = $tb->month($haider, '2026-10');
     ok($o['late']['in'] === 514, 'Oct carries 8h34m late in', (string) $o['late']['in']);
 
-    // Farooq: cover off, take leave for late, give extra
-    $f = $tb->month($farooq, '2026-09', ['cover' => false]);
+    // Farooq: give him 20h more late by hand so the month has WHOLE late days under the ½ rule.
+    $tb->adjust($farooq, 'late', 1200, 'proof: extra late', $actor);
+    TB::forget();
+    $f = $tb->month($farooq, '2026-09');
+    ok($f['net']['late_days'] === 2 && $f['tiles']['result']['big'] === '−2 leaves', 'Farooq + 20h late: extra still pays first, 2 whole late days remain', json_encode($f['net']));
+    ok($f['confirm_will'] === 'Take 2 leaves · move 2h 19m late + 1m overtime to Oct', 'Confirm sentence for taking leave', $f['confirm_will']);
     $bal0 = (new App\Services\HR\LeavePolicyService())->balance($farooq)['remaining'];
-    $r = $tb->decide($farooq, '2026-09', ['cover' => false, 'late_choice' => 'leave', 'ot_choice' => 'give', 'expect' => $f['expect']], $actor);
-    ok($r['success'], 'Farooq Sep: cover off, leave + give', $r['message']);
+    $r = $tb->decide($farooq, '2026-09', ['cover' => false, 'late_choice' => 'leave', 'expect' => $f['expect']], $actor);
+    ok($r['success'], 'Farooq Sep: take leave (a "cover off" input is ignored)', $r['message']);
     $bal1 = (new App\Services\HR\LeavePolicyService())->balance($farooq)['remaining'];
-    ok(abs(($bal1 - $bal0) - ($f['net']['ot_days'] - $f['net']['late_days'])) < 0.01, "balance moved by +extra −late ($bal0 → $bal1)");
+    ok(abs(($bal1 - $bal0) + 2) < 0.01, "balance −2 ($bal0 → $bal1)");
+    $fd = $tb->month($farooq, '2026-09');
+    ok($fd['tiles']['result']['title'] === '✓ DECIDED' && $fd['tiles']['result']['big'] === '−2 leaves', 'decided RESULT tile', $fd['tiles']['result']['big']);
+    ok(str_contains($fd['tiles']['late']['outcome'], 'wiped by overtime') && str_contains($fd['tiles']['late']['outcome'], '2 leaves taken'), 'LATE tile says what happened to its minutes', $fd['tiles']['late']['outcome']);
+    ok(str_contains($fd['cells']['late']['outcome'], '2 leaves taken') && str_contains($fd['cells']['by'], 'by Taimur'), 'table cell: outcome + who', $fd['cells']['late']['outcome'] . ' | ' . $fd['cells']['by']);
+    $lh = (new App\Services\HR\LeavePolicyService())->adjustments($farooq);
+    ok((bool) array_filter($lh, fn ($g) => ($g['label'] ?? '') === 'Time bank Sep 2026 · taken for late' && ($g['bank_month'] ?? '') === '2026-09'),
+       'leave history row says "Time bank Sep 2026 · taken for late" and links to September', json_encode(array_slice($lh, 0, 2)));
     $u = $tb->undo($farooq, '2026-09', $actor);
     $bal2 = (new App\Services\HR\LeavePolicyService())->balance($farooq)['remaining'];
     ok($u['success'] && abs($bal2 - $bal0) < 0.01, "undo restores the balance ($bal2)", $u['message']);
 
     // Salary on a month: cut lands on Sep pay (Sep unpaid for Farooq on replica)
-    $f = $tb->month($farooq, '2026-09', ['cover' => false]);
-    $r = $tb->decide($farooq, '2026-09', ['cover' => false, 'late_choice' => 'salary', 'ot_choice' => 'carry', 'expect' => $f['expect']], $actor);
+    $f = $tb->month($farooq, '2026-09');
+    $r = $tb->decide($farooq, '2026-09', ['late_choice' => 'salary', 'expect' => $f['expect']], $actor);
     ok($r['success'], 'Farooq salary cut', $r['message']);
     $cuts = $tb->cutsLandingOn($farooq, '2026-09');
     ok(count($cuts) === 1 && abs($cuts[0]['amount'] - $f['net']['late_days'] * $f['day_rate']) < 0.02, 'cut = days × day rate on Sep pay', json_encode($cuts));
@@ -177,6 +224,8 @@ try {
     ok($pr && abs((float) $pr->late_deduction - (float) $row['late_deduction']) < 0.02, 'receipt late_deduction = bank cut', $pr ? (string) $pr->late_deduction : 'no row');
     $paidAt = DB::table('t_hr_time_bank_month')->where('user_id', $farooq)->where('month', '2026-09')->value('salary_paid_at');
     ok($paidAt !== null, 'bank cut marked paid');
+    ok(str_contains((string) $pr->notes, 'September 2026 time bank') && str_contains((string) $pr->notes, 'Taimur'),
+       'the paid receipt says where the late cut came from and who decided', (string) $pr->notes);
     App\Services\HR\TimeBankService::forget();
     $u = $tb->undo($farooq, '2026-09', $actor);
     ok(!$u['success'], 'paid cut cannot be undone', $u['message']);
@@ -188,16 +237,22 @@ try {
     App\Services\HR\TimeBankService::forget(); $pay->forgetAll();
     $res = $pay->payRow($kanan, '2026-09', ['funding' => 'cash', 'actor_id' => $actor, 'shortfall' => 'writeoff']);
     $kr = DB::table('t_hr_payroll_payment')->where('user_id', $kanan)->where('pay_month', '2026-09')->first();
-    ok(!empty($res['success']) && $kr && (float) $kr->late_deduction == 0.0 && str_contains((string) $kr->notes, 'not decided yet'),
-       'undecided month paid: no late cut, receipt says not decided', $kr ? (string) $kr->notes : ($res['message'] ?? ''));
+    // Under the ½ rule Kanan's Sep is under a day ('clear'): no decision exists to wait for, so the
+    // receipt must NOT claim one is pending; a 'pending' month would say "not decided yet".
+    $kst = $tb->month($kanan, '2026-09')['status'] ?? '';
+    ok(!empty($res['success']) && $kr && (float) $kr->late_deduction == 0.0
+       && ($kst === 'pending' ? str_contains((string) $kr->notes, 'not decided yet') : !str_contains((string) $kr->notes, 'not decided yet')),
+       "undecided month paid: no late cut; receipt note matches the month ($kst)", $kr ? (string) $kr->notes : ($res['message'] ?? ''));
     App\Services\HR\TimeBankService::forget();
     ok($tb->month($kanan, '2026-09')['status'] !== 'before_start', 'a payment never closes a bank month');
     $k9 = $tb->month($kanan, '2026-09');
-    ok($k9['status'] === 'pending', 'Kanan Sep still pending after pay', $k9['status']);
+    ok($k9['status'] !== 'decided', 'Kanan Sep still undecided after pay', $k9['status']);
     // Deciding salary now lands on the NEXT unpaid month (Oct).
-    $k9 = $tb->month($kanan, '2026-09', ['cover' => false]);
+    $tb->adjust($kanan, 'late', 1500, 'proof: extra late', $actor);
+    TB::forget();
+    $k9 = $tb->month($kanan, '2026-09');
     if ($k9['net']['late_days'] > 0) {
-        $r = $tb->decide($kanan, '2026-09', ['cover' => false, 'late_choice' => 'salary', 'ot_choice' => 'carry', 'expect' => $k9['expect']], $actor);
+        $r = $tb->decide($kanan, '2026-09', ['late_choice' => 'salary', 'expect' => $k9['expect']], $actor);
         $sm = DB::table('t_hr_time_bank_month')->where('user_id', $kanan)->where('month', '2026-09')->value('salary_month');
         ok($r['success'] && $sm === '2026-10', 'salary chosen after Sep was paid → comes off Oct', $r['message'] . ' / ' . $sm);
         $cuts = $tb->cutsLandingOn($kanan, '2026-10');
@@ -249,13 +304,52 @@ try {
     if (($k['status'] ?? '') === 'decided') {
         ok(!$k['decision']['can_change'] && str_contains((string) $k['decision']['change_blocked'], 'back to the bank'),
            'month whose cut was returned is locked', (string) $k['decision']['change_blocked']);
+        $ku = $tb->undo($kanan, '2026-09', $actor);
+        ok(!$ku['success'] && str_contains($ku['message'], 'back to the bank'), 'undo is refused too when the cut went back to the bank (no double count)', $ku['message']);
         ok(str_contains($k['chip'], 'back in the bank'), 'its chip says the cut went back to the bank', $k['chip']);
     }
+
+    echo "── 6. Never stuck (T4)\n";
+    $asim = uid('Asim Tahir');
+    $tb->adjust($asim, 'late', 1500, 'proof: extra late', $actor);
+    TB::forget();
+    $as9 = $tb->month($asim, '2026-09');
+    $tl = array_values(array_filter($as9['choices']['late'], fn ($c) => $c['value'] === 'leave'));
+    ok($tl && !empty($tl[0]['disabled']) && str_contains($tl[0]['hint'], 'no leave left'), 'Asim (−1 balance): "Take leave" shown DISABLED with the reason', json_encode($tl));
+    ok(!isset($as9['confirm_map']['leave|']), 'a disabled choice has no Confirm sentence');
+    $fd = $tb->month($farooq, '2026-09');
+    ok($fd['status'] === 'decided', 'Farooq Sep decided');
 
     // Legacy guard: old-rule decide for a bank month is refused/converted
     $pay = new App\Services\HR\PayrollService();
     $r = $pay->decideLeaveAction($kanan, '2026-09', 'late_penalty', 'apply', $actor);
     ok(!$r['success'], 'old late_penalty decide refused for a bank month', $r['message'] ?? '');
+
+    echo "── 7. Traceability + phone payloads (Oct-15)\n";
+    // Undo names the MANAGER on the zeroed leave row, never the employee.
+    TB::forget();
+    $rajab = uid('Rajab Masood');
+    $tb->adjust($rajab, 'late', 1500, 'proof: a whole day of late', $actor);
+    TB::forget();
+    $hz = $tb->month($rajab, '2026-09');
+    $rh = $tb->decide($rajab, '2026-09', ['late_choice' => 'leave', 'ot_choice' => 'carry', 'expect' => $hz['expect']], $actor);
+    ok($rh['success'], 'Rajab Sep: take leave', $rh['message']);
+    $u = $tb->undo($rajab, '2026-09', $actor);
+    ok($u['success'], 'Rajab Sep undone', $u['message']);
+    $g = DB::table('t_hr_leave_grant')->where('user_id', $rajab)->where('reason', 'Time bank Sep 2026')->where('source', 'late_penalty')->first();
+    ok($g && (float) $g->days === 0.0 && (int) $g->created_by === $actor && (int) $g->created_by !== $rajab,
+       'undo: the zeroed leave row is stamped with the manager, not the employee', json_encode($g));
+    // Rider tiles carry the check STATE (the phone never guesses ✓/⚠ from words).
+    $rv = $tb->riderView($kanan);
+    $k9 = collect($rv['months'] ?? [])->firstWhere('month', '2026-09');
+    ok($k9 && array_key_exists('ot_check_ok', $k9) && $k9['ot_check_ok'] === (($tb->month($kanan, '2026-09')['cells']['extra']['check']['state'] ?? '') === 'all'),
+        'rider month: ot_check_ok = the engine check state', json_encode($k9['ot_check_ok'] ?? null));
+    // Phone employee-detail payload = the engine's cells.
+    $mgr = \App\Models\User::find($actor); Auth::setUser($mgr);
+    $rq = Illuminate\Http\Request::create('/x', 'GET', ['user_id' => $haider, 'month' => '2026-09']); $rq->setUserResolver(fn () => $mgr);
+    $det = (new App\Http\Controllers\API\RiderController())->getStoreAttendanceEmployeeDetails($rq)->getData(true);
+    ok(json_encode($det['employee']['time_bank_cells'] ?? null) === json_encode($tb->month($haider, '2026-09')['cells']),
+        'phone employee details: time_bank_cells = engine cells');
 } finally {
     DB::rollBack();
     TB::forget();

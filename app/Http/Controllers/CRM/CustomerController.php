@@ -1349,6 +1349,42 @@ class CustomerController extends Controller
             $previousType = $customer->customer_type;
             $payload = $request->all();
 
+            // Oct-2026 guard — saving a customer as SHOP deletes every pending
+            // online invoice on their orders (they leave Online Approvals and
+            // become shop-tab outstanding). On 14-Oct that ran on Irfan Burney
+            // (SH-23614, Rs 53,687) from a single mis-set dropdown and the
+            // invoice vanished without a word. So: when the flip would delete
+            // anything, refuse once and say exactly what goes, until the form
+            // comes back with confirm_shop_conversion=1. A flip that deletes
+            // nothing needs no confirmation.
+            $flippingToShop = $request->filled('customer_type')
+                && $previousType !== CustomerModel::TYPE_SHOP
+                && $request->input('customer_type') === CustomerModel::TYPE_SHOP;
+            if ($flippingToShop && !$request->boolean('confirm_shop_conversion')) {
+                $pending = $this->pendingOnlineInvoiceQuery($customer)
+                    ->join('t_crm_prod_order as o', 'o.id', '=', 't_fin_ledger.order_id')
+                    ->orderBy('t_fin_ledger.transaction_date')
+                    ->get(['t_fin_ledger.id', 't_fin_ledger.amount', 'o.order_number']);
+                if ($pending->isNotEmpty()) {
+                    $total = (float) $pending->sum('amount');
+                    $list  = $pending->map(fn ($r) => $r->order_number . ' (Rs ' . number_format((float) $r->amount) . ')')->implode(', ');
+                    $msg = 'Making this customer a Shop will remove ' . $pending->count()
+                        . ' pending online invoice' . ($pending->count() === 1 ? '' : 's')
+                        . ' worth Rs ' . number_format($total) . ' from Online Approvals: ' . $list
+                        . '. They become shop outstanding, settled by payments.';
+                    if ($request->expectsJson()) {
+                        return response()->json([
+                            'success'            => false,
+                            'needs_confirmation' => true,
+                            'message'            => $msg,
+                            'pending_count'      => $pending->count(),
+                            'pending_amount'     => $total,
+                        ], 409);
+                    }
+                    return redirect()->back()->with('error', $msg . ' Tick the confirmation to proceed.');
+                }
+            }
+
             // Guard: don't allow flipping a shop back to regular while it still
             // has in-progress (partially paid) shop orders — that would leave
             // orders mid-cycle on the wrong billing basis.
@@ -1519,6 +1555,29 @@ class CustomerController extends Controller
      * Approved invoices are left untouched — that revenue is already booked.
      * Returns the number of invoices converted.
      */
+    /**
+     * The invoice rows a regular→shop flip would take out of Online Approvals:
+     * pending / pending_l1 online invoices on this customer's live orders.
+     * ONE definition, used by the confirmation in update() and by the
+     * conversion itself, so what is shown is exactly what is removed.
+     */
+    private function pendingOnlineInvoiceQuery(CustomerModel $customer, ?array $pendingStatuses = null)
+    {
+        $pendingStatuses = $pendingStatuses ?? [
+            \App\Models\FIN\LedgerModel::STATUS_PENDING,
+            \App\Models\FIN\LedgerModel::STATUS_PENDING_L1,
+        ];
+
+        return \App\Models\FIN\LedgerModel::query()
+            ->where('t_fin_ledger.mode', \App\Models\FIN\LedgerModel::MODE_ONLINE)
+            ->where('t_fin_ledger.transaction_type', \App\Models\FIN\LedgerModel::TYPE_INVOICE)
+            ->whereIn('t_fin_ledger.approval_status', $pendingStatuses)
+            ->whereNull('t_fin_ledger.request_id')
+            ->whereIn('t_fin_ledger.order_id', function ($q) use ($customer) {
+                $q->select('id')->from('t_crm_prod_order')->where('customer_id', $customer->id);
+            });
+    }
+
     private function convertPendingOnlineInvoicesToShopFlow(CustomerModel $customer): int
     {
         $converted = 0;
@@ -1534,16 +1593,9 @@ class CustomerController extends Controller
             \App\Models\FIN\LedgerModel::STATUS_PENDING_L1,
         ];
 
-        // Pending online invoice ledger rows for this customer's orders.
-        $invoices = \App\Models\FIN\LedgerModel::query()
-            ->where('mode', \App\Models\FIN\LedgerModel::MODE_ONLINE)
-            ->where('transaction_type', \App\Models\FIN\LedgerModel::TYPE_INVOICE)
-            ->whereIn('approval_status', $pendingStatuses)
-            ->whereNull('request_id')
-            ->whereIn('order_id', function ($q) use ($customer) {
-                $q->select('id')->from('t_crm_prod_order')->where('customer_id', $customer->id);
-            })
-            ->get();
+        // Pending online invoice ledger rows for this customer's orders
+        // (same set the pre-save confirmation in update() shows the user).
+        $invoices = $this->pendingOnlineInvoiceQuery($customer, $pendingStatuses)->get();
 
         foreach ($invoices as $invoice) {
             \DB::beginTransaction();

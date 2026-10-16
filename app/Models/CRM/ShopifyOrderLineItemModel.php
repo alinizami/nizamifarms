@@ -35,7 +35,18 @@ class ShopifyOrderLineItemModel extends BaseModel
     /**
      * The accessors to append to the model's array form for mobile app compatibility
      */
-    protected $appends = ['product_name', 'title', 'unit_price_formatted', 'total_formatted'];
+    protected $appends = ['product_name', 'title', 'unit_price_formatted', 'total_formatted', 'bundle_hint'];
+
+    /**
+     * 📦 "= 3 × Chicken Samosa @ Rs 400" for a BUNDLE sku, null otherwise — what this
+     * staging line turns into when the order is accepted (App\Services\CRM\ProductBundle).
+     * Appended so every surface that serialises a staging line (web list + detail,
+     * phone list) gets it without its own lookup.
+     */
+    public function getBundleHintAttribute(): ?string
+    {
+        return \App\Services\CRM\ProductBundle::hintForLine($this->sku, $this->quantity);
+    }
 
     public function product(): BelongsTo
     {

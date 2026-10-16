@@ -297,6 +297,12 @@ class LeavePolicyService
                     'days'    => (float) $g->days,
                     'source'  => $g->source,
                     'reason'  => $g->reason,
+                    // ⏱ Oct-2026 — WHERE the leave came from, in the card's words, so a leave
+                    // history row explains itself ("Time bank Sep 2026 · taken for late").
+                    'label'   => self::grantLabel((string) $g->source, (string) $g->reason),
+                    // The month whose card produced it (time-bank rows) — surfaces link to it.
+                    'bank_month' => str_starts_with((string) $g->reason, 'Time bank ')
+                        ? date('Y-m', strtotime('1 ' . substr((string) $g->reason, 10))) : null,
                     'date'    => $g->effective_date ? substr((string) $g->effective_date, 0, 10)
                         : ($g->created_at ? substr((string) $g->created_at, 0, 10) : null),
                     'by_name' => $g->by_name,
@@ -304,6 +310,21 @@ class LeavePolicyService
         } catch (\Throwable $e) {
             return [];
         }
+    }
+
+    /** One label per leave-ledger row — same words as the time-bank card on every surface. */
+    public static function grantLabel(string $source, string $reason): string
+    {
+        if (str_starts_with($reason, 'Time bank ')) {
+            return $reason . ($source === 'late_penalty' ? ' · taken for late' : ($source === 'overtime' ? ' · given for overtime' : ''));
+        }
+        return match ($source) {
+            'overtime'      => 'From overtime' . ($reason !== '' ? ' · ' . $reason : ''),
+            'late_penalty'  => 'Taken for late' . ($reason !== '' ? ' · ' . $reason : ''),
+            'absence_cover' => $reason !== '' ? $reason : 'Covered a parked absence',
+            'half_day'      => 'Half day' . ($reason !== '' ? ' · ' . $reason : ''),
+            default         => $reason !== '' ? $reason : 'Manual adjustment',
+        };
     }
 
     /**

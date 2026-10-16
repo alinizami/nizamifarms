@@ -22346,6 +22346,14 @@ class RiderController extends Controller
                     // Carry-aware (Sep-2026): identical to the web grid and the payslip.
                     'overtime_bonus_leaves' => $otSvcDet->bonusLeavesFor($userId, $startDate, $endDate, $otMinutesDet),
                     'overtime_minutes_per_bonus' => $otSvcDet->minutesPerBonusDay(),
+                    // ⏱ Oct-2026 — the time-bank Late / Extra cells for this month (null outside the bank):
+                    // the SAME payload the month table, payroll grid and web show (TimeBankService::month).
+                    'time_bank_cells' => (function () use ($userId, $month) {
+                        try {
+                            $tb = new \App\Services\HR\TimeBankService();
+                            return $tb->covers((int) $userId, (string) $month) ? ($tb->month((int) $userId, (string) $month)['cells'] ?? null) : null;
+                        } catch (\Throwable $e) { return null; }
+                    })(),
                     'total_hours' => round($totalHours, 1),
                     'total_orders_delivered' => $totalOrdersDelivered,
                     // ⭐ NEW: Meter/Distance statistics
@@ -22686,7 +22694,9 @@ class RiderController extends Controller
                             $s = (new \App\Services\HR\TimeBankService())->month((int) $user->user_id, substr((string) $startDate, 0, 7));
                             return in_array($s['status'] ?? '', ['off', 'excluded', 'before_start'], true) ? null
                                 : ['status' => $s['status'], 'chip' => $s['chip'] ?? '', 'tone' => $s['chip_tone'] ?? 'muted',
-                                   'lines' => $s['lines'] ?? [], 'result' => $s['result'] ?? ''];
+                                   'lines' => $s['lines'] ?? [], 'result' => $s['result'] ?? '',
+                                   // Tiles round (Oct-14): the same cells the web tables draw.
+                                   'cells' => $s['cells'] ?? null];
                         } catch (\Throwable $e) { return null; }
                     })(),
                     'overtime_minutes_per_bonus' => $otSvcMob->minutesPerBonusDay(),
