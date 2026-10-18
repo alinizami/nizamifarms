@@ -926,6 +926,8 @@ class VehicleHandoverRequestService
                         }
                     }
                 } catch (\Throwable $e) { /* the warning is a kindness, never a blocker */ }
+
+                $extraNote .= $this->closeDayOnReturnedMachine((int) $r->user_id, (int) $r->vehicle_id, $meter);
             }
 
             if (!empty($result['id'])) {
@@ -951,6 +953,73 @@ class VehicleHandoverRequestService
         } catch (\Throwable $e) {
             Log::error('handover decide failed', ['id' => $id, 'error' => $e->getMessage()]);
             return $this->fail('Could not complete that handover.');
+        }
+    }
+
+    /**
+     * ⭐ A RETURN THAT LEAVES HIM WITH NOTHING ALSO CLOSES HIS DAY'S METER PAIR (owner ruling,
+     *    17-Oct-2026).
+     *
+     * ⚠⚠ THE GAP. Since the checkout dialog got its "🔁 Van wapas karein" button, a rider with no
+     *    bike of his own (Mashood) can hand the van back BEFORE pressing OUT. After approval he
+     *    holds nothing, so checkout rightly asks him for no meter — and his attendance row is left
+     *    with the van's morning reading and no end. The van's close IS recorded (release() writes
+     *    its meter log), but the fuel month summary (`FleetFuelService::dayStatus`) and the day
+     *    checks read the ATTENDANCE pair and flag the day "no end meter".
+     *    The reading he typed on the hand-back is exactly that day's closing reading, so it is
+     *    written there too. Same shape his days already had when he closed on the van first
+     *    (2-Oct, 7-Oct: meter_end = the van's close, plus the meter-log row at the same number).
+     *
+     * ⚠ Written ONLY when every one of these holds — otherwise nothing is touched:
+     *    · he holds NOTHING now (an own bike given back = he closes on that bike at OUT, as before)
+     *    · an open attendance row (checked in, not out) whose meter_end is still empty — a reading
+     *      already there is never overwritten
+     *    · its morning reading is of THIS machine: stamped to it, or unstamped (he checked in
+     *      before the van was put on his name) and the day's distance is sane (0–MAX_DAY_KM).
+     *      A day that began on another machine is a two-machine day and is left alone.
+     * ⚠ Never fatal: the hand-back is already recorded; this only tidies the report.
+     */
+    private function closeDayOnReturnedMachine(int $userId, int $vehicleId, ?int $meter): string
+    {
+        if ($meter === null || $meter <= 0) return '';
+        try {
+            if ((new VehicleResolver())->currentVehicleFor($userId) !== null) return '';
+
+            $row = DB::table('t_ops_attendance')
+                ->where('user_id', $userId)
+                ->whereIn('attendance_date', [now()->format('Y-m-d'), now()->subDay()->format('Y-m-d')])
+                // TIME / INT columns: NULL is "not yet", never ''.
+                ->whereNotNull('login_time')->whereNull('logout_time')
+                ->orderByDesc('attendance_date')->orderByDesc('id')
+                ->first();
+            if (!$row) return '';
+            if ($row->meter_end !== null) return '';
+            if ($row->meter_start === null || (int) $row->meter_start <= 0) return '';
+
+            $hasStamps = Schema::hasColumn('t_ops_attendance', 'meter_start_vehicle_id');
+            $startVid = $hasStamps && !empty($row->meter_start_vehicle_id) ? (int) $row->meter_start_vehicle_id : null;
+            if ($startVid !== null) {
+                if ($startVid !== $vehicleId) return '';
+            } else {
+                $km = $meter - (int) $row->meter_start;
+                if ($km < 0 || $km > VehicleService::MAX_DAY_KM) return '';
+            }
+
+            $upd = ['meter_end' => $meter, 'updated_at' => now()];
+            if ($hasStamps) $upd['meter_end_vehicle_id'] = $vehicleId;
+            $n = DB::table('t_ops_attendance')->where('id', $row->id)
+                ->whereNull('meter_end')        // never over a reading that landed meanwhile
+                ->update($upd);
+            if (!$n) return '';
+
+            Log::info('Hand-back closed the day\'s meter pair', [
+                'user' => $userId, 'attendance_id' => (int) $row->id,
+                'vehicle' => $vehicleId, 'meter_end' => $meter,
+            ]);
+            return ' His day\'s end meter was recorded as ' . number_format($meter) . '.';
+        } catch (\Throwable $e) {
+            Log::warning('closeDayOnReturnedMachine failed (non-fatal)', ['user' => $userId, 'error' => $e->getMessage()]);
+            return '';
         }
     }
 

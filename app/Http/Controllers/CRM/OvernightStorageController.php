@@ -339,8 +339,10 @@ class OvernightStorageController extends Controller
         $payload = ['success' => true, 'products' => $products];
 
         if ($request->boolean('all')) {
-            $payload['manual_products'] = ProductModel::where('is_active', true)
-                ->where('business_unit_id', $nfBuId)
+            // 📦 bundles are not physical packets — nothing to put in the chiller
+            $payload['manual_products'] = \App\Services\CRM\ProductBundle::excludeBundles(
+                ProductModel::where('is_active', true)->where('business_unit_id', $nfBuId)
+            )
                 ->orderBy('title')
                 ->get(['id', 'title'])
                 ->map(function ($p) {

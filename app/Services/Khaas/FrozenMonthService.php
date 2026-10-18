@@ -84,8 +84,11 @@ class FrozenMonthService
     {
         [$start, $end] = $this->window($month);
 
-        $products = ProductModel::where('business_unit_id', $businessUnitId)
-            ->where('is_active', 1)
+        // 📦 Bundles are not physical stock (their packets are the products inside),
+        // so the inventory report / month review leaves them out.
+        $products = \App\Services\CRM\ProductBundle::excludeBundles(
+            ProductModel::where('business_unit_id', $businessUnitId)->where('is_active', 1)
+        )
             ->orderBy('title')
             ->get(['id', 'title', 'featured_image', 'total_inventory', 'product_type', 'price_min', 'price_max']);
 

@@ -87,6 +87,35 @@ final class ProductBundle
         return self::$bundleIds;
     }
 
+    /** @return int[] every bundle product id */
+    public static function bundleProductIds(): array
+    {
+        return array_keys(self::bundleIds());
+    }
+
+    /**
+     * 📦 Leave bundles out of an INVENTORY-style product list (Oct-16, owner): a bundle
+     * is not a physical pack — its stock and demand live on the products inside — so it
+     * must not appear on stock / storage / production screens. The web Products page,
+     * the phone's ordinary Products list, product search and billing keep them.
+     * Never throws: if anything goes wrong the list is returned unfiltered.
+     *
+     * @param \Illuminate\Database\Eloquent\Builder|\Illuminate\Database\Query\Builder $query
+     * @param string $column the product id column in that query ('id', 'p.id', …)
+     */
+    public static function excludeBundles($query, string $column = 'id')
+    {
+        try {
+            $ids = self::supported() ? self::bundleProductIds() : [];
+            if ($ids) {
+                $query->whereNotIn($column, $ids);
+            }
+        } catch (\Throwable $e) {
+            Log::warning('ProductBundle: excludeBundles skipped', ['error' => $e->getMessage()]);
+        }
+        return $query;
+    }
+
     /** Is this product set up as a bundle? */
     public static function isBundle(?ProductModel $product): bool
     {

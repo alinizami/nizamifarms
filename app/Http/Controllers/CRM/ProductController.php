@@ -831,7 +831,15 @@ class ProductController extends Controller
     {
         // Get products with variants and business unit
         $query = ProductModel::with(['variants', 'businessUnit']);
-        
+
+        // 📦 The phone's frozen / store inventory screens (Khaas Shop Inventory, frozen
+        // Products, storage picker) list ONE business unit's products — bundles are not
+        // physical stock, so they stay out there. The web Products page and the phone's
+        // ordinary Products list (no business unit) still show them.
+        if ($request->is('api/*') && $request->filled('business_unit_id')) {
+            \App\Services\CRM\ProductBundle::excludeBundles($query);
+        }
+
         // Add search functionality
         if ($request->has('search') && $request->search) {
             $search = $request->search;

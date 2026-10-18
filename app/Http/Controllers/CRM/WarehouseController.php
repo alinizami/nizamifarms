@@ -1947,9 +1947,11 @@ class WarehouseController extends Controller
     {
         try {
             // Get NF (BU 1) active products
-            $products = ProductModel::where('business_unit_id', 1)
-                ->where('is_active', 1)
-                ->where('status', 'active')
+            $products = \App\Services\CRM\ProductBundle::excludeBundles( // 📦 not physical stock
+                ProductModel::where('business_unit_id', 1)
+                    ->where('is_active', 1)
+                    ->where('status', 'active')
+            )
                 ->with('variants:id,product_id,title,price,sku')
                 ->orderBy('title')
                 ->get(['id', 'title', 'featured_image', 'product_type', 'vendor']);
@@ -2892,8 +2894,10 @@ class WarehouseController extends Controller
             }
             $endDate = $startDate->copy()->endOfMonth();
 
-            $productIds = ProductModel::where('business_unit_id', $businessUnitId)
-                ->where('is_active', 1)
+            $productIds = \App\Services\CRM\ProductBundle::excludeBundles( // 📦 not physical stock
+                ProductModel::where('business_unit_id', $businessUnitId)
+                    ->where('is_active', 1)
+            )
                 ->pluck('id')
                 ->toArray();
 
@@ -3266,11 +3270,13 @@ class WarehouseController extends Controller
                 return response()->json(['success' => false, 'message' => 'business_unit_id required'], 400);
             }
 
-            // All active Khaas products
-            $allProducts = DB::table('t_crm_prod_product')
-                ->where('business_unit_id', $businessUnitId)
-                ->where('is_active', 1)
-                ->where('status', 'active')
+            // All active Khaas products (📦 bundles aren't made — their products inside are)
+            $allProducts = \App\Services\CRM\ProductBundle::excludeBundles(
+                DB::table('t_crm_prod_product')
+                    ->where('business_unit_id', $businessUnitId)
+                    ->where('is_active', 1)
+                    ->where('status', 'active')
+            )
                 ->select('id', 'title')
                 ->orderBy('title')
                 ->get();

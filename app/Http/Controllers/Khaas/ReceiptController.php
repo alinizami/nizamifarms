@@ -79,6 +79,9 @@ class ReceiptController extends Controller
                 'The bill reader is not set up correctly. Tell Shabib, and type this bill in by hand for now.' . $saved,
             ReceiptExtractionService::FAIL_NO_IMAGE =>
                 'The photo did not arrive properly. Take it again.',
+            ReceiptExtractionService::FAIL_DERAILED =>
+                'The bill reader lost its place on this bill and did not read it through. Try once more, '
+                . 'or type the bill in by hand.' . $saved,
             default =>
                 'The reader could not make out this bill. Lay the whole slip flat, fill the frame with it '
                 . 'and try again — or type it in by hand.' . $saved,
@@ -260,12 +263,14 @@ class ReceiptController extends Controller
      *   "POTATO LOOSE" for "Potato (Aaloo)" — a whole word in common, three characters
      *   apart. Words are what these names have in common; spelling is not.
      */
-    private function closestProducts(string $rawName, array $catalogue): array
+    private function closestProducts(string $rawName, array $catalogue, array $linkedIds = []): array
     {
         // ⚠ Unique words only — "ONION ONION" must not score a product twice.
+        // ⚠⚠ Oct-17: a size token ("100g", "50gm", "1ltr") is NOT a word — see
+        //    PurchaseLogService::isSizeWord. It made "Sonf 100g" suggest Bari Elaichi 100gm.
         $words = fn (string $s) => array_values(array_unique(array_filter(
             preg_split('/[^\p{L}\p{N}]+/u', mb_strtolower($s)) ?: [],
-            fn ($w) => mb_strlen($w) >= 3
+            fn ($w) => mb_strlen($w) >= 3 && !PurchaseLogService::isSizeWord($w)
         )));
 
         $want = $words($rawName);
@@ -309,7 +314,12 @@ class ReceiptController extends Controller
             }
         }
 
+        // ⭐ Oct-17 (owner): on equal evidence, a product LINKED to a recipe ingredient comes
+        //   before one that is not — the Frozen bill is for the kitchen, and a linked pick
+        //   feeds the recipe costs; an unlinked one is money only.
+        $linked = array_fill_keys(array_map('intval', $linkedIds), true);
         usort($scored, fn ($a, $b) => $b['score'] <=> $a['score']
+            ?: (int) isset($linked[(int) $b['product']->id]) <=> (int) isset($linked[(int) $a['product']->id])
             ?: strcmp((string) $a['product']->product_name, (string) $b['product']->product_name));
 
         return array_map(fn ($s) => [
@@ -399,6 +409,19 @@ class ReceiptController extends Controller
         $aiCount = 0;      // lines with a product suggestion (tap to confirm)
         $aiNewCount = 0;   // lines not on the list, with an ingredient guess (add as new)
 
+        // ⭐ Oct-17 (owner): the products already LINKED to a recipe ingredient, by ingredient.
+        //   A line the reader could only name as an ingredient ("Cardamom Black" → Bari
+        //   Elaichi) is offered the vendor product that feeds that ingredient BEFORE "add it
+        //   as a new product" — the kitchen wants the linked one, not a second unlinked twin.
+        $linkedIds = [];
+        $productsByIngredient = [];
+        foreach ($ingredientCols as $pid => $cols) {
+            if ((int) ($cols->ingredient_id ?? 0) > 0 && isset($catalogueById[(int) $pid])) {
+                $linkedIds[] = (int) $pid;
+                $productsByIngredient[(int) $cols->ingredient_id][] = (int) $pid;
+            }
+        }
+
         $lines = [];
         foreach ($read['lines'] as $raw) {
             $match = null;
@@ -464,7 +487,21 @@ class ReceiptController extends Controller
                     ];
                 } elseif ($aiDeals && (int) ($raw['ai_ingredient'] ?? 0)) {
                     $ai = $ingredients->get((int) $raw['ai_ingredient']);
-                    if ($ai && !$ai->isMeat() && (int) $ai->business_unit_id === (int) $vendor->business_unit_id) {
+                    $linkedHere = $productsByIngredient[(int) $raw['ai_ingredient']] ?? [];
+                    if ($linkedHere) {
+                        // ⭐ Oct-17: the ingredient already HAS a product on this vendor — offer that
+                        //   product (the best-worded one when there are several, e.g. two garlics),
+                        //   not a new twin. Shown as the same "Yes, use it" the person already knows.
+                        $pick = $this->closestProducts((string) $raw['raw_name'],
+                            array_values(array_intersect_key($catalogueById, array_flip($linkedHere))), $linkedHere);
+                        $ap = $catalogueById[(int) ($pick[0]['id'] ?? $linkedHere[0])];
+                        $aiProduct = [
+                            'id'   => (int) $ap->id,
+                            'name' => (string) $ap->product_name,
+                            'unit' => $ap->unit ?? null,
+                            'rate' => (float) ($ap->rate_per_unit ?? 0),
+                        ];
+                    } elseif ($ai && !$ai->isMeat() && (int) $ai->business_unit_id === (int) $vendor->business_unit_id) {
                         $aiIngredient = ['id' => (int) $ai->id, 'name' => $ai->name, 'base_unit' => $ai->base_unit];
                     }
                 }
@@ -475,7 +512,7 @@ class ReceiptController extends Controller
                 }
             }
 
-            $wordSuggestions = $match ? [] : $this->closestProducts((string) $raw['raw_name'], $catalogue);
+            $wordSuggestions = $match ? [] : $this->closestProducts((string) $raw['raw_name'], $catalogue, $linkedIds);
             if ($aiProduct) {
                 // shown once, as the reader's suggestion — not again in "Did you mean"
                 $wordSuggestions = array_values(array_filter($wordSuggestions, fn ($s) => $s['id'] !== $aiProduct['id']));

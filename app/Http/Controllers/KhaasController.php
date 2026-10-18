@@ -64,7 +64,10 @@ class KhaasController extends Controller
 
         // Get summary stats
         $vendorCount = VendorModel::where('business_unit_id', $khaasBU->id)->where('is_active', 1)->count();
-        $productCount = ProductModel::where('business_unit_id', $khaasBU->id)->where('is_active', 1)->count();
+        // 📦 bundles are not physical products — not counted
+        $productCount = \App\Services\CRM\ProductBundle::excludeBundles(
+            ProductModel::where('business_unit_id', $khaasBU->id)->where('is_active', 1)
+        )->count();
         
         $totalVendorBalance = VendorModel::where('business_unit_id', $khaasBU->id)
             ->where('is_active', 1)
@@ -234,6 +237,8 @@ class KhaasController extends Controller
         // Build product query filtered by Khaas BU
         $query = ProductModel::where('business_unit_id', $khaasBU->id)
             ->with(['variants']);
+        // 📦 Inventory page: bundles are not physical stock (they stay on /products)
+        \App\Services\CRM\ProductBundle::excludeBundles($query);
 
         // Search filter
         if ($request->has('search') && $request->search) {

@@ -394,8 +394,11 @@ class RecipeService
     /** Which products have a recipe and which do not — drives the "no recipe" chips. */
     public function coverage(int $businessUnitId = self::FROZEN_BU): array
     {
-        $products = ProductModel::where('business_unit_id', $businessUnitId)
-            ->where('is_active', 1)
+        // 📦 A bundle is never cooked — its products inside carry the recipes — so it
+        // must not show up as "no recipe".
+        $products = \App\Services\CRM\ProductBundle::excludeBundles(
+            ProductModel::where('business_unit_id', $businessUnitId)->where('is_active', 1)
+        )
             ->orderBy('title')
             ->get(['id', 'title']);
 

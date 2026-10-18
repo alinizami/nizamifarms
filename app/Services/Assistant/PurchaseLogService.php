@@ -556,7 +556,30 @@ class PurchaseLogService
     private function words(string $s): array
     {
         $parts = preg_split('/[^\p{L}]+/u', mb_strtolower($s), -1, PREG_SPLIT_NO_EMPTY) ?: [];
-        return array_values(array_unique(array_filter($parts, fn($w) => mb_strlen($w) >= 2)));
+        return array_values(array_unique(array_filter(
+            $parts,
+            fn($w) => mb_strlen($w) >= 2 && !self::isSizeWord($w)
+        )));
+    }
+
+    /**
+     * ⚠⚠ Oct-17-2026: a SIZE is not a NAME. "Non-Woven Bag 50gm" auto-matched "Long 50gm"
+     *    (cloves) on the one shared word "gm", and the card showed the bag as a certain
+     *    match. "Sonf 100g" drew "Bari Elaichi 100gm" as a did-you-mean the same way. So
+     *    unit words — and digits-plus-unit tokens from a matcher that keeps digits — count
+     *    for nothing in BOTH matchers (this one and the receipt card's did-you-mean).
+     */
+    public static function isSizeWord(string $w): bool
+    {
+        $w = mb_strtolower(trim($w));
+        if ($w === '') {
+            return true;
+        }
+        return (bool) preg_match(
+            '/^(?:\d+(?:\.\d+)?(?:g|gm|gms|gram|grams|kg|kgs|mg|ml|l|lt|ltr|litre|liter|pcs|pc|pk|pkt|oz|s)?'
+            . '|g|gm|gms|gram|grams|kg|kgs|mg|ml|lt|ltr|litre|liter|pcs|pc|pk|pkt|oz)$/u',
+            $w
+        );
     }
 
     /** Line count / quantity / total of an existing purchase, for comparison. */

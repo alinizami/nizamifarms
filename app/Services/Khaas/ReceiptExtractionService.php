@@ -34,20 +34,32 @@ class ReceiptExtractionService
     /**
      * 🤖 Sep-27 (owner): "for unmatched items use the AI to suggest which of OUR products it
      * is". The vendor's product list — and, for a Frozen vendor, the recipe ingredients —
-     * ride along IN THE SAME CALL that reads the slip (no second call, no extra credits
-     * beyond a few hundred input tokens), and the model answers per line with one of OUR
-     * codes or "NONE".
+     * are matched against the printed names, and the model answers per line with one of
+     * OUR codes or "NONE".
      *
-     * ⚠⚠ The answer is an ENUM of the codes we sent: it cannot invent a product, and a
-     *    short code cannot fall into the digit loop that NUMBER fields did. The server
-     *    checks every code against the list again anyway (cleanLines), and a person taps
-     *    to confirm every suggestion — nothing here is ever applied on its own.
+     * ⚠⚠ Oct-17-2026: the lists used to ride IN THE SAME CALL that reads the photo, as an
+     *    enum on every line. On Qasim's 26-line Imtiaz slip that enum made the model lose
+     *    its place at the FIRST price, 4 times out of 4; without it the same photo read
+     *    26/26. So the photo is now read with the plain schema, and the matching is a
+     *    SECOND, TEXT-ONLY call (matchLines) — text calls have never stalled (8/8, ~1.3 s
+     *    in the Sep tests). A failed matching call costs the suggestions, never the read.
+     *
+     * ⚠⚠ The answer is still an ENUM of the codes we sent: it cannot invent a product. The
+     *    server checks every code against the list again anyway (hintId), and a person
+     *    taps to confirm every suggestion — nothing here is ever applied on its own.
      */
     private const MAX_HINT_PRODUCTS    = 150;
     private const MAX_HINT_INGREDIENTS = 120;
 
     /** @var array{products: array<int,array{id:int,name:string,unit:?string}>, ingredients: array<int,array{id:int,name:string}>}|null */
     private ?array $hints = null;
+
+    /** The matching call: a short list of names in, short codes out. */
+    private const MATCH_MAX_OUTPUT_TOKENS = 2048;
+    private const MATCH_TIMEOUT           = 15;
+
+    /** Whether the last extract()'s matching call answered — so "no match" can be told apart from "never asked". */
+    private bool $matched = false;
 
     /**
      * What this vendor sells (and, for Frozen, what the kitchen cooks with) — sent with the
@@ -74,6 +86,19 @@ class ReceiptExtractionService
     public const FAIL_NO_CREDIT  = 'no_credit';   // prepaid balance used up
     public const FAIL_REFUSED    = 'refused';     // 400/401/403/404 — a setup problem
     public const FAIL_UNREADABLE = 'unreadable';  // empty / blocked / not JSON
+    /**
+     * ⚠⚠ Oct-17-2026 — THE QUIET FAILURE ("the scanner only shows a few products"): the
+     *    model lost its place at the FIRST line's price, wrote its own reasoning INTO the
+     *    string ("195.00Pool Number field values like: 195.00 string formatted? Wait
+     *    schema…"), closed the array after ONE line and finished with STOP. Valid JSON, so
+     *    every check passed: toAmount() pulled 195 out of the junk, grand_total was null so
+     *    the arithmetic check had nothing to compare, and the card showed one line of a
+     *    26-line slip with no warning. Reproduced 4/4 WITH the product/ingredient lists in
+     *    the schema and 0/1 without (26/26 lines). So a derailed reply is a failed attempt
+     *    and gets the one retry (nudged temperature), exactly like the output-cap path —
+     *    and the lists no longer ride in the photo call at all (see matchLines).
+     */
+    public const FAIL_DERAILED   = 'derailed';    // valid JSON, but the model lost its place
 
     /**
      * ⚠⚠ THE PRODUCTION FAILURE (Sep-2026): with `NUMBER` fields in the schema, Gemini
@@ -137,26 +162,27 @@ class ReceiptExtractionService
         $response = null;
         $parsed   = null;
         $text     = null;
-        $rejected = false;   // the previous try was refused outright (C15) — nothing was generated
+        $this->matched = false;
 
         while ($attempt < self::MAX_ATTEMPTS) {
             $attempt++;
 
+            // ⚠⚠ The photo call carries NO product list and NO enum (Oct-17, see the class
+            //    comment): the plain prompt and the plain schema, whatever hints are set.
             $payload = [
                 'contents' => [[
                     'parts' => [
-                        ['text' => $this->prompt() . $this->hintsPrompt()],
+                        ['text' => $this->prompt()],
                         ['inline_data' => ['mime_type' => $mime, 'data' => base64_encode($bytes)]],
                     ],
                 ]],
                 'generationConfig' => [
                     // A retry nudges the temperature: the digit loop is a decoding rut, and
-                    // an identical request at 0 is the likeliest way back into it. A retry after
-                    // a refused (400) request generated nothing, so there is no rut: it stays at 0.
-                    'temperature'      => ($attempt === 1 || $rejected) ? 0 : 0.2,
+                    // an identical request at 0 is the likeliest way back into it.
+                    'temperature'      => $attempt === 1 ? 0 : 0.2,
                     'maxOutputTokens'  => self::MAX_OUTPUT_TOKENS,
                     'responseMimeType' => 'application/json',
-                    'responseSchema'   => $this->responseSchema(),
+                    'responseSchema'   => $this->baseSchema(),
                     // Reading a printed list is mechanical; thought tokens are billed as
                     // output and buy nothing here. Same setting the Assistant uses.
                     'thinkingConfig'   => ['thinkingBudget' => 0],
@@ -186,14 +212,8 @@ class ReceiptExtractionService
                 if ($reason === self::FAIL_BUSY) {
                     continue;
                 }
-                // 🤖 C15: a 400 on a read that carried our lists is most likely the lists (an
-                //    enum the API would not take). The one retry reads the slip WITHOUT them —
-                //    the bill still reads, it just has no suggestions. A plain read's 400 is
-                //    still final, exactly as before.
-                if ($status === 400 && $this->dropHintsForRetry($attempt, 'HTTP 400')) {
-                    $rejected = true;
-                    continue;
-                }
+                // (C15's "retry a 400 without the lists" is gone with the lists: the photo
+                //  call no longer carries anything a 400 could be about.)
                 return null; // no credit / refused: asking again changes nothing
             }
 
@@ -206,10 +226,7 @@ class ReceiptExtractionService
                     'tail'    => mb_substr((string) $text, -60),
                 ]);
                 $this->lastFailure = $this->failure(self::FAIL_LOOPED, 'output cap reached', 200, $started, $attempt);
-                // 🤖 C15: a long bill plus our lists can run out of room; the retry (which
-                //    happened anyway) now goes without the lists. Same cap, same count.
-                $this->dropHintsForRetry($attempt, 'MAX_TOKENS');
-                continue;
+                continue; // one more try at a nudged temperature; same cap, same count
             }
 
             if (!$text) {
@@ -226,6 +243,19 @@ class ReceiptExtractionService
                 continue;
             }
 
+            // 🤖 Oct-17: a reply that parses but is not a reading of the slip (see
+            //    FAIL_DERAILED). One more try at the nudged temperature.
+            if (($why = $this->derailed($parsed)) !== null) {
+                Log::warning('ReceiptExtraction: reply derailed (model lost its place)', [
+                    'attempt' => $attempt,
+                    'why'     => $why,
+                    'lines'   => is_array($parsed['lines'] ?? null) ? count($parsed['lines']) : 0,
+                ]);
+                $this->lastFailure = $this->failure(self::FAIL_DERAILED, $why, 200, $started, $attempt);
+                $parsed = null;
+                continue;
+            }
+
             $this->lastFailure = null;
             break;
         }
@@ -236,11 +266,28 @@ class ReceiptExtractionService
 
         $usage = $response->json('usageMetadata') ?: [];
 
+        // The one line a successful read leaves behind. Before Oct-17 only failures were
+        // logged, so a "successful" one-line read of a 26-line slip left no trace at all.
+        Log::info('ReceiptExtraction: read ok', [
+            'attempt'    => $attempt,
+            'lines'      => is_array($parsed['lines'] ?? null) ? count($parsed['lines']) : 0,
+            'tokens_in'  => (int) ($usage['promptTokenCount'] ?? 0),
+            'tokens_out' => (int) ($usage['candidatesTokenCount'] ?? 0),
+            'seconds'    => round(microtime(true) - $started, 1),
+        ]);
+
+        $lines = $this->cleanLines($parsed['lines'] ?? []);
+        // 🤖 The second, text-only call: which of OUR products each printed line is.
+        //    Never a reason for the read to fail — see matchLines().
+        if ($this->hints && $lines) {
+            $lines = $this->matchLines($lines, $apiKey, $endpoint);
+        }
+
         return [
             'store_name'     => $this->clean($parsed['store_name'] ?? null),
             'receipt_no'     => $this->clean($parsed['receipt_no'] ?? null),
             'receipt_date'   => $this->cleanDate($parsed['receipt_date'] ?? null),
-            'lines'          => $this->cleanLines($parsed['lines'] ?? []),
+            'lines'          => $lines,
             'subtotal'       => $this->toAmount($parsed['subtotal'] ?? null),
             'discount_total' => $this->toAmount($parsed['discount_total'] ?? null),
             'grand_total'    => $this->toAmount($parsed['grand_total'] ?? null),
@@ -250,11 +297,99 @@ class ReceiptExtractionService
             'model'          => $model,
             'tokens_in'      => (int) ($usage['promptTokenCount'] ?? 0),
             'tokens_out'     => (int) ($usage['candidatesTokenCount'] ?? 0),
-            // 🤖 whether the reader was shown our lists — so "no match" can be told apart
-            //    from "never asked"
-            'hinted_products'    => (bool) ($this->hints['products'] ?? false),
-            'hinted_ingredients' => (bool) ($this->hints['ingredients'] ?? false),
+            // 🤖 whether the matching call was asked AND answered — so "no match" can be
+            //    told apart from "never asked" (and from "asked, but the call failed")
+            'hinted_products'    => $this->matched && (bool) ($this->hints['products'] ?? false),
+            'hinted_ingredients' => $this->matched && (bool) ($this->hints['ingredients'] ?? false),
         ];
+    }
+
+    /**
+     * The second call: the printed names (text only, no photo) and OUR lists go to the
+     * model, which answers per line with one of our codes or NONE. One attempt, short
+     * timeout, small output cap. On ANY failure the lines come back exactly as they were:
+     * a bill without suggestions is a bill a person matches by hand, which is what every
+     * suggestion ends in anyway.
+     *
+     * @param array<int,array> $lines  cleanLines() output
+     * @return array<int,array>        the same lines, ai_match / ai_ingredient filled where answered
+     */
+    private function matchLines(array $lines, string $apiKey, string $endpoint): array
+    {
+        $started = microtime(true);
+        try {
+            $listed = "PRINTED LINES of a shop receipt from Pakistan, numbered:\n";
+            foreach ($lines as $i => $l) {
+                $listed .= ($i + 1) . '. ' . mb_substr((string) $l['raw_name'], 0, 80) . "\n";
+            }
+            $payload = [
+                'contents' => [['parts' => [['text' => $listed . $this->hintsPrompt()]]]],
+                'generationConfig' => [
+                    'temperature'      => 0,
+                    'maxOutputTokens'  => self::MATCH_MAX_OUTPUT_TOKENS,
+                    'responseMimeType' => 'application/json',
+                    'responseSchema'   => $this->matchSchema(),
+                    'thinkingConfig'   => ['thinkingBudget' => 0],
+                ],
+            ];
+
+            $response = Http::timeout(self::MATCH_TIMEOUT)
+                ->withQueryParameters(['key' => $apiKey])
+                ->post($endpoint, $payload);
+
+            if (!$response->successful()) {
+                Log::warning('ReceiptExtraction: matching call non-200 (no suggestions)', [
+                    'status' => $response->status(),
+                    'body'   => $this->redactKey(mb_substr($response->body(), 0, 200)),
+                ]);
+                return $lines;
+            }
+            $finish = (string) data_get($response->json(), 'candidates.0.finishReason', '');
+            $text   = (string) data_get($response->json(), 'candidates.0.content.parts.0.text', '');
+            $parsed = $text !== '' ? json_decode($text, true) : null;
+            if ($finish === 'MAX_TOKENS' || !is_array($parsed) || !is_array($parsed['matches'] ?? null)) {
+                Log::warning('ReceiptExtraction: matching reply unusable (no suggestions)', [
+                    'finish' => $finish,
+                    'text'   => mb_substr($text, 0, 200),
+                ]);
+                return $lines;
+            }
+
+            $filled = 0;
+            foreach ($parsed['matches'] as $m) {
+                if (!is_array($m)) {
+                    continue;
+                }
+                $n = (int) preg_replace('/\D+/', '', (string) ($m['line'] ?? ''));
+                if ($n < 1 || $n > count($lines) || !isset($lines[$n - 1])) {
+                    continue; // a line number we never sent
+                }
+                $p = $this->hintId($m['match'] ?? null, 'P');
+                $i = $this->hintId($m['ingredient'] ?? null, 'I');
+                $lines[$n - 1]['ai_match']      = $p;
+                $lines[$n - 1]['ai_ingredient'] = $i;
+                if ($p !== null || $i !== null) {
+                    $filled++;
+                }
+            }
+            $this->matched = true;
+
+            $usage = $response->json('usageMetadata') ?: [];
+            Log::info('ReceiptExtraction: match ok', [
+                'lines'      => count($lines),
+                'suggested'  => $filled,
+                'tokens_in'  => (int) ($usage['promptTokenCount'] ?? 0),
+                'tokens_out' => (int) ($usage['candidatesTokenCount'] ?? 0),
+                'seconds'    => round(microtime(true) - $started, 1),
+            ]);
+            return $lines;
+        } catch (\Throwable $e) {
+            // ⚠ SECURITY: same redaction as the photo call — the message can carry ?key=.
+            Log::warning('ReceiptExtraction: matching call failed (no suggestions)', [
+                'error' => mb_substr($this->redactKey($e->getMessage()), 0, 160),
+            ]);
+            return $lines;
+        }
     }
 
     /**
@@ -355,7 +490,8 @@ TXT;
                     . (!empty($p['unit']) ? ' (bought per ' . $name($p['unit']) . ')' : '') . "\n";
             }
             $out .= <<<'TXT'
-For EVERY line also return "match": the code of the product on this list that the line is
+For EVERY numbered line return one object with "line" (its number as printed above) and
+"match": the code of the product on this list that the line is
 the SAME ITEM as — allowing for brand names ("MAGGI CHICKEN CUBES" is chicken cubes), Urdu
 or Roman-Urdu names ("NAMAK" is salt, "CHEENI" is sugar, "ANDAY" are eggs), abbreviations
 ("CHKN", "CRM CHES") and pack sizes. Return "NONE" when no product on the list is the same
@@ -370,12 +506,37 @@ TXT;
                 $out .= 'I' . (int) $i['id'] . ': ' . $name($i['name']) . "\n";
             }
             $out .= <<<'TXT'
-For EVERY line also return "ingredient": the code of the ingredient the item IS, by the
-same rule — the same thing, not something related — or "NONE" for anything else
-(a bag, a charge, a cleaning product, or anything not on the list).
+For EVERY numbered line also return "ingredient" (with its "line" number): the code of the
+ingredient the item IS, by the same rule — the same thing, not something related — or
+"NONE" for anything else (a bag, a charge, a cleaning product, or anything not on the list).
 TXT;
         }
-        return $out;
+        return $out . "\nReturn exactly one object per numbered line, in order.";
+    }
+
+    /**
+     * The matching call's schema: one object per printed line — its number and OUR codes.
+     * The codes are an enum of exactly what we sent (plus NONE). Only when a list exists.
+     */
+    private function matchSchema(): array
+    {
+        $props = ['line' => ['type' => 'STRING']];
+        foreach (['match' => 'P', 'ingredient' => 'I'] as $field => $kind) {
+            $codes = $this->hintCodes($kind);
+            if ($codes) {
+                $props[$field] = ['type' => 'STRING', 'format' => 'enum', 'enum' => $codes];
+            }
+        }
+        return [
+            'type'       => 'OBJECT',
+            'properties' => [
+                'matches' => [
+                    'type'  => 'ARRAY',
+                    'items' => ['type' => 'OBJECT', 'properties' => $props, 'required' => ['line']],
+                ],
+            ],
+            'required' => ['matches'],
+        ];
     }
 
     /** The codes the reader may answer with — exactly the ones sent, plus NONE. */
@@ -394,23 +555,8 @@ TXT;
     /**
      * ⚠⚠ Every amount is a STRING on purpose — see MAX_OUTPUT_TOKENS. `NUMBER` is what
      *    let the model loop on digits. toAmount() reads the strings back.
+     * ⚠⚠ No product enum here, ever — that is matchSchema(), in its own call (Oct-17).
      */
-    private function responseSchema(): array
-    {
-        $schema = $this->baseSchema();
-        // 🤖 Only when there is a list to match against: an enum of OUR codes, so the
-        //    answer can be nothing else.
-        foreach (['match' => 'P', 'ingredient' => 'I'] as $field => $kind) {
-            $codes = $this->hintCodes($kind);
-            if ($codes) {
-                $schema['properties']['lines']['items']['properties'][$field] = [
-                    'type' => 'STRING', 'format' => 'enum', 'enum' => $codes,
-                ];
-            }
-        }
-        return $schema;
-    }
-
     private function baseSchema(): array
     {
         return [
@@ -558,18 +704,47 @@ TXT;
     }
 
     /**
-     * 🤖 C15 (Sep-29): forget the product/ingredient lists for the rest of this read, when
-     * there are lists and a retry is still left. True when the next attempt will go without
-     * them. The attempt count is unchanged (MAX_ATTEMPTS), and so is the output cap.
+     * Why a parsed reply is NOT a reading of the slip, or null when it looks like one.
+     * Three signs, each seen on Qasim's Oct-17 slip or implied by it:
+     *  - no lines at all;
+     *  - prose inside a number — a run of three or more letters once the currency word
+     *    and separators are gone ("195.00Pool Number field values like…"). Two letters
+     *    ("2.00 kg") stay allowed: toAmount() has always read those;
+     *  - fewer than three lines with no printed total and no real confidence — a reply
+     *    that stopped early with nothing to check it against. A genuine two-line slip
+     *    with a readable total is untouched; one without it costs one more read.
      */
-    private function dropHintsForRetry(int $attempt, string $why): bool
+    private function derailed(array $parsed): ?string
     {
-        if (!$this->hints || $attempt >= self::MAX_ATTEMPTS) {
-            return false;
+        $lines = $parsed['lines'] ?? null;
+        if (!is_array($lines) || count($lines) === 0) {
+            return 'no lines';
         }
-        Log::warning('ReceiptExtraction: retrying without the product list', ['attempt' => $attempt, 'why' => $why]);
-        $this->hints = null;
-        return true;
+
+        foreach ($lines as $i => $l) {
+            if (!is_array($l)) {
+                continue;
+            }
+            foreach (['qty', 'unit_price', 'line_total', 'discount'] as $f) {
+                $v = $l[$f] ?? null;
+                if (!is_string($v)) {
+                    continue;
+                }
+                $s = preg_replace('/^(?:rs\.?|pkr)\s*/i', '', trim($v));
+                $s = str_replace([',', ' '], '', $s);
+                if (preg_match('/[A-Za-z]{3,}/', $s)) {
+                    return sprintf('text inside %s of line %d: %s', $f, $i + 1, mb_substr($v, 0, 60));
+                }
+            }
+        }
+
+        $conf = $parsed['confidence'] ?? '';
+        $confident = in_array($conf, ['medium', 'high'], true) || (is_numeric($conf) && (float) $conf >= 0.5);
+        if (count($lines) < 3 && $this->toAmount($parsed['grand_total'] ?? null) === null && !$confident) {
+            return 'only ' . count($lines) . ' line(s), no total, low confidence';
+        }
+
+        return null;
     }
 
     private function reasonForStatus(int $status, string $body): string
