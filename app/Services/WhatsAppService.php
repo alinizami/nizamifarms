@@ -1195,8 +1195,14 @@ class WhatsAppService
             // customer, stamp replied_at on any active campaign rows where the
             // customer was already sent a message (within that campaign's
             // tracking window). Non-fatal on any error.
+            //
+            // Oct-2026 owner ruling: a button TAP (e.g. the frozen campaign's
+            // "Menu") is NOT a reply — the system answers it, and the campaign
+            // screen shows taps on their own ("Tapped") from the chat log.
+            // Reactions DO count as a reply. CampaignStatsService::engagementMap
+            // applies the same rule, so the column and the screen agree.
             try {
-                if ($conversation->customer_id) {
+                if ($conversation->customer_id && !in_array($type, ['button', 'interactive'], true)) {
                     $this->stampCampaignReplies((int) $conversation->customer_id);
                 }
             } catch (\Exception $campaignErr) {

@@ -1846,52 +1846,17 @@ class ExecutiveClosingService
     // =====================================================================
 
     /**
-     * product_type → display category. The catalog's product_type mixes real
-     * categories (Beef, Chicken) with cut-level types (Back Chops, Raan &
-     * Dasti…), so the tab groups through this map WITHOUT touching the catalog.
-     * Unmapped types pass through under their own name — a new type stays
-     * visible instead of hiding in Others — and every drill shows the raw type,
-     * so a wrong bucket is easy to spot and a one-line fix here (owner review
-     * pending — ruling P-R1). Keys are entity-DECODED ("&", not "&amp;").
+     * product_type → display category. The map itself moved to
+     * ProductCategoryRollup (Oct-2026) so campaign tracking groups products
+     * exactly the way this tab does — edit it THERE, never fork it here.
+     * Every drill still shows the raw type, so a wrong bucket is easy to spot
+     * (owner review pending — ruling P-R1).
      */
-    private const CATEGORY_ROLLUP = [
-        'Beef' => 'Beef', 'Boneless LEAN Beef' => 'Beef',
-        'Bihari & Pasanday' => 'Beef', 'Steaks' => 'Beef',
-        'Mutton' => 'Mutton', 'Lean Whole/Half Bakra' => 'Mutton',
-        'Whole/Half Bakra' => 'Mutton', 'Raan & Dasti Lean' => 'Mutton',
-        'Raan & Dasti' => 'Mutton', 'Raan Choice Lean' => 'Mutton',
-        'Raan Choice' => 'Mutton', 'Back Chops (Puth)' => 'Mutton',
-        'Front Chops' => 'Mutton', 'Boneless' => 'Mutton', 'Lean Meat' => 'Mutton',
-        'Whole LEAN Meat Cut' => 'Mutton', 'Whole Meat Cut' => 'Mutton',
-        'Mix' => 'Mutton', 'Mix Lean' => 'Mutton', 'Lamb' => 'Mutton',
-        'Chicken' => 'Chicken', 'Boneless LEAN Chicken' => 'Chicken',
-        'Boneless Chicken' => 'Chicken', 'Thigh LEAN' => 'Chicken',
-        'Thigh' => 'Chicken', 'LEAN Drumsticks' => 'Chicken',
-        'Drumsticks' => 'Chicken', 'Wings' => 'Chicken',
-        'Minced (Qeema)' => 'Minced (Qeema)',
-        'Paaye' => 'Paaye',
-        'Khaas' => 'Khaas · Frozen', 'Table Talk' => 'Khaas · Frozen',
-        'Sadqa' => 'Sadqa & Aqeeqa',
-        'Dog Food' => 'Dog Food',
-        'Others' => 'Others',
-        'Qurbani 2026' => 'Qurbani',
-        // "Qurbani 2023" is a STALE type shared by two very different things:
-        // the Aqeeqa listings — which are what actually sells on regular orders
-        // (verified Jul-2026) — and three dead 2023 Qurbani listings whose only
-        // orders since are cancelled, so they never reach this tab (delivered
-        // basis). Hence Aqeeqa. Never classify Qurbani by this type.
-        'Qurbani 2023' => 'Sadqa & Aqeeqa',
-        'Goat Qurbani Day 1' => 'Qurbani', 'Goat Qurbani Day 2' => 'Qurbani',
-        'Goat Qurbani Day 3' => 'Qurbani',
-    ];
-
-    private const CAT_UNLINKED = 'Old catalog · unlinked';
+    private const CAT_UNLINKED = \App\Services\CRM\ProductCategoryRollup::UNLINKED;
 
     private function rollupCategory(?string $type): string
     {
-        $t = html_entity_decode(trim((string) $type), ENT_QUOTES);
-        if ($t === '') return 'Others';
-        return self::CATEGORY_ROLLUP[$t] ?? $t;
+        return \App\Services\CRM\ProductCategoryRollup::rollup($type);
     }
 
     /** Line-level unit filter (same rule as the closing: NULL BU = NF). */

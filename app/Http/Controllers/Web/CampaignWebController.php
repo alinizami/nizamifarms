@@ -238,15 +238,37 @@ class CampaignWebController extends Controller
 
         $search = trim((string) $request->get('q', ''));
 
+        // Active products only (the picker used to list retired ones too),
+        // each labelled with its category so "Frozen" items are recognisable.
         $q = DB::table('t_crm_prod_product')
-            ->select('id', 'title', 'attribute_1')
+            ->where('is_active', 1)
+            ->select('id', 'title', 'attribute_1', 'product_type')
             ->orderBy('title');
 
         if ($search !== '') {
-            $q->where('title', 'LIKE', "%{$search}%");
+            $q->where(function ($w) use ($search) {
+                $w->where('title', 'LIKE', "%{$search}%")->orWhere('product_type', 'LIKE', "%{$search}%");
+            });
         }
 
-        return response()->json(['success' => true, 'products' => $q->limit(200)->get()]);
+        $rows = $q->limit(300)->get();
+        foreach ($rows as $r) {
+            $r->category = \App\Services\CRM\ProductCategoryRollup::rollup($r->product_type);
+        }
+
+        return response()->json(['success' => true, 'products' => $rows]);
+    }
+
+    /** Categories that can be tracked, with how many active products each has. */
+    public function getCategories()
+    {
+        if ($deny = $this->denyIfNotPermitted()) return $deny;
+
+        return response()->json([
+            'success' => true,
+            'categories' => \App\Services\CRM\ProductCategoryRollup::selectable(),
+            'available' => Schema::hasColumn('t_crm_campaigns', 'tracked_categories'),
+        ]);
     }
 
     // =====================================================================
@@ -429,12 +451,21 @@ class CampaignWebController extends Controller
             // 'general' = any order counts; 'products' = only orders containing
             // the tracked products; 'app_orders' = only orders placed through
             // the customer mobile app (the app-install campaign).
-            'tracking_type' => 'nullable|in:general,products,app_orders',
+            // 'category' (Oct-2026) = only orders containing a product of the
+            // picked category, e.g. Frozen.
+            'tracking_type' => 'nullable|in:general,products,app_orders,category',
             'tracking_window_days' => 'nullable|integer|min:1|max:365',
             'session_limit' => 'nullable|integer|min:1|max:100000',
             'tracked_product_ids' => 'nullable|array',
             'tracked_product_ids.*' => 'integer',
+            'tracked_categories' => 'nullable|array',
+            'tracked_categories.*' => 'string|max:60',
         ]);
+
+        $tracking = $this->trackingColumns($request);
+        if (isset($tracking['error'])) {
+            return response()->json(['success' => false, 'message' => $tracking['error']], 422);
+        }
 
         $filters = $request->input('filters', []);
         $result = $this->filterService->buildCustomerIdSet($filters);
@@ -461,9 +492,7 @@ class CampaignWebController extends Controller
             ? 'Excluded: already received template "' . $templateName . '" in last ' . $windowDays . ' day' . ($windowDays === 1 ? '' : 's')
             : 'Excluded: recent template send';
 
-        $trackedProducts = $request->input('tracked_product_ids', []);
-
-        $campaignId = DB::table('t_crm_campaigns')->insertGetId([
+        $campaignId = DB::table('t_crm_campaigns')->insertGetId($tracking + [
             'name' => $request->input('name'),
             'status' => 'active',
             'send_state' => 'idle',
@@ -472,8 +501,8 @@ class CampaignWebController extends Controller
             'message_template' => $request->input('notes', ''),
             'wa_template_name' => $templateName,
             'wa_template_language' => $request->input('wa_template_language', 'en'),
-            'tracking_type' => $request->input('tracking_type', 'general'),
-            'tracked_product_ids' => !empty($trackedProducts) ? json_encode(array_map('intval', $trackedProducts)) : null,
+            // tracking_type / tracked_product_ids / tracked_categories come
+            // from trackingColumns() above.
             'tracking_window_days' => $request->input('tracking_window_days', 30),
             // Persisting the dedup window lets the sender and the
             // "Refresh Dedup" action re-check later — the operator's
@@ -1072,6 +1101,138 @@ class CampaignWebController extends Controller
         }
 
         return response()->json(['success' => true, 'stats' => $stats]);
+    }
+
+    /**
+     * The tile numbers that need orders or the chat log (Ordered, Tapped,
+     * Conversation, Waiting on us). Separate from detail() on purpose: they
+     * cost a few hundred ms on a big campaign, and detail() runs on every tab
+     * switch. The page fetches these after the list is already on screen.
+     * Cached 60s per campaign for the same reason.
+     */
+    public function engagement(Request $request, $id)
+    {
+        if ($deny = $this->denyIfNotPermitted()) return $deny;
+
+        $campaign = DB::table('t_crm_campaigns')->where('id', $id)->first();
+        if (!$campaign) {
+            return response()->json(['success' => false, 'message' => 'Campaign not found'], 404);
+        }
+
+        $key = 'campaign_engagement_' . (int) $id . '_' . md5(($campaign->tracking_type ?? '') . '|'
+            . ($campaign->tracked_product_ids ?? '') . '|' . ($campaign->tracked_categories ?? '') . '|' . ($campaign->tracking_window_days ?? ''));
+
+        $data = \Illuminate\Support\Facades\Cache::remember($key, 60, function () use ($id, $campaign) {
+            $window = (int) ($campaign->tracking_window_days ?: 30);
+            $conv = $this->statsService->conversions([(int) $id], $window, $campaign);
+            return array_merge($this->statsService->engagementCounts((int) $id), [
+                'ordered' => $conv['converters'],
+                'orders'  => $conv['orders'],
+                'revenue' => $conv['revenue'],
+            ]);
+        });
+
+        return response()->json([
+            'success' => true,
+            'engagement' => $data,
+            'tracking' => [
+                'type' => $campaign->tracking_type ?: 'general',
+                'categories' => $this->statsService->trackedCategories($campaign),
+                'product_count' => count(json_decode($campaign->tracked_product_ids ?? '[]', true) ?: []),
+                'window_days' => (int) ($campaign->tracking_window_days ?: 30),
+            ],
+        ]);
+    }
+
+    /** One customer's story after the message — receipts, chat, orders. */
+    public function timeline(Request $request, $id, $customerId)
+    {
+        if ($deny = $this->denyIfNotPermitted()) return $deny;
+
+        $data = $this->statsService->customerTimeline((int) $id, (int) $customerId);
+        if (!$data) {
+            return response()->json(['success' => false, 'message' => 'Not found in this campaign'], 404);
+        }
+        return response()->json(['success' => true, 'timeline' => $data]);
+    }
+
+    /**
+     * Change what counts as "Ordered" on an EXISTING campaign — until Oct-2026
+     * this was fixed at creation, so a frozen campaign created as "any order"
+     * could only ever report mutton orders as frozen wins. Only the counting
+     * rule changes: nobody is messaged, added or removed.
+     */
+    public function updateTracking(Request $request, $id)
+    {
+        if ($deny = $this->denyIfCannotManage()) return $deny;
+
+        $campaign = DB::table('t_crm_campaigns')->where('id', $id)->first();
+        if (!$campaign) {
+            return response()->json(['success' => false, 'message' => 'Campaign not found'], 404);
+        }
+
+        $request->validate([
+            'tracking_type' => 'required|in:general,products,app_orders,category',
+            'tracking_window_days' => 'nullable|integer|min:1|max:365',
+            'tracked_product_ids' => 'nullable|array',
+            'tracked_product_ids.*' => 'integer',
+            'tracked_categories' => 'nullable|array',
+            'tracked_categories.*' => 'string|max:60',
+        ]);
+
+        $update = $this->trackingColumns($request);
+        if (isset($update['error'])) {
+            return response()->json(['success' => false, 'message' => $update['error']], 422);
+        }
+        if ($request->filled('tracking_window_days')) {
+            $update['tracking_window_days'] = (int) $request->input('tracking_window_days');
+        }
+        $update['updated_at'] = now();
+
+        DB::table('t_crm_campaigns')->where('id', $id)->update($update);
+
+        // Full results only when the Results window is open to show them —
+        // they take a few seconds on a big campaign.
+        return response()->json([
+            'success' => true,
+            'stats' => $request->boolean('with_stats') ? $this->statsService->forCampaign((int) $id) : null,
+        ]);
+    }
+
+    /**
+     * tracking_type + its product/category list, validated the same way for
+     * create() and updateTracking(). Returns ['error' => msg] when the request
+     * can't be honoured.
+     */
+    protected function trackingColumns(Request $request): array
+    {
+        $type = (string) ($request->input('tracking_type') ?: 'general');
+        $products = array_values(array_filter(array_map('intval', (array) $request->input('tracked_product_ids', []))));
+        $categories = array_values(array_unique(array_filter(array_map(
+            fn($c) => trim((string) $c), (array) $request->input('tracked_categories', [])
+        ))));
+        $hasCatCol = Schema::hasColumn('t_crm_campaigns', 'tracked_categories');
+
+        if ($type === 'category') {
+            if (!$hasCatCol) {
+                return ['error' => 'Category tracking needs the Oct-2026 database update first (tracked_categories column).'];
+            }
+            if (empty($categories)) {
+                return ['error' => 'Pick at least one category to track.'];
+            }
+        }
+        if ($type === 'products' && empty($products)) {
+            return ['error' => 'Pick at least one product to track.'];
+        }
+
+        $out = [
+            'tracking_type' => $type,
+            'tracked_product_ids' => ($type === 'products' && $products) ? json_encode($products) : null,
+        ];
+        if ($hasCatCol) {
+            $out['tracked_categories'] = ($type === 'category' && $categories) ? json_encode($categories) : null;
+        }
+        return $out;
     }
 
     /**

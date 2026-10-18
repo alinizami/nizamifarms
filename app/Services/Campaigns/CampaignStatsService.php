@@ -2,6 +2,7 @@
 
 namespace App\Services\Campaigns;
 
+use App\Services\CRM\ProductCategoryRollup;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
 
@@ -91,10 +92,13 @@ class CampaignStatsService
             'campaign_name'        => $campaign->name,
             'wa_template_name'     => $campaign->wa_template_name,
             'tracking_type'        => $campaign->tracking_type ?: 'general',
+            'tracked_categories'   => $this->trackedCategories($campaign),
             'tracking_window_days' => $window,
             'funnel'               => $this->assembleFunnel($delivery, $conversion),
+            'engagement'           => $this->engagementCounts($campaignId),
             'source_split'         => $conversion['source_split'],
             'product_breakdown'    => $this->productBreakdown([$campaignId], $window, $campaign),
+            'category_breakdown'   => $this->categoryBreakdown([$campaignId], $window),
             'tracking_note'        => $this->trackingNote($campaign),
         ];
     }
@@ -176,23 +180,9 @@ class CampaignStatsService
         if (empty($campaignIds)) return $empty;
 
         $ph = implode(',', array_fill(0, count($campaignIds), '?'));
-        $trackingType = $campaignForRules->tracking_type ?? 'general';
 
         // Extra conditions that decide what counts as a conversion.
-        $extra = '';
-        if ($trackingType === 'app_orders') {
-            $appList = "'" . implode("','", self::APP_CHANNELS) . "'";
-            $extra = " AND o.order_source_channel IN ({$appList}) ";
-        } elseif ($trackingType === 'products') {
-            $productIds = $this->trackedProductIds($campaignForRules);
-            if (!empty($productIds)) {
-                $pph = implode(',', array_fill(0, count($productIds), '?'));
-                $extra = " AND EXISTS (
-                    SELECT 1 FROM t_crm_prod_order_line_item li
-                    WHERE li.order_id = o.id AND li.product_id IN ({$pph})
-                ) ";
-            }
-        }
+        [$extra, $extraBindings] = $this->conversionFilter($campaignForRules);
 
         $statusList = "'" . implode("','", self::NON_CONVERTING_STATUSES) . "'";
         $appList    = "'" . implode("','", self::APP_CHANNELS) . "'";
@@ -225,14 +215,10 @@ class CampaignStatsService
 
         // Binding order must follow the order the placeholders appear in the
         // SQL above: campaign ids (derived table), then the window in the
-        // JOIN's DATE_ADD, then any tracked product ids inside {$extra}.
+        // JOIN's DATE_ADD, then the bindings of {$extra} (product ids / types).
         $bindings = $campaignIds;
         $bindings[] = $windowDays;
-        if ($trackingType === 'products') {
-            foreach ($this->trackedProductIds($campaignForRules) as $pid) {
-                $bindings[] = $pid;
-            }
-        }
+        foreach ($extraBindings as $b) $bindings[] = $b;
 
         $rows = DB::select($sql, $bindings);
         $r = $rows[0] ?? null;
@@ -326,7 +312,14 @@ class CampaignStatsService
             ->join('t_crm_prod_customer as c', 'cc.customer_id', '=', 'c.id')
             ->where('cc.campaign_id', $campaignId);
 
-        $this->applyStatusFilter($q, $statusFilter);
+        // Lists behind the clickable tiles. Ordered / Tapped / Conversation /
+        // Waiting are computed sets (orders + chat log), the rest are columns.
+        if (in_array($statusFilter, self::DERIVED_FILTERS, true)) {
+            $ids = $this->customerIdsForDerivedFilter($campaignId, $statusFilter, $campaign);
+            $q->where('cc.status', 'sent')->whereIn('cc.customer_id', $ids ?: [0]);
+        } else {
+            $this->applyStatusFilter($q, $statusFilter);
+        }
 
         $total = (clone $q)->count();
 
@@ -428,9 +421,23 @@ class CampaignStatsService
                 $m = $orderMap[(int) $r->customer_id] ?? null;
                 $r->order_count = $m ? (int) $m['orders'] : 0;
                 $r->order_revenue = $m ? (float) $m['revenue'] : 0.0;
+                $r->first_order_at = $m['first_order_at'] ?? null;
+            }
+
+            // Chat-log facts for the page (tap / wrote / team answered).
+            $eng = $this->engagementMap($campaignId, $sentRows->pluck('customer_id')->map(fn($v) => (int) $v)->all());
+            foreach ($rows as $r) {
+                $e = $eng[(int) $r->customer_id] ?? null;
+                $r->tapped_at    = $e['tapped_at'] ?? null;
+                $r->wrote_at     = $e['wrote_at'] ?? null;
+                $r->conversation = $e ? $e['conversation'] : false;
+                $r->waiting      = $e ? $e['waiting'] : false;
             }
         } else {
-            foreach ($rows as $r) { $r->order_count = 0; $r->order_revenue = 0.0; }
+            foreach ($rows as $r) {
+                $r->order_count = 0; $r->order_revenue = 0.0; $r->first_order_at = null;
+                $r->tapped_at = null; $r->wrote_at = null; $r->conversation = false; $r->waiting = false;
+            }
         }
 
         return [
@@ -453,24 +460,13 @@ class CampaignStatsService
         $cph = implode(',', array_fill(0, count($customerIds), '?'));
         $statusList = "'" . implode("','", self::NON_CONVERTING_STATUSES) . "'";
 
-        $trackingType = $campaign->tracking_type ?? 'general';
-        $extra = '';
-        $productIds = [];
-        if ($trackingType === 'app_orders') {
-            $appList = "'" . implode("','", self::APP_CHANNELS) . "'";
-            $extra = " AND o.order_source_channel IN ({$appList}) ";
-        } elseif ($trackingType === 'products') {
-            $productIds = $this->trackedProductIds($campaign);
-            if (!empty($productIds)) {
-                $pph = implode(',', array_fill(0, count($productIds), '?'));
-                $extra = " AND EXISTS (SELECT 1 FROM t_crm_prod_order_line_item li WHERE li.order_id = o.id AND li.product_id IN ({$pph})) ";
-            }
-        }
+        [$extra, $extraBindings] = $this->conversionFilter($campaign);
 
         $rows = DB::select("
             SELECT cc.customer_id,
                    COUNT(DISTINCT o.id) AS orders,
-                   COALESCE(SUM(o.total_price), 0) AS revenue
+                   COALESCE(SUM(o.total_price), 0) AS revenue,
+                   MIN(o.order_date) AS first_order_at
             FROM t_crm_campaign_customers cc
             JOIN t_crm_prod_order o
               ON o.customer_id = cc.customer_id
@@ -482,11 +478,15 @@ class CampaignStatsService
               AND cc.status = 'sent'
               AND cc.customer_id IN ({$cph})
             GROUP BY cc.customer_id
-        ", array_merge([$windowDays], $productIds, [$campaignId], $customerIds));
+        ", array_merge([$windowDays], $extraBindings, [$campaignId], $customerIds));
 
         $out = [];
         foreach ($rows as $r) {
-            $out[(int) $r->customer_id] = ['orders' => (int) $r->orders, 'revenue' => (float) $r->revenue];
+            $out[(int) $r->customer_id] = [
+                'orders' => (int) $r->orders,
+                'revenue' => (float) $r->revenue,
+                'first_order_at' => $r->first_order_at,
+            ];
         }
         return $out;
     }
@@ -624,6 +624,7 @@ class CampaignStatsService
                             SELECT 1 FROM t_wa_messages r
                             WHERE r.conversation_id = m.conversation_id
                               AND r.direction = 'inbound'
+                              AND r.type NOT IN ('button', 'interactive')
                               AND r.created_at > m.created_at
                        ) THEN 1 ELSE 0 END,
                        CASE WHEN m.status = 'failed' THEN 1 ELSE 0 END,
@@ -687,28 +688,15 @@ class CampaignStatsService
      */
     protected function templateConversions(string $templateName, int $windowDays, $rulesCampaign): array
     {
-        $trackingType = $rulesCampaign->tracking_type ?? 'general';
-
-        $extra = '';
-        $productIds = [];
-        if ($trackingType === 'app_orders') {
-            $appList = "'" . implode("','", self::APP_CHANNELS) . "'";
-            $extra = " AND o.order_source_channel IN ({$appList}) ";
-        } elseif ($trackingType === 'products') {
-            $productIds = $this->trackedProductIds($rulesCampaign);
-            if (!empty($productIds)) {
-                $pph = implode(',', array_fill(0, count($productIds), '?'));
-                $extra = " AND EXISTS (SELECT 1 FROM t_crm_prod_order_line_item li WHERE li.order_id = o.id AND li.product_id IN ({$pph})) ";
-            }
-        }
+        [$extra, $extraBindings] = $this->conversionFilter($rulesCampaign);
 
         $statusList = "'" . implode("','", self::NON_CONVERTING_STATUSES) . "'";
         $appList    = "'" . implode("','", self::APP_CHANNELS) . "'";
 
         // Bindings follow placeholder order: template, template (inside the
-        // derived table), then the window, then any product ids in {$extra}.
+        // derived table), then the window, then the bindings of {$extra}.
         $bindings = [$templateName, $templateName, $windowDays];
-        foreach ($productIds as $pid) $bindings[] = $pid;
+        foreach ($extraBindings as $b) $bindings[] = $b;
 
         $rows = DB::select("
             SELECT COUNT(DISTINCT l.customer_id) AS converters,
@@ -1059,7 +1047,15 @@ class CampaignStatsService
         $type = $campaign->tracking_type ?? 'general';
 
         if ($type === 'products' && empty($this->trackedProductIds($campaign))) {
-            return 'This campaign is set to track specific products, but no products were saved against it — so any order within the window is being counted. Re-create the campaign with products selected if you need a product-level result.';
+            return 'This campaign is set to track specific products, but no products were saved against it — so any order within the window is being counted. Use "Change tracking" to pick products or a category.';
+        }
+
+        if ($type === 'category') {
+            $cats = $this->trackedCategories($campaign);
+            if (empty($cats)) {
+                return 'This campaign is set to track a category, but none is saved — so nothing counts as a conversion. Use "Change tracking" to pick one.';
+            }
+            return 'Only orders containing ' . implode(' / ', $cats) . ' products count as "Ordered". The "By category" table below shows every category, so you can still see who ordered something else.';
         }
 
         if ($type === 'app_orders') {
@@ -1079,6 +1075,470 @@ class CampaignStatsService
     }
 
     /**
+     * Categories (ProductCategoryRollup names) a 'category' campaign tracks.
+     * The column arrives with the Oct-2026 SQL; before it exists the property
+     * is simply absent and this returns [].
+     */
+    public function trackedCategories($campaign): array
+    {
+        $raw = $campaign->tracked_categories ?? null;
+        if (!$raw) return [];
+        $cats = is_array($raw) ? $raw : json_decode($raw, true);
+        if (!is_array($cats)) return [];
+        return array_values(array_filter(array_map(fn($c) => trim((string) $c), $cats), fn($c) => $c !== ''));
+    }
+
+    /**
+     * The extra JOIN condition (on order alias `o`) that decides whether an
+     * order counts as a conversion for this campaign, plus its bindings.
+     *
+     * ONE implementation for every conversion query — campaign totals, the
+     * per-row "N after", the Ordered list and the per-template view — so the
+     * strip, the list and the Results window can never disagree.
+     *
+     *   general    — any order (no extra condition)
+     *   app_orders — placed through the customer app
+     *   products   — contains one of the picked products (none picked = any
+     *                order, flagged by trackingNote)
+     *   category   — contains a product of the picked category, e.g. Frozen.
+     *                None picked = NOTHING counts (also flagged), because
+     *                silently counting every order is exactly the mistake
+     *                this type exists to stop.
+     */
+    protected function conversionFilter($campaign): array
+    {
+        $type = $campaign->tracking_type ?? 'general';
+
+        if ($type === 'app_orders') {
+            $appList = "'" . implode("','", self::APP_CHANNELS) . "'";
+            return [" AND o.order_source_channel IN ({$appList}) ", []];
+        }
+
+        if ($type === 'products') {
+            $productIds = $this->trackedProductIds($campaign);
+            if (empty($productIds)) return ['', []];
+            $pph = implode(',', array_fill(0, count($productIds), '?'));
+            return [" AND EXISTS (
+                SELECT 1 FROM t_crm_prod_order_line_item cfli
+                WHERE cfli.order_id = o.id AND cfli.product_id IN ({$pph})
+            ) ", $productIds];
+        }
+
+        if ($type === 'category') {
+            $types = ProductCategoryRollup::rawTypesFor($this->trackedCategories($campaign));
+            if (empty($types)) return [' AND 1 = 0 ', []];
+            $tph = implode(',', array_fill(0, count($types), '?'));
+            return [" AND EXISTS (
+                SELECT 1 FROM t_crm_prod_order_line_item cfli
+                JOIN t_crm_prod_product cfp ON cfp.id = cfli.product_id
+                WHERE cfli.order_id = o.id AND cfp.product_type IN ({$tph})
+            ) ", $types];
+        }
+
+        return ['', []];
+    }
+
+    // =====================================================================
+    // Oct-2026 — category results, reply split, lists, timeline
+    // =====================================================================
+
+    /**
+     * What the people who ordered after the message actually bought, by
+     * category — on EVERY campaign, whatever it tracks. This is what lets a
+     * frozen campaign say "12 ordered something, 5 of them ordered frozen"
+     * without having to decide up front, and it works retroactively.
+     *
+     * Same attribution as conversions(): most recent send per customer, the
+     * campaign's window, cancelled/refunded excluded. `value` is the value of
+     * THAT category's lines, not the whole order.
+     *
+     * `new_to_frozen` = frozen buyers with no frozen order before the
+     * message. Only computed for Frozen ON PURPOSE: almost every 2025 line
+     * item points at the pre-Mar-2026 catalog (unlinked), so "first time
+     * buying mutton" would wrongly call most regulars new. Frozen lines are
+     * all on the current catalog, so for Frozen it is exact.
+     */
+    public function categoryBreakdown(array $campaignIds, int $windowDays): array
+    {
+        $empty = ['rows' => [], 'any' => ['customers' => 0, 'orders' => 0], 'new_to_frozen' => 0, 'frozen_label' => ProductCategoryRollup::FROZEN];
+        if (empty($campaignIds)) return $empty;
+
+        $ph = implode(',', array_fill(0, count($campaignIds), '?'));
+        $statusList = "'" . implode("','", self::NON_CONVERTING_STATUSES) . "'";
+        $latestSend = "
+            SELECT cc.customer_id, MAX(cc.sent_at) AS sent_at
+            FROM t_crm_campaign_customers cc
+            WHERE cc.campaign_id IN ({$ph}) AND cc.status = 'sent' AND cc.sent_at IS NOT NULL
+            GROUP BY cc.customer_id";
+
+        $orders = DB::select("
+            SELECT l.customer_id, o.id AS oid
+            FROM ({$latestSend}) l
+            JOIN t_crm_prod_order o
+              ON o.customer_id = l.customer_id
+             AND o.order_date  > l.sent_at
+             AND o.order_date <= DATE_ADD(l.sent_at, INTERVAL ? DAY)
+             AND COALESCE(o.order_status, '') NOT IN ({$statusList})
+        ", array_merge($campaignIds, [$windowDays]));
+
+        if (empty($orders)) return $empty;
+
+        $customerByOrder = [];
+        foreach ($orders as $o) $customerByOrder[(int) $o->oid] = (int) $o->customer_id;
+
+        $cats = [];
+        foreach (array_chunk(array_keys($customerByOrder), 1000) as $chunk) {
+            $lines = DB::table('t_crm_prod_order_line_item as li')
+                ->leftJoin('t_crm_prod_product as p', 'p.id', '=', 'li.product_id')
+                ->whereIn('li.order_id', $chunk)
+                ->groupBy('li.order_id', 'p.product_type', DB::raw('(p.id IS NOT NULL)'))
+                ->selectRaw('li.order_id, p.product_type AS ptype, (p.id IS NOT NULL) AS linked, COALESCE(SUM(li.line_total), 0) AS val')
+                ->get();
+            foreach ($lines as $ln) {
+                $cat = $ln->linked ? ProductCategoryRollup::rollup($ln->ptype) : ProductCategoryRollup::UNLINKED;
+                $oid = (int) $ln->order_id;
+                $cats[$cat]['orders'][$oid] = true;
+                $cats[$cat]['customers'][$customerByOrder[$oid]] = true;
+                $cats[$cat]['value'] = ($cats[$cat]['value'] ?? 0) + (float) $ln->val;
+            }
+        }
+
+        $rows = [];
+        foreach ($cats as $cat => $c) {
+            $rows[] = [
+                'category'  => $cat,
+                'customers' => count($c['customers'] ?? []),
+                'orders'    => count($c['orders'] ?? []),
+                'value'     => round((float) ($c['value'] ?? 0), 2),
+            ];
+        }
+        usort($rows, fn($a, $b) => [$b['customers'], $b['value']] <=> [$a['customers'], $a['value']]);
+
+        // First-time frozen buyers.
+        $newToFrozen = 0;
+        $frozenBuyers = array_keys($cats[ProductCategoryRollup::FROZEN]['customers'] ?? []);
+        $frozenTypes  = ProductCategoryRollup::rawTypesFor([ProductCategoryRollup::FROZEN]);
+        if (!empty($frozenBuyers) && !empty($frozenTypes)) {
+            $bph = implode(',', array_fill(0, count($frozenBuyers), '?'));
+            $tph = implode(',', array_fill(0, count($frozenTypes), '?'));
+            $before = DB::select("
+                SELECT DISTINCT l.customer_id
+                FROM ({$latestSend}) l
+                JOIN t_crm_prod_order o
+                  ON o.customer_id = l.customer_id
+                 AND o.order_date < l.sent_at
+                 AND COALESCE(o.order_status, '') NOT IN ({$statusList})
+                JOIN t_crm_prod_order_line_item li ON li.order_id = o.id
+                JOIN t_crm_prod_product p ON p.id = li.product_id
+                WHERE l.customer_id IN ({$bph})
+                  AND p.product_type IN ({$tph})
+            ", array_merge($campaignIds, $frozenBuyers, $frozenTypes));
+            $newToFrozen = count($frozenBuyers) - count($before);
+        }
+
+        return [
+            'rows' => $rows,
+            'any'  => [
+                'customers' => count(array_unique(array_values($customerByOrder))),
+                'orders'    => count($customerByOrder),
+            ],
+            'new_to_frozen' => max(0, $newToFrozen),
+            'frozen_label'  => ProductCategoryRollup::FROZEN,
+        ];
+    }
+
+    /**
+     * What happened in WhatsApp after the message, per customer, read from
+     * the chat log itself (t_wa_messages) inside the campaign's window:
+     *
+     *   tapped_at    — first button tap (e.g. "Menu"). Shown on its own: it is
+     *                  interest, and the system answers it, so it is not a
+     *                  conversation (owner ruling Oct-2026).
+     *   replied_at   — first message that is not a tap. Reactions COUNT
+     *                  (owner ruling). Same rule the webhook now stamps.
+     *   wrote_at     — first message the customer actually wrote (not a tap,
+     *                  not a reaction).
+     *   team_last_at — last message a STAFF member sent (sent_by set), other
+     *                  than this campaign's own template.
+     *
+     *   conversation = they wrote AND staff sent something after that.
+     *   waiting      = they wrote and NO staff message followed. A later
+     *                  "ok thanks" after the team answered stays a
+     *                  conversation, so the list doesn't fill with closed chats.
+     *
+     * Keyed by customer_id. $customerIds limits it to one page of rows.
+     */
+    public function engagementMap(int $campaignId, ?array $customerIds = null): array
+    {
+        $campaign = DB::table('t_crm_campaigns')->where('id', $campaignId)->first();
+        if (!$campaign) return [];
+        if ($customerIds !== null && empty($customerIds)) return [];
+
+        $bindings = [(string) ($campaign->wa_template_name ?? ''), (int) ($campaign->tracking_window_days ?: 30), $campaignId];
+        $scope = '';
+        if ($customerIds !== null) {
+            $scope = ' AND cc.customer_id IN (' . implode(',', array_fill(0, count($customerIds), '?')) . ')';
+            foreach ($customerIds as $cid) $bindings[] = (int) $cid;
+        }
+
+        $rows = DB::select("
+            SELECT cc.customer_id,
+                   MIN(CASE WHEN m.direction = 'inbound' AND m.type IN ('button','interactive') THEN m.created_at END) AS tapped_at,
+                   MIN(CASE WHEN m.direction = 'inbound' AND m.type NOT IN ('button','interactive') THEN m.created_at END) AS replied_at,
+                   MIN(CASE WHEN m.direction = 'inbound' AND m.type NOT IN ('button','interactive','reaction') THEN m.created_at END) AS wrote_at,
+                   MAX(CASE WHEN m.direction = 'outbound' AND m.sent_by IS NOT NULL AND COALESCE(m.template_name, '') <> ? THEN m.created_at END) AS team_last_at
+            FROM t_crm_campaign_customers cc
+            JOIN t_wa_conversations cv ON cv.customer_id = cc.customer_id
+            JOIN t_wa_messages m
+              ON m.conversation_id = cv.id
+             AND m.created_at > cc.sent_at
+             AND m.created_at <= DATE_ADD(cc.sent_at, INTERVAL ? DAY)
+            WHERE cc.campaign_id = ?
+              AND cc.status = 'sent'
+              AND cc.sent_at IS NOT NULL
+              {$scope}
+            GROUP BY cc.customer_id
+        ", $bindings);
+
+        $out = [];
+        foreach ($rows as $r) {
+            $conversation = $r->wrote_at && $r->team_last_at && $r->team_last_at > $r->wrote_at;
+            $out[(int) $r->customer_id] = [
+                'tapped_at'    => $r->tapped_at,
+                'replied_at'   => $r->replied_at,
+                'wrote_at'     => $r->wrote_at,
+                'team_last_at' => $r->team_last_at,
+                'conversation' => (bool) $conversation,
+                'waiting'      => $r->wrote_at && !$conversation,
+            ];
+        }
+        return $out;
+    }
+
+    /** Whole-campaign tallies of engagementMap(), for the strip and Results. */
+    public function engagementCounts(int $campaignId): array
+    {
+        $map = $this->engagementMap($campaignId);
+        $out = ['tapped' => 0, 'wrote' => 0, 'conversation' => 0, 'waiting' => 0];
+        foreach ($map as $e) {
+            if ($e['tapped_at']) $out['tapped']++;
+            if ($e['wrote_at'])  $out['wrote']++;
+            if ($e['conversation']) $out['conversation']++;
+            if ($e['waiting']) $out['waiting']++;
+        }
+        return $out;
+    }
+
+    /**
+     * Customers who count as "Ordered" for this campaign — the exact set
+     * behind conversions()['converters'], so the Ordered tile and the list it
+     * opens always show the same number.
+     */
+    public function convertedCustomerIds(int $campaignId, $campaign): array
+    {
+        $window = (int) ($campaign->tracking_window_days ?: 30);
+        [$extra, $extraBindings] = $this->conversionFilter($campaign);
+        $statusList = "'" . implode("','", self::NON_CONVERTING_STATUSES) . "'";
+
+        $rows = DB::select("
+            SELECT DISTINCT l.customer_id
+            FROM (
+                SELECT cc.customer_id, MAX(cc.sent_at) AS sent_at
+                FROM t_crm_campaign_customers cc
+                WHERE cc.campaign_id = ? AND cc.status = 'sent' AND cc.sent_at IS NOT NULL
+                GROUP BY cc.customer_id
+            ) l
+            JOIN t_crm_prod_order o
+              ON o.customer_id = l.customer_id
+             AND o.order_date  > l.sent_at
+             AND o.order_date <= DATE_ADD(l.sent_at, INTERVAL ? DAY)
+             AND COALESCE(o.order_status, '') NOT IN ({$statusList})
+             {$extra}
+        ", array_merge([$campaignId, $window], $extraBindings));
+
+        return array_map(fn($r) => (int) $r->customer_id, $rows);
+    }
+
+    /** Filters that need a computed set of customers rather than a column. */
+    public const DERIVED_FILTERS = ['ordered', 'tapped', 'conversation', 'waiting'];
+
+    protected function customerIdsForDerivedFilter(int $campaignId, string $filter, $campaign): array
+    {
+        if ($filter === 'ordered') return $this->convertedCustomerIds($campaignId, $campaign);
+
+        $ids = [];
+        foreach ($this->engagementMap($campaignId) as $cid => $e) {
+            if ($filter === 'tapped' && $e['tapped_at']) $ids[] = $cid;
+            elseif ($filter === 'conversation' && $e['conversation']) $ids[] = $cid;
+            elseif ($filter === 'waiting' && $e['waiting']) $ids[] = $cid;
+        }
+        return $ids;
+    }
+
+    /**
+     * Everything that happened with ONE customer after the campaign message:
+     * receipts, every WhatsApp message in the window (who sent it, what kind),
+     * and every order in the window with its categories and whether it counts.
+     */
+    public function customerTimeline(int $campaignId, int $customerId): ?array
+    {
+        $campaign = DB::table('t_crm_campaigns')->where('id', $campaignId)->first();
+        if (!$campaign) return null;
+
+        $cc = DB::table('t_crm_campaign_customers')
+            ->where('campaign_id', $campaignId)
+            ->where('customer_id', $customerId)
+            ->orderByRaw("status = 'sent' DESC")
+            ->orderByDesc('sent_at')
+            ->first();
+        if (!$cc) return null;
+
+        $customer = DB::table('t_crm_prod_customer')->where('id', $customerId)
+            ->select('id', 'first_name', 'last_name', 'phone', 'phone_normalized', 'city')->first();
+
+        $window = (int) ($campaign->tracking_window_days ?: 30);
+        $base = [
+            'campaign' => [
+                'id' => (int) $campaign->id, 'name' => $campaign->name,
+                'template' => $campaign->wa_template_name,
+                'tracking_type' => $campaign->tracking_type ?: 'general',
+                'tracked_categories' => $this->trackedCategories($campaign),
+                'window_days' => $window,
+            ],
+            'customer' => $customer,
+            'row' => [
+                'status' => $cc->status, 'sent_at' => $cc->sent_at,
+                'delivered_at' => $cc->delivered_at ?? null, 'read_at' => $cc->read_at ?? null,
+                'undelivered_at' => $cc->undelivered_at ?? null, 'replied_at' => $cc->replied_at ?? null,
+                'error_message' => $cc->error_message ?? null,
+            ],
+            'messages' => [], 'orders' => [], 'summary' => null,
+        ];
+        if ($cc->status !== 'sent' || !$cc->sent_at) return $base;
+
+        $sentAt = \Carbon\Carbon::parse($cc->sent_at);
+        $until  = $sentAt->copy()->addDays($window);
+        $template = (string) ($campaign->wa_template_name ?? '');
+
+        // Messages: from a few minutes before the send (so the campaign
+        // message itself shows) to the end of the window.
+        $convIds = DB::table('t_wa_conversations')->where('customer_id', $customerId)->pluck('id')->all();
+        $messages = [];
+        if (!empty($convIds)) {
+            $msgRows = DB::table('t_wa_messages as m')
+                ->leftJoin('t_sys_user as u', 'u.id', '=', 'm.sent_by')
+                ->whereIn('m.conversation_id', $convIds)
+                ->where('m.created_at', '>=', $sentAt->copy()->subMinutes(5))
+                ->where('m.created_at', '<=', $until)
+                ->orderBy('m.created_at')
+                ->limit(150)
+                ->select('m.id', 'm.direction', 'm.type', 'm.content', 'm.template_name', 'm.sent_by',
+                         'm.status', 'm.created_at', DB::raw("COALESCE(u.fullname, '') AS staff_name"))
+                ->get();
+            foreach ($msgRows as $m) {
+                if ($m->direction === 'inbound') {
+                    $kind = in_array($m->type, ['button', 'interactive'], true) ? 'tap'
+                        : ($m->type === 'reaction' ? 'reaction' : 'wrote');
+                } elseif ($template !== '' && $m->template_name === $template) {
+                    $kind = 'campaign';
+                } elseif ($m->sent_by) {
+                    $kind = 'team';
+                } else {
+                    $kind = 'system';
+                }
+                $messages[] = [
+                    'at' => $m->created_at, 'kind' => $kind, 'type' => $m->type,
+                    'text' => mb_substr((string) $m->content, 0, 400),
+                    'template' => $m->template_name ?: null,
+                    'staff' => $m->staff_name ?: null,
+                    'status' => $m->status,
+                ];
+            }
+        }
+
+        // Orders in the window — ALL of them, each saying whether it counts.
+        $orderRows = DB::table('t_crm_prod_order')
+            ->where('customer_id', $customerId)
+            ->where('order_date', '>', $sentAt)
+            ->where('order_date', '<=', $until)
+            ->orderBy('order_date')
+            ->select('id', 'order_number', 'order_date', 'total_price', 'order_status', 'order_source_channel')
+            ->get();
+
+        $orders = [];
+        if ($orderRows->isNotEmpty()) {
+            $oids = $orderRows->pluck('id')->map(fn($v) => (int) $v)->all();
+
+            $catsByOrder = [];
+            $lines = DB::table('t_crm_prod_order_line_item as li')
+                ->leftJoin('t_crm_prod_product as p', 'p.id', '=', 'li.product_id')
+                ->whereIn('li.order_id', $oids)
+                ->select('li.order_id', 'p.product_type', DB::raw('(p.id IS NOT NULL) AS linked'))
+                ->get();
+            foreach ($lines as $ln) {
+                $cat = $ln->linked ? ProductCategoryRollup::rollup($ln->product_type) : ProductCategoryRollup::UNLINKED;
+                $catsByOrder[(int) $ln->order_id][$cat] = true;
+            }
+
+            // Which of them pass this campaign's conversion rule — through the
+            // same conversionFilter() as every total, so the timeline agrees.
+            [$extra, $extraBindings] = $this->conversionFilter($campaign);
+            $statusList = "'" . implode("','", self::NON_CONVERTING_STATUSES) . "'";
+            $oph = implode(',', array_fill(0, count($oids), '?'));
+            $counting = DB::select("
+                SELECT o.id FROM t_crm_prod_order o
+                WHERE o.id IN ({$oph})
+                  AND COALESCE(o.order_status, '') NOT IN ({$statusList})
+                  {$extra}
+            ", array_merge($oids, $extraBindings));
+            $countingIds = array_flip(array_map(fn($r) => (int) $r->id, $counting));
+
+            foreach ($orderRows as $o) {
+                $orders[] = [
+                    'id' => (int) $o->id,
+                    'order_number' => $o->order_number,
+                    'order_date' => $o->order_date,
+                    'total_price' => (float) $o->total_price,
+                    'status' => $o->order_status,
+                    'channel' => $o->order_source_channel,
+                    'categories' => array_keys($catsByOrder[(int) $o->id] ?? []),
+                    'counts' => isset($countingIds[(int) $o->id]),
+                    'hours_after' => round($sentAt->diffInMinutes(\Carbon\Carbon::parse($o->order_date)) / 60, 1),
+                ];
+            }
+        }
+
+        // Summary — the same definitions engagementMap() uses.
+        // Only messages AFTER the send count (the list starts 5 minutes early
+        // purely so the campaign message itself is visible).
+        $sentStr = (string) $cc->sent_at;
+        $first = fn(callable $f) => collect($messages)->first(fn($m) => $m['at'] > $sentStr && $f($m))['at'] ?? null;
+        $tappedAt  = $first(fn($m) => $m['kind'] === 'tap');
+        $repliedAt = $first(fn($m) => in_array($m['kind'], ['wrote', 'reaction'], true));
+        $wroteAt   = $first(fn($m) => $m['kind'] === 'wrote');
+        $teamAfter = $wroteAt ? $first(fn($m) => $m['kind'] === 'team' && $m['at'] > $wroteAt) : null;
+        $firstCounting = collect($orders)->first(fn($o) => $o['counts']);
+
+        $base['messages'] = $messages;
+        $base['orders']   = $orders;
+        $base['summary']  = [
+            'tapped_at'       => $tappedAt,
+            'replied_at'      => $repliedAt,
+            'wrote_at'        => $wroteAt,
+            'team_replied_at' => $teamAfter,
+            'response_minutes'=> ($wroteAt && $teamAfter) ? \Carbon\Carbon::parse($wroteAt)->diffInMinutes(\Carbon\Carbon::parse($teamAfter)) : null,
+            'conversation'    => (bool) $teamAfter,
+            'waiting'         => $wroteAt && !$teamAfter,
+            'first_order_at'  => $firstCounting['order_date'] ?? null,
+            'hours_to_order'  => $firstCounting['hours_after'] ?? null,
+            'window_ends_at'  => $until->toDateTimeString(),
+            'messages_capped' => count($messages) >= 150,
+        ];
+
+        return $base;
+    }
+
+    /**
      * The Excluded/Skipped split lives in the error_message prefix, not the
      * status column — see CampaignWebController::create(). Kept here so every
      * caller applies it identically.
@@ -1093,6 +1553,15 @@ class CampaignStatsService
             });
         } elseif ($statusFilter === 'undelivered') {
             $query->where('cc.status', 'sent')->whereNotNull('cc.undelivered_at');
+        } elseif ($statusFilter === 'delivered') {
+            // Same rule as counts(): a read receipt proves delivery too.
+            $query->where('cc.status', 'sent')->where(function ($q) {
+                $q->whereNotNull('cc.delivered_at')->orWhereNotNull('cc.read_at');
+            });
+        } elseif ($statusFilter === 'read') {
+            $query->where('cc.status', 'sent')->whereNotNull('cc.read_at');
+        } elseif ($statusFilter === 'replied') {
+            $query->where('cc.status', 'sent')->whereNotNull('cc.replied_at');
         } elseif ($statusFilter === 'pending') {
             // 'sending' rows are mid-flight; showing them under Pending keeps
             // the operator's mental model simple (they are not done yet).

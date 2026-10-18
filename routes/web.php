@@ -1049,7 +1049,9 @@ Route::middleware(['auth'])->group(function () {
         Route::get('/cities', [\App\Http\Controllers\Web\CampaignWebController::class, 'getCities']);
         Route::get('/qurbani-years', [\App\Http\Controllers\Web\CampaignWebController::class, 'getQurbaniYears']);
         Route::get('/products', [\App\Http\Controllers\Web\CampaignWebController::class, 'getProducts']);
-        Route::get('/quota', [\App\Http\Controllers\Web\CampaignWebController::class, 'quota']);
+        // Oct-2026 — product categories (Frozen / Mutton / …) for category tracking.
+        Route::get('/categories', [\App\Http\Controllers\Web\CampaignWebController::class, 'getCategories']);
+        Route::get('/quota',[\App\Http\Controllers\Web\CampaignWebController::class, 'quota']);
         // Landing view: allowance, live sends, per-template results, attention list.
         Route::get('/overview', [\App\Http\Controllers\Web\CampaignWebController::class, 'overview']);
         // Results grouped by template (per-campaign + combined unique). MUST stay
@@ -1080,6 +1082,12 @@ Route::middleware(['auth'])->group(function () {
         Route::post('/{id}/end', [\App\Http\Controllers\Web\CampaignWebController::class, 'end']);
         Route::post('/{id}/customers/{customerId}/skip', [\App\Http\Controllers\Web\CampaignWebController::class, 'skip']);
         Route::get('/{id}/stats', [\App\Http\Controllers\Web\CampaignWebController::class, 'stats']);
+        // Oct-2026 — Ordered / Tapped / Conversation / Waiting tile numbers
+        // (loaded after the list so the list stays fast), one customer's
+        // timeline, and changing what a running campaign counts as "Ordered".
+        Route::get('/{id}/engagement', [\App\Http\Controllers\Web\CampaignWebController::class, 'engagement']);
+        Route::get('/{id}/customers/{customerId}/timeline', [\App\Http\Controllers\Web\CampaignWebController::class, 'timeline']);
+        Route::post('/{id}/tracking', [\App\Http\Controllers\Web\CampaignWebController::class, 'updateTracking']);
     });
 
     // Customer Management Routes

@@ -454,6 +454,13 @@
     border-radius: 4px;
     cursor: pointer;
 }
+/* Inside a form group the generic uppercase block-label style used to win
+   over the row style (product picker rows rendered one word per line). */
+.camp-form-group label.camp-exclude-item {
+    display: flex; margin-bottom: 0; font-size: 12px; font-weight: 400;
+    color: #334155; text-transform: none; letter-spacing: 0;
+}
+.camp-form-group label.camp-exclude-item input { width: auto; flex: 0 0 auto; margin: 0; }
 .camp-exclude-item:hover {
     background: #f1f5f9;
 }
@@ -469,6 +476,29 @@
     border-radius: 8px;
     margin-left: 4px;
 }
+/* Oct-2026 — clickable result tiles, engagement badges, timeline */
+.camp-tile {
+    flex: 1; min-width: 92px; padding: 6px 8px; background: #fff;
+    border: 1px solid #e2e8f0; border-radius: 6px; cursor: pointer;
+    text-align: left; font: inherit; transition: border-color .15s, box-shadow .15s;
+}
+.camp-tile:hover { border-color: #a78bfa; }
+.camp-tile.active { border-color: #7c3aed; box-shadow: 0 0 0 2px #ede9fe; }
+.camp-tile .v { font-size: 16px; font-weight: 700; line-height: 1.1; }
+.camp-tile .l { font-size: 10px; color: #64748b; margin-top: 2px; }
+.camp-eng-badge {
+    font-size: 10px; font-weight: 600; padding: 2px 6px; border-radius: 8px;
+    margin-left: 4px; white-space: nowrap;
+}
+.camp-eng-tap   { background: #f3e8ff; color: #6b21a8; }
+.camp-eng-conv  { background: #e0f2fe; color: #075985; }
+.camp-eng-wait  { background: #fef3c7; color: #92400e; }
+.camp-name-link { cursor: pointer; }
+.camp-name-link:hover { color: #7c3aed; text-decoration: underline; }
+.camp-tl-item { display: flex; gap: 10px; padding: 7px 0; border-bottom: 1px dashed #eef2f7; font-size: 12px; }
+.camp-tl-time { width: 118px; flex-shrink: 0; color: #64748b; font-size: 11px; }
+.camp-tl-who  { width: 92px; flex-shrink: 0; font-weight: 600; font-size: 11px; }
+.camp-tl-text { flex: 1; color: #1e293b; white-space: pre-wrap; word-break: break-word; }
 .camp-shopify-badge {
     background: #dcfce7;
     color: #166534;
@@ -639,6 +669,7 @@
                     <label>What counts as success?</label>
                     <select id="filterTrackingType" onchange="onTrackingTypeChange(this.value)">
                         <option value="general">Any order they place</option>
+                        <option value="category">Only orders with a category (e.g. Frozen)</option>
                         <option value="products">Only orders with specific products</option>
                         <option value="app_orders">📱 Only orders placed through the customer app</option>
                     </select>
@@ -649,13 +680,24 @@
                 </div>
             </div>
 
+            {{-- Shown only for the category tracking type (Oct-2026). Same
+                 grouping as HQ: Frozen = Khaas + Table Talk products. --}}
+            <div class="camp-form-group" id="trackedCategoriesBox" style="display:none;">
+                <label>Which categories count?</label>
+                <div id="trackedCategoriesList" style="border:1px solid #d1d5db;border-radius:6px;padding:6px;max-height:150px;overflow-y:auto;background:#fafbfc;"></div>
+            </div>
+
             {{-- Shown only for the products tracking type. --}}
             <div class="camp-form-group" id="trackedProductsBox" style="display:none;">
                 <label>Which products count?</label>
-                <input type="text" id="productSearchInput" placeholder="Search products..." oninput="searchProducts(this.value)" style="margin-bottom:6px;">
+                <div style="display:flex;gap:6px;margin-bottom:6px;">
+                    <input type="text" id="productSearchInput" placeholder="Search products or a type, e.g. Khaas..." oninput="searchProducts(this.value)" style="flex:1;">
+                    <button type="button" class="camp-btn camp-btn-secondary" style="padding:3px 10px;font-size:11px;" onclick="selectAllShownProducts()">Select all shown</button>
+                </div>
                 <div id="trackedProductsList" style="border:1px solid #d1d5db;border-radius:6px;padding:6px;max-height:150px;overflow-y:auto;background:#fafbfc;">
                     <div style="font-size:12px;color:#94a3b8;padding:6px;">Type above to find products.</div>
                 </div>
+                <div id="trackedProductsCount" style="font-size:11px;color:#64748b;margin-top:4px;"></div>
             </div>
 
             {{-- App-install campaign helper. Tracking app orders only makes
@@ -801,6 +843,65 @@
     </div>
 </div>
 
+{{-- Oct-2026 — one customer's story after the message: receipts, every
+     WhatsApp message in the window (who sent it), and the orders. --}}
+<div class="camp-modal-overlay" id="timelineModal">
+    <div class="camp-modal" style="width:680px;">
+        <div class="camp-modal-header">
+            <h3 id="timelineTitle">Customer timeline</h3>
+            <button onclick="closeTimeline()" style="background:none;border:none;font-size:20px;cursor:pointer;color:#64748b;">&times;</button>
+        </div>
+        <div class="camp-modal-body" id="timelineBody"></div>
+    </div>
+</div>
+
+{{-- Oct-2026 — change what counts as "Ordered" on an existing campaign. --}}
+<div class="camp-modal-overlay" id="trackingModal">
+    <div class="camp-modal" style="width:560px;">
+        <div class="camp-modal-header">
+            <h3>Change tracking</h3>
+            <button onclick="closeTrackingModal()" style="background:none;border:none;font-size:20px;cursor:pointer;color:#64748b;">&times;</button>
+        </div>
+        <div class="camp-modal-body">
+            <div style="font-size:12px;color:#475569;margin-bottom:12px;line-height:1.5;">
+                This only changes how results are <b>counted</b> — nobody is messaged, added or removed. Results update straight away, including for messages already sent.
+            </div>
+            <div class="camp-form-row">
+                <div class="camp-form-group">
+                    <label>What counts as success?</label>
+                    <select id="trkEdit_filterTrackingType" onchange="onTrackingTypeChange(this.value, 'edit')">
+                        <option value="general">Any order they place</option>
+                        <option value="category">Only orders with a category (e.g. Frozen)</option>
+                        <option value="products">Only orders with specific products</option>
+                        <option value="app_orders">📱 Only orders placed through the customer app</option>
+                    </select>
+                </div>
+                <div class="camp-form-group">
+                    <label title="How long after the message an order still counts.">Count orders for (days)</label>
+                    <input type="number" id="trkEdit_filterTrackingDays" value="30" min="1" max="365">
+                </div>
+            </div>
+            <div class="camp-form-group" id="trkEdit_trackedCategoriesBox" style="display:none;">
+                <label>Which categories count?</label>
+                <div id="trkEdit_trackedCategoriesList" style="border:1px solid #d1d5db;border-radius:6px;padding:6px;max-height:180px;overflow-y:auto;background:#fafbfc;"></div>
+            </div>
+            <div class="camp-form-group" id="trkEdit_trackedProductsBox" style="display:none;">
+                <label>Which products count?</label>
+                <div style="display:flex;gap:6px;margin-bottom:6px;">
+                    <input type="text" id="trkEdit_productSearchInput" placeholder="Search products or a type, e.g. Khaas..." oninput="searchProducts(this.value, 'edit')" style="flex:1;">
+                    <button type="button" class="camp-btn camp-btn-secondary" style="padding:3px 10px;font-size:11px;" onclick="selectAllShownProducts('edit')">Select all shown</button>
+                </div>
+                <div id="trkEdit_trackedProductsList" style="border:1px solid #d1d5db;border-radius:6px;padding:6px;max-height:180px;overflow-y:auto;background:#fafbfc;"></div>
+                <div id="trkEdit_trackedProductsCount" style="font-size:11px;color:#64748b;margin-top:4px;"></div>
+            </div>
+        </div>
+        <div class="camp-modal-footer">
+            <button class="camp-btn camp-btn-secondary" onclick="closeTrackingModal()">Cancel</button>
+            <button class="camp-btn camp-btn-primary" id="trkEdit_saveBtn" onclick="saveTracking()">Save</button>
+        </div>
+    </div>
+</div>
+
 {{-- ==================================================================
      SEND DIALOG
      Replaces the old browser confirm(). A campaign send spends real money
@@ -845,6 +946,8 @@ let activeCampaignId = null;
 let activeCampaign = null;
 let campaignCustomers = [];
 let campaignCounts = null;
+let campaignEngagement = null;  // Ordered/Tapped/Conversation/Waiting — loadEngagement()
+let campaignTracking = null;    // what "Ordered" means for this campaign
 let customerStatusFilter = 'pending';
 // Client-side in-tab filters that narrow the currently-loaded campaign
 // customer list. Live search across name + phone + city, plus a Shopify
@@ -1152,6 +1255,7 @@ async function loadCampaignDetail(id, statusFilter, page) {
     activeCampaign = data.campaign;
     campaignCustomers = data.customers || [];
     campaignCounts = data.counts;
+    if (!sameCampaign) { campaignEngagement = null; campaignTracking = null; }
     if (data.pagination) detailPagination = { ...detailPagination, ...data.pagination };
     if (data.sort) detailSort = { by: data.sort.by, dir: data.sort.dir };
     if (data.quota) waQuota = data.quota;
@@ -1165,6 +1269,34 @@ async function loadCampaignDetail(id, statusFilter, page) {
     renderCampaignList();
     renderQuotaFooter();
     managePolling();
+    loadEngagement(id, myLoad);
+}
+
+// Ordered / Tapped / Conversation / Waiting need orders + the chat log, so
+// they arrive a moment after the list (server caches them 60s). The tiles
+// show "…" until then rather than a misleading 0.
+async function loadEngagement(id, loadSeq) {
+    let data;
+    try { data = await apiFetch(`/campaigns/${id}/engagement`); } catch (e) { return; }
+    if (loadSeq !== detailLoadSeq || activeCampaignId != id || !data || !data.success) return;
+    campaignEngagement = data.engagement;
+    campaignTracking = data.tracking;
+    const strip = document.getElementById('campFunnelStrip');
+    if (strip) strip.outerHTML = renderFunnelStrip(campaignCounts || {});
+}
+
+// The tile lists live alongside the status tabs; this is their label.
+const TILE_FILTER_LABELS = {
+    delivered: 'Delivered', read: 'Read', replied: 'Replied', tapped: 'Tapped a button',
+    conversation: 'Had a conversation', waiting: 'Waiting on us', ordered: 'Ordered',
+};
+
+function trackingLabel(t) {
+    if (!t) return '';
+    if (t.type === 'category') return (t.categories || []).join(' / ') + ' orders only';
+    if (t.type === 'products') return `orders with ${t.product_count} picked product${t.product_count === 1 ? '' : 's'}`;
+    if (t.type === 'app_orders') return 'app orders only';
+    return 'any order';
 }
 
 // While a background send is running, poll a small status endpoint so the
@@ -1572,7 +1704,8 @@ function renderOverviewTemplates(templates) {
         const lastSent = relDate(t.last_sent_at);
         const typeLabel = t.tracking_type === 'app_orders'
             ? '📱 app orders only'
-            : (t.tracking_type === 'products' ? 'specific products' : 'any order');
+            : (t.tracking_type === 'products' ? 'specific products'
+                : (t.tracking_type === 'category' ? 'a product category' : 'any order'));
 
         html += `
         <div style="padding:12px;border:1px solid #e2e8f0;border-radius:8px;margin-bottom:8px;background:#fff;cursor:pointer;"
@@ -1731,26 +1864,50 @@ function renderFunnelStrip(counts) {
     const undelivered  = parseInt(counts.undelivered || 0);
     const pct = (n) => sent > 0 ? Math.round((n / sent) * 1000) / 10 : 0;
 
-    if (tracked === 0) {
-        return `<div style="margin-top:10px;padding:8px 10px;background:#f8fafc;border:1px dashed #cbd5e1;border-radius:6px;font-size:11px;color:#64748b;">
-            <b>Delivery tracking not available for these sends.</b> WhatsApp delivered/read receipts are recorded from Jul-2026 onwards — messages sent before that have no receipt data. Replies: <b>${replied}</b>.
-        </div>`;
-    }
+    // Every tile opens the list of people behind its number (Oct-2026).
+    const e = campaignEngagement;
+    const cid = activeCampaign ? activeCampaign.id : 0;
+    const cell = (filter, label, val, pctVal, color, title) => `
+        <button type="button" class="camp-tile${customerStatusFilter === filter ? ' active' : ''}" title="${title} Click to see who."
+                onclick="loadCampaignDetail(${cid}, '${filter}')">
+            <div class="v" style="color:${color};">${val}</div>
+            <div class="l">${label}${pctVal !== null ? ' · ' + pctVal + '%' : ''}</div>
+        </button>`;
+    const eng = (key) => e ? parseInt(e[key] || 0) : '…';
+    const engPct = (key) => e ? pct(parseInt(e[key] || 0)) : null;
 
-    const cell = (label, val, pctVal, color, title) => `
-        <div style="flex:1;min-width:88px;padding:6px 8px;background:#fff;border:1px solid #e2e8f0;border-radius:6px;" title="${title}">
-            <div style="font-size:16px;font-weight:700;color:${color};line-height:1.1;">${val}</div>
-            <div style="font-size:10px;color:#64748b;margin-top:2px;">${label} · ${pctVal}%</div>
-        </div>`;
+    const receiptTiles = tracked === 0 ? '' : `
+            ${cell('delivered', 'Delivered', delivered, pct(delivered), '#0891b2', 'Reached the customer\'s phone, confirmed by WhatsApp.')}
+            ${cell('read', 'Read', readCount, pct(readCount), '#7c3aed', 'Opened by the customer. This is a minimum — anyone who turns read receipts off never reports a read, so the real number is higher.')}`;
+
+    const orderedVal = e ? parseInt(e.ordered || 0) : '…';
+    const orderedSub = e && parseInt(e.orders || 0) > 0
+        ? `<div class="l" style="color:#16a34a;">${e.orders} order${e.orders == 1 ? '' : 's'} · PKR ${Math.round(parseFloat(e.revenue || 0)).toLocaleString()}</div>` : '';
 
     return `
-    <div style="margin-top:10px;">
+    <div id="campFunnelStrip" style="margin-top:10px;">
+        ${tracked === 0 ? `<div style="margin-bottom:6px;padding:6px 10px;background:#f8fafc;border:1px dashed #cbd5e1;border-radius:6px;font-size:11px;color:#64748b;">
+            <b>Delivered/Read not available for these sends</b> — WhatsApp receipts are recorded from Jul-2026 onwards.
+        </div>` : ''}
         <div style="display:flex;gap:6px;flex-wrap:wrap;">
-            ${cell('Delivered', delivered, pct(delivered), '#0891b2', 'Reached the customer\'s phone, confirmed by WhatsApp.')}
-            ${cell('Read', readCount, pct(readCount), '#7c3aed', 'Opened by the customer. This is a minimum — anyone who turns read receipts off never reports a read, so the real number is higher.')}
-            ${cell('Replied', replied, pct(replied), '#2563eb', 'Sent us a WhatsApp message back within the tracking window.')}
-            ${undelivered > 0 ? cell('Undelivered', undelivered, pct(undelivered), '#dc2626', 'WhatsApp accepted the message but could not deliver it — a dead/blocked number, or WhatsApp\'s marketing frequency cap protecting busy inboxes. Check the reason on each row; frequency-capped ones can be requeued.') : ''}
+            ${receiptTiles}
+            ${cell('replied', 'Replied', replied, pct(replied), '#2563eb', 'Wrote back to us (a message, photo, voice note or reaction) within the tracking window. Button taps are counted separately.')}
+            ${cell('tapped', 'Tapped a button', eng('tapped'), engPct('tapped'), '#6b21a8', 'Tapped a quick-reply button on a message (e.g. Menu). The system answers these automatically.')}
+            ${cell('conversation', 'Conversation', eng('conversation'), engPct('conversation'), '#0369a1', 'They wrote to us AND someone from the team replied after that.')}
+            ${cell('waiting', 'Waiting on us', eng('waiting'), engPct('waiting'), '#b45309', 'They wrote to us and nobody from the team has replied since.')}
+            <button type="button" class="camp-tile${customerStatusFilter === 'ordered' ? ' active' : ''}" onclick="loadCampaignDetail(${cid}, 'ordered')"
+                    title="Placed an order inside the tracking window that matches this campaign's tracking. Click to see who.">
+                <div class="v" style="color:#16a34a;">${orderedVal}</div>
+                <div class="l">Ordered${e ? ' · ' + pct(parseInt(e.ordered || 0)) + '%' : ''}</div>
+                ${orderedSub}
+            </button>
+            ${undelivered > 0 ? cell('undelivered', 'Undelivered', undelivered, pct(undelivered), '#dc2626', 'WhatsApp accepted the message but could not deliver it — a dead/blocked number, or WhatsApp\'s marketing frequency cap protecting busy inboxes. Check the reason on each row; frequency-capped ones can be requeued.') : ''}
         </div>
+        ${campaignTracking ? `<div style="font-size:11px;color:#64748b;margin-top:6px;">
+            "Ordered" counts <b>${esc(trackingLabel(campaignTracking))}</b> within ${campaignTracking.window_days} days of the message.
+            <a href="#" onclick="openTrackingModal();return false;" style="color:#7c3aed;margin-left:4px;">Change tracking</a>
+            · <a href="#" onclick="openStatsModal(${cid});return false;" style="color:#7c3aed;">By category</a>
+        </div>` : ''}
     </div>`;
 }
 
@@ -1896,6 +2053,10 @@ function renderCampaignDetail() {
     ${renderSendStateBanner()}
     <div class="camp-actions-bar">
         ${filterBtns}
+        ${TILE_FILTER_LABELS[customerStatusFilter] ? `<span class="camp-filter-btn active" style="cursor:default;">
+            Showing: ${TILE_FILTER_LABELS[customerStatusFilter]} (${detailPagination.total || 0})
+            <a href="#" onclick="loadCampaignDetail(${c.id}, 'sent');return false;" title="Back to all sent" style="color:#fff;margin-left:6px;text-decoration:none;">×</a>
+        </span>` : ''}
         ${customerStatusFilter === 'undelivered' && (counts.undelivered || 0) > 0 && !isEnded ? `<button class="camp-btn camp-btn-secondary" style="margin-left:6px;" onclick="requeueAllUndelivered(${counts.undelivered})" title="Move every undelivered recipient back to Pending so a normal send can reach them again.">Requeue all ${counts.undelivered}</button>` : ''}
     </div>`;
 
@@ -2021,13 +2182,15 @@ function renderCampaignDetail() {
             <div class="camp-customer-row">
                 ${showCheckbox ? `<input type="checkbox" class="cust-checkbox" ${isChecked ? 'checked' : ''} onchange="toggleCustomer(${cu.customer_id}, this.checked)">` : ''}
                 <div class="camp-customer-info">
-                    <div class="camp-customer-name">${esc(name)}${replied ? '<span class="camp-reply-badge">Replied</span>' : ''}${isShopify ? '<span class="camp-shopify-badge" title="Customer has ordered via Shopify">🛍 Shopify</span>' : ''}${Number(cu.is_on_mobile_app) ? '<span class="camp-shopify-badge" title="Has ordered through the customer mobile app">📱 On app</span>' : ''}${renderReceiptBadge(cu)}</div>
+                    <div class="camp-customer-name">${cu.campaign_status === 'sent'
+                        ? `<span class="camp-name-link" onclick="openTimeline(${cu.customer_id})" title="See everything that happened after the message">${esc(name)}</span>`
+                        : esc(name)}${replied ? `<span class="camp-reply-badge" title="First reply ${esc(fmtDateTime(cu.replied_at))} — ${esc(gapText(cu.sent_at, cu.replied_at))} after the message">Replied</span>` : ''}${cu.tapped_at ? `<span class="camp-eng-badge camp-eng-tap" title="Tapped a button ${esc(fmtDateTime(cu.tapped_at))}">👆 Tapped</span>` : ''}${cu.conversation ? '<span class="camp-eng-badge camp-eng-conv" title="They wrote and the team replied">💬 Conversation</span>' : ''}${cu.waiting ? `<span class="camp-eng-badge camp-eng-wait" title="Wrote ${esc(fmtDateTime(cu.wrote_at))} — no reply from the team since">⏳ Waiting on us</span>` : ''}${isShopify ? '<span class="camp-shopify-badge" title="Customer has ordered via Shopify">🛍 Shopify</span>' : ''}${Number(cu.is_on_mobile_app) ? '<span class="camp-shopify-badge" title="Has ordered through the customer mobile app">📱 On app</span>' : ''}${renderReceiptBadge(cu)}</div>
                     <div class="camp-customer-phone">${esc(phone)}</div>
                     <div class="camp-customer-details">
                         ${cu.city ? `<span>${esc(cu.city)}</span>` : ''}
                         ${cu.last_order_date ? `<span title="Last order">Last: ${esc(String(cu.last_order_date).substring(0,10))}</span>` : '<span style="color:#94a3b8;">Never ordered</span>'}
                         ${Number(cu.lifetime_orders) > 0 ? `<span title="Lifetime, computed live from delivered orders — this is what the spend/orders sort ranks by">${Number(cu.lifetime_orders)} order${Number(cu.lifetime_orders) === 1 ? '' : 's'} · PKR ${Number(cu.lifetime_spent || 0).toLocaleString()}</span>` : ''}
-                        ${cu.order_count > 0 ? `<span style="color:#16a34a;font-weight:600;" title="Orders placed after this campaign message, inside the tracking window">${cu.order_count} after${cu.order_revenue ? ' · PKR ' + parseFloat(cu.order_revenue).toLocaleString() : ''}</span>` : ''}
+                        ${cu.order_count > 0 ? `<span style="color:#16a34a;font-weight:600;" title="Orders placed after this campaign message, inside the tracking window">${cu.order_count} after${cu.order_revenue ? ' · PKR ' + parseFloat(cu.order_revenue).toLocaleString() : ''}${cu.first_order_at ? ' · first ' + esc(gapText(cu.sent_at, cu.first_order_at)) + ' later' : ''}</span>` : ''}
                     </div>
                     ${tagsHtml}
                     ${(() => {
@@ -2066,6 +2229,7 @@ function renderCampaignDetail() {
                     ${cu.campaign_status === 'sent' && cu.undelivered_at && !isEnded ? `
                         <button class="camp-btn camp-btn-secondary" onclick="requeueSingle(${cu.customer_id}, '${esc(name)}')" title="Put them back in Pending so they can be sent again. WhatsApp refused the last delivery — they never received it, so a resend is a retry, not a repeat.">Requeue</button>
                     ` : ''}
+                    ${cu.campaign_status === 'sent' ? `<button class="camp-btn camp-btn-secondary" onclick="openTimeline(${cu.customer_id})" title="Replies, team answers and orders after the message">Timeline</button>` : ''}
                 </div>
             </div>`;
         });
@@ -2619,7 +2783,10 @@ async function openStatsModal(id) {
         return;
     }
 
-    const s = data.stats;
+    renderStatsBody(data.stats);
+}
+
+function renderStatsBody(s) {
     // A tracking_note means the campaign's setup can't fully deliver what its
     // type implies (e.g. "products" with no products saved). Shown first so the
     // numbers below are read with that caveat in mind.
@@ -2627,31 +2794,82 @@ async function openStatsModal(id) {
         ? `<div style="margin-bottom:12px;padding:9px 11px;background:#fffbeb;border:1px solid #fde68a;border-radius:6px;font-size:11px;color:#92400e;line-height:1.5;">${esc(s.tracking_note)}</div>`
         : '';
 
+    const changeBtn = `<div style="display:flex;justify-content:flex-end;margin-bottom:8px;">
+        <button class="camp-btn camp-btn-secondary" style="padding:3px 10px;font-size:11px;" onclick="openTrackingModal()">Change tracking</button>
+    </div>`;
+
     document.getElementById('statsBody').innerHTML =
-        note
-        + renderFunnelBlock(s.funnel, s.tracking_window_days, s.tracking_type)
+        changeBtn
+        + note
+        + renderFunnelBlock(s.funnel, s.tracking_window_days, s.tracking_type, s.engagement, s.tracked_categories)
+        + renderCategoryBreakdown(s.category_breakdown, s.tracked_categories)
         + renderSourceSplitBlock(s.source_split, s.funnel.orders)
         + renderProductBreakdown(s.product_breakdown)
         + renderRunHistoryBlock();
 }
 
+// What the people who ordered after the message actually bought — on every
+// campaign, whatever it tracks. Answers "of those who ordered, how many took
+// frozen vs mutton vs chicken".
+function renderCategoryBreakdown(cb, trackedCats) {
+    if (!cb || !cb.rows || !cb.rows.length) return '';
+    const tracked = trackedCats || [];
+    let html = `<h4 style="font-size:13px;font-weight:600;margin:0 0 4px;">By category</h4>
+    <div style="font-size:11px;color:#64748b;margin-bottom:8px;line-height:1.5;">
+        Everyone who ordered <b>anything</b> after the message (${cb.any.customers} customer${cb.any.customers == 1 ? '' : 's'}, ${cb.any.orders} order${cb.any.orders == 1 ? '' : 's'}), split by what was in their orders.
+        One order can contain several categories, so the rows add up to more than the total.
+    </div>
+    <table style="width:100%;border-collapse:collapse;font-size:12px;margin-bottom:6px;">
+        <thead><tr style="color:#64748b;text-align:left;">
+            <th style="padding:4px 6px;font-weight:600;">Category</th>
+            <th style="padding:4px 6px;font-weight:600;text-align:right;">Customers</th>
+            <th style="padding:4px 6px;font-weight:600;text-align:right;">Orders</th>
+            <th style="padding:4px 6px;font-weight:600;text-align:right;" title="Value of that category's items only, not the whole order">Item value</th>
+        </tr></thead><tbody>`;
+    cb.rows.forEach(r => {
+        const isTracked = tracked.includes(r.category);
+        const isFrozen = r.category === cb.frozen_label;
+        html += `<tr style="border-top:1px solid #f1f5f9;${isTracked ? 'background:#f5f3ff;font-weight:600;' : ''}">
+            <td style="padding:5px 6px;">${esc(r.category)}${isTracked ? ' <span style="font-size:10px;color:#7c3aed;">tracked</span>' : ''}
+                ${isFrozen && cb.new_to_frozen > 0 ? `<div style="font-size:10px;color:#16a34a;font-weight:600;">${cb.new_to_frozen} bought frozen for the first time</div>` : ''}</td>
+            <td style="padding:5px 6px;text-align:right;">${r.customers}</td>
+            <td style="padding:5px 6px;text-align:right;">${r.orders}</td>
+            <td style="padding:5px 6px;text-align:right;">PKR ${Math.round(r.value).toLocaleString()}</td>
+        </tr>`;
+    });
+    html += `</tbody></table>
+    <div style="font-size:10px;color:#94a3b8;margin-bottom:16px;line-height:1.5;">
+        Same grouping as HQ (Frozen = Khaas + Table Talk products). "First time" is only shown for frozen: older meat orders are on the previous catalog, so it can't be worked out reliably for meat.
+    </div>`;
+    return html;
+}
+
 // The full funnel, with each step's meaning spelled out. The percentages are all
 // relative to Sent, so they read as one narrowing story rather than five
 // unrelated numbers.
-function renderFunnelBlock(f, windowDays, trackingType) {
+function renderFunnelBlock(f, windowDays, trackingType, engagement, trackedCats) {
+    const eg = engagement || {};
+    const egPct = (n) => f.sent > 0 ? Math.round((n / f.sent) * 1000) / 10 : 0;
     const rows = [
         ['Sent',        f.sent,        null,                'Messages WhatsApp accepted from us.', '#0f172a'],
         ['Delivered',   f.delivered,   f.rates.delivered,   'Confirmed as reaching the phone.', '#0891b2'],
         ['Read',        f.read,        f.rates.read,        'Opened by the customer. A minimum only — people who turn read receipts off never report a read.', '#7c3aed'],
-        ['Replied',     f.replied,     f.rates.replied,     'Wrote back to us on WhatsApp.', '#2563eb'],
-        ['Ordered',     f.ordered,     f.rates.ordered,     `Placed an order within ${windowDays} days of the message. Counted as soon as the order exists — cancelled orders are excluded.`, '#16a34a'],
+        ['Replied',     f.replied,     f.rates.replied,     'Wrote back to us on WhatsApp — a message, photo, voice note or reaction. Button taps are not counted here.', '#2563eb'],
     ];
+    if (engagement) {
+        rows.push(['Tapped a button',     eg.tapped || 0,       egPct(eg.tapped || 0),       'Tapped a quick-reply button (e.g. Menu). The system answers these automatically.', '#6b21a8']);
+        rows.push(['Had a conversation',  eg.conversation || 0, egPct(eg.conversation || 0), 'They wrote to us and someone from the team replied after that.', '#0369a1']);
+        rows.push(['Waiting on us',       eg.waiting || 0,      egPct(eg.waiting || 0),      'They wrote to us and nobody from the team has replied since.', '#b45309']);
+    }
+    rows.push(['Ordered', f.ordered, f.rates.ordered, `Placed an order within ${windowDays} days of the message. Counted as soon as the order exists — cancelled orders are excluded.`, '#16a34a']);
 
     const typeNote = trackingType === 'app_orders'
         ? `Only orders placed <b>through the customer app</b> count as a conversion here.`
         : (trackingType === 'products'
             ? `Only orders containing the <b>tracked products</b> count as a conversion here.`
-            : `Any delivered order within the window counts.`);
+            : (trackingType === 'category'
+                ? `Only orders containing <b>${esc((trackedCats || []).join(' / ') || 'the tracked category')}</b> products count as a conversion here.`
+                : `Any order placed within the window counts.`));
 
     let html = `<h4 style="font-size:13px;font-weight:600;margin:0 0 10px;">Funnel</h4>`;
 
@@ -2753,6 +2971,194 @@ function renderRunHistoryBlock() {
         </div>`;
     });
     return html + '</div>';
+}
+
+// ==========================================================================
+// TIMELINE (Oct-2026) — one customer's story after the message
+// ==========================================================================
+
+function fmtDateTime(v) {
+    if (!v) return '';
+    const s = String(v).replace('T', ' ');
+    const d = new Date(s.replace(' ', 'T'));
+    if (isNaN(d)) return s.substring(0, 16);
+    return d.toLocaleString('en-GB', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' });
+}
+
+// "3h 10m", "2d 4h" — how long after the message something happened.
+function gapText(from, to) {
+    if (!from || !to) return '';
+    const a = new Date(String(from).replace(' ', 'T'));
+    const b = new Date(String(to).replace(' ', 'T'));
+    if (isNaN(a) || isNaN(b)) return '';
+    let mins = Math.max(0, Math.round((b - a) / 60000));
+    if (mins < 60) return mins + 'm';
+    const hrs = Math.floor(mins / 60); mins = mins % 60;
+    if (hrs < 24) return hrs + 'h' + (mins ? ' ' + mins + 'm' : '');
+    const days = Math.floor(hrs / 24);
+    return days + 'd' + (hrs % 24 ? ' ' + (hrs % 24) + 'h' : '');
+}
+
+async function openTimeline(customerId) {
+    if (!activeCampaignId) return;
+    document.getElementById('timelineModal').classList.add('open');
+    document.getElementById('timelineTitle').textContent = 'Customer timeline';
+    document.getElementById('timelineBody').innerHTML = '<div style="text-align:center;padding:30px;"><div class="camp-spinner camp-spinner-dark"></div></div>';
+
+    let data;
+    try { data = await apiFetch(`/campaigns/${activeCampaignId}/customers/${customerId}/timeline`); } catch (e) { data = null; }
+    if (!data || !data.success) {
+        document.getElementById('timelineBody').innerHTML = `<p style="text-align:center;color:#dc2626;">${esc((data && data.message) || 'Could not load the timeline.')}</p>`;
+        return;
+    }
+    renderTimeline(data.timeline);
+}
+
+function closeTimeline() {
+    document.getElementById('timelineModal').classList.remove('open');
+}
+
+function renderTimeline(t) {
+    const cu = t.customer || {};
+    const name = ((cu.first_name || '') + ' ' + (cu.last_name || '')).trim() || 'Customer';
+    const phone = cu.phone || cu.phone_normalized || '';
+    document.getElementById('timelineTitle').textContent = name;
+
+    const r = t.row || {};
+    const s = t.summary;
+    const sent = r.sent_at;
+    const fact = (label, val, color) => `<div style="flex:1;min-width:120px;padding:7px 9px;border:1px solid #e2e8f0;border-radius:6px;">
+        <div style="font-size:10px;color:#64748b;">${label}</div>
+        <div style="font-size:12px;font-weight:600;color:${color || '#0f172a'};margin-top:2px;">${val}</div>
+    </div>`;
+    const when = (v) => v ? `${esc(fmtDateTime(v))} <span style="color:#94a3b8;font-weight:400;">(+${esc(gapText(sent, v))})</span>` : '<span style="color:#94a3b8;font-weight:400;">—</span>';
+
+    let html = `<div style="font-size:12px;color:#64748b;margin-bottom:10px;">
+        ${esc(phone)}${cu.city ? ' · ' + esc(cu.city) : ''}
+        ${phone ? ` · <a href="/messages?focus_phone=${encodeURIComponent(phone)}" target="_blank" style="color:#7c3aed;">Open chat ↗</a>` : ''}
+    </div>`;
+
+    if (r.status !== 'sent' || !s) {
+        html += `<div style="padding:12px;background:#f8fafc;border-radius:6px;font-size:12px;color:#64748b;">Not sent yet (status: ${esc(r.status || '?')}).</div>`;
+        document.getElementById('timelineBody').innerHTML = html;
+        return;
+    }
+
+    html += `<div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px;">
+        ${fact('Message sent', esc(fmtDateTime(sent)))}
+        ${fact('Delivered', r.undelivered_at ? '<span style="color:#dc2626;">Not delivered</span>' : when(r.delivered_at || r.read_at), '#0891b2')}
+        ${fact('Read', when(r.read_at), '#7c3aed')}
+    </div>
+    <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px;">
+        ${fact('First reply', when(s.replied_at), '#2563eb')}
+        ${fact('Tapped a button', when(s.tapped_at), '#6b21a8')}
+        ${fact('Team answered', s.team_replied_at
+            ? `${esc(fmtDateTime(s.team_replied_at))} <span style="color:#94a3b8;font-weight:400;">(${esc(gapText(s.wrote_at, s.team_replied_at))} after they wrote)</span>`
+            : (s.waiting ? '<span style="color:#b45309;">Not yet — waiting on us</span>' : '<span style="color:#94a3b8;font-weight:400;">—</span>'), '#0369a1')}
+    </div>
+    <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:14px;">
+        ${fact('First counted order', s.first_order_at ? when(s.first_order_at) : '<span style="color:#94a3b8;font-weight:400;">None</span>', '#16a34a')}
+        ${fact('Window ends', esc(fmtDateTime(s.window_ends_at)))}
+    </div>`;
+
+    // Orders
+    html += `<h4 style="font-size:13px;font-weight:600;margin:0 0 6px;">Orders in the window (${(t.orders || []).length})</h4>`;
+    if (!(t.orders || []).length) {
+        html += `<div style="font-size:12px;color:#94a3b8;margin-bottom:14px;">No orders within ${t.campaign.window_days} days of the message.</div>`;
+    } else {
+        html += '<div style="margin-bottom:14px;">';
+        t.orders.forEach(o => {
+            const cancelled = ['cancelled', 'refunded'].includes(String(o.status || '').toLowerCase());
+            html += `<div style="display:flex;gap:8px;align-items:center;padding:6px 8px;border:1px solid ${o.counts ? '#bbf7d0' : '#e2e8f0'};background:${o.counts ? '#f0fdf4' : '#fff'};border-radius:6px;margin-bottom:5px;font-size:12px;flex-wrap:wrap;">
+                <b>${esc(o.order_number || ('#' + o.id))}</b>
+                <span style="color:#64748b;">${esc(fmtDateTime(o.order_date))} (+${esc(gapText(sent, o.order_date))})</span>
+                <span>PKR ${Math.round(o.total_price || 0).toLocaleString()}</span>
+                <span style="color:#64748b;">${esc(o.status || '')}</span>
+                <span style="flex:1;font-size:11px;color:#475569;">${(o.categories || []).map(esc).join(' · ')}</span>
+                <span style="font-size:10px;font-weight:600;color:${o.counts ? '#16a34a' : '#94a3b8'};" title="${o.counts ? 'Counts as Ordered for this campaign' : (cancelled ? 'Cancelled/refunded orders never count' : 'Does not match this campaign\'s tracking')}">${o.counts ? '✓ counts' : (cancelled ? 'cancelled' : 'not tracked')}</span>
+            </div>`;
+        });
+        html += '</div>';
+    }
+
+    // Messages
+    const who = {
+        campaign: ['Campaign', '#7c3aed'], wrote: ['Customer', '#2563eb'], reaction: ['Reaction', '#2563eb'],
+        tap: ['Tapped', '#6b21a8'], team: ['Team', '#0369a1'], system: ['Automatic', '#94a3b8'],
+    };
+    html += `<h4 style="font-size:13px;font-weight:600;margin:0 0 6px;">WhatsApp after the message (${(t.messages || []).length}${s.messages_capped ? '+' : ''})</h4>`;
+    if (!(t.messages || []).length) {
+        html += `<div style="font-size:12px;color:#94a3b8;">No messages found in the chat for this window${phone ? '' : ' (no phone on record)'}.</div>`;
+    } else {
+        t.messages.forEach(m => {
+            const [label, color] = who[m.kind] || ['', '#64748b'];
+            // Templates show their name (the body is a template, not chat);
+            // media without a caption shows its type.
+            const text = m.template ? `Template: ${m.template}` : (m.text || `[${m.type}]`);
+            html += `<div class="camp-tl-item">
+                <div class="camp-tl-time">${esc(fmtDateTime(m.at))}</div>
+                <div class="camp-tl-who" style="color:${color};">${label}${m.kind === 'team' && m.staff ? `<div style="font-weight:400;color:#64748b;">${esc(m.staff)}</div>` : ''}</div>
+                <div class="camp-tl-text"${m.template ? ' style="color:#64748b;"' : ''}>${esc(text)}</div>
+            </div>`;
+        });
+        if (s.messages_capped) html += `<div style="font-size:11px;color:#94a3b8;margin-top:6px;">Showing the first 150 messages — open the chat for the rest.</div>`;
+    }
+
+    document.getElementById('timelineBody').innerHTML = html;
+}
+
+// ==========================================================================
+// CHANGE TRACKING (Oct-2026) — what counts as "Ordered" on a live campaign
+// ==========================================================================
+
+async function openTrackingModal() {
+    if (!activeCampaign) return;
+    const c = activeCampaign;
+    const type = c.tracking_type || 'general';
+    trackedProductIds = (() => { try { return (JSON.parse(c.tracked_product_ids || '[]') || []).map(Number); } catch (e) { return []; } })();
+    trackedCategories = (() => { try { return JSON.parse(c.tracked_categories || '[]') || []; } catch (e) { return []; } })();
+    document.getElementById('trkEdit_filterTrackingType').value = type;
+    document.getElementById('trkEdit_filterTrackingDays').value = c.tracking_window_days || 30;
+    document.getElementById('trkEdit_productSearchInput').value = '';
+    document.getElementById('trackingModal').classList.add('open');
+    onTrackingTypeChange(type, 'edit');
+}
+
+function closeTrackingModal() {
+    document.getElementById('trackingModal').classList.remove('open');
+}
+
+async function saveTracking() {
+    if (!activeCampaign) return;
+    const type = document.getElementById('trkEdit_filterTrackingType').value;
+    if (type === 'products' && !trackedProductIds.length) { alert('Pick at least one product, or choose another option.'); return; }
+    if (type === 'category' && !trackedCategories.length) { alert('Tick at least one category (e.g. Khaas · Frozen), or choose another option.'); return; }
+
+    const btn = document.getElementById('trkEdit_saveBtn');
+    btn.disabled = true;
+    btn.innerHTML = '<span class="camp-spinner"></span> Saving...';
+    const data = await apiFetch(`/campaigns/${activeCampaign.id}/tracking`, {
+        method: 'POST',
+        body: JSON.stringify({
+            tracking_type: type,
+            tracked_product_ids: type === 'products' ? trackedProductIds : [],
+            tracked_categories: type === 'category' ? trackedCategories : [],
+            tracking_window_days: parseInt(document.getElementById('trkEdit_filterTrackingDays').value) || 30,
+            with_stats: document.getElementById('statsModal').classList.contains('open'),
+        })
+    });
+    btn.disabled = false;
+    btn.innerHTML = 'Save';
+
+    if (!data || !data.success) {
+        alert((data && data.message) || 'Could not save tracking.');
+        return;
+    }
+    closeTrackingModal();
+    campaignEngagement = null;
+    campaignTracking = null;
+    if (document.getElementById('statsModal').classList.contains('open') && data.stats) renderStatsBody(data.stats);
+    loadCampaignDetail(activeCampaign.id);
 }
 
 function closeStatsModal() {
@@ -2910,6 +3316,7 @@ function resetCreateForm() {
     document.getElementById('previewResult').style.display = 'none';
     selectedTemplateName = '';
     trackedProductIds = [];
+    trackedCategories = [];
     updateTemplateSelectBtn();
     onTrackingTypeChange('general');
     // New campaigns skip phoneless customers by default — they can only ever
@@ -2922,13 +3329,66 @@ function resetCreateForm() {
 // ==========================================================================
 
 let trackedProductIds = [];
+let trackedCategories = [];
+let categoryOptions = null;     // [{category, products}] — loaded once
+let categoryTrackingAvailable = true;
 
-function onTrackingTypeChange(val) {
-    const box = document.getElementById('trackedProductsBox');
-    const hint = document.getElementById('appCampaignHint');
+// The tracking editor appears twice: in the Create form and in the
+// "Change tracking" dialog. Same functions, different element ids —
+// the dialog's ids carry a 'trkEdit_' prefix.
+function trkId(base, scope) {
+    return scope === 'edit' ? 'trkEdit_' + base : base;
+}
+
+function onTrackingTypeChange(val, scope) {
+    const box  = document.getElementById(trkId('trackedProductsBox', scope));
+    const cbox = document.getElementById(trkId('trackedCategoriesBox', scope));
+    const hint = scope === 'edit' ? null : document.getElementById('appCampaignHint');
     if (box)  box.style.display  = val === 'products'   ? 'block' : 'none';
+    if (cbox) cbox.style.display = val === 'category'   ? 'block' : 'none';
     if (hint) hint.style.display = val === 'app_orders' ? 'block' : 'none';
-    if (val === 'products' && !productOptions.length) searchProducts('');
+    if (val === 'products') searchProducts(document.getElementById(trkId('productSearchInput', scope))?.value || '', scope);
+    if (val === 'category') loadCategoryOptions(scope);
+}
+
+async function loadCategoryOptions(scope) {
+    if (!categoryOptions) {
+        const data = await apiFetch('/campaigns/categories');
+        if (data.success) {
+            categoryOptions = data.categories || [];
+            categoryTrackingAvailable = data.available !== false;
+        } else {
+            categoryOptions = [];
+        }
+    }
+    renderCategoryPicker(scope);
+}
+
+function renderCategoryPicker(scope) {
+    const el = document.getElementById(trkId('trackedCategoriesList', scope));
+    if (!el) return;
+    if (!categoryTrackingAvailable) {
+        el.innerHTML = '<div style="font-size:12px;color:#b45309;padding:6px;">Category tracking needs the Oct-2026 database update before it can be saved.</div>';
+        return;
+    }
+    if (!categoryOptions || !categoryOptions.length) {
+        el.innerHTML = '<div style="font-size:12px;color:#94a3b8;padding:6px;">No categories found.</div>';
+        return;
+    }
+    el.innerHTML = categoryOptions.map(c => `
+        <label class="camp-exclude-item">
+            <input type="checkbox" ${trackedCategories.includes(c.category) ? 'checked' : ''} onchange="toggleTrackedCategory('${esc(c.category).replace(/'/g, "\\'")}', this.checked)">
+            <span style="flex:1;">${esc(c.category)}</span>
+            <span style="font-size:11px;color:#94a3b8;">${c.products} product${c.products === 1 ? '' : 's'}</span>
+        </label>`).join('');
+}
+
+function toggleTrackedCategory(cat, checked) {
+    if (checked) {
+        if (!trackedCategories.includes(cat)) trackedCategories.push(cat);
+    } else {
+        trackedCategories = trackedCategories.filter(x => x !== cat);
+    }
 }
 
 // One-click setup for the app-install campaign: audience = people NOT already
@@ -2941,34 +3401,49 @@ function applyAppInstallPreset() {
     alert('Audience set to customers who are NOT on the app yet. Preview the count to see how many that is.');
 }
 
-async function searchProducts(q) {
+let productSearchSeq = 0;
+async function searchProducts(q, scope) {
+    const mine = ++productSearchSeq;
     const data = await apiFetch(`/campaigns/products?q=${encodeURIComponent(q || '')}`);
+    if (mine !== productSearchSeq) return;   // a newer keystroke won
     if (data.success) {
         productOptions = data.products || [];
-        renderProductPicker();
+        renderProductPicker(scope);
     }
 }
 
-function renderProductPicker() {
-    const el = document.getElementById('trackedProductsList');
+function renderProductPicker(scope) {
+    const el = document.getElementById(trkId('trackedProductsList', scope));
     if (!el) return;
+    const countEl = document.getElementById(trkId('trackedProductsCount', scope));
+    if (countEl) countEl.textContent = trackedProductIds.length ? `${trackedProductIds.length} product${trackedProductIds.length === 1 ? '' : 's'} selected` : '';
     if (!productOptions.length) {
         el.innerHTML = '<div style="font-size:12px;color:#94a3b8;padding:6px;">No products found.</div>';
         return;
     }
-    el.innerHTML = productOptions.slice(0, 80).map(p => `
+    el.innerHTML = productOptions.map(p => `
         <label class="camp-exclude-item">
-            <input type="checkbox" ${trackedProductIds.includes(p.id) ? 'checked' : ''} onchange="toggleTrackedProduct(${p.id}, this.checked)">
+            <input type="checkbox" ${trackedProductIds.includes(p.id) ? 'checked' : ''} onchange="toggleTrackedProduct(${p.id}, this.checked, '${scope || ''}')">
             <span style="flex:1;">${esc(p.title || ('Product #' + p.id))}</span>
+            ${p.category ? `<span style="font-size:10px;color:#64748b;background:#f1f5f9;padding:1px 6px;border-radius:8px;white-space:nowrap;">${esc(p.category)}</span>` : ''}
         </label>`).join('');
 }
 
-function toggleTrackedProduct(id, checked) {
+function toggleTrackedProduct(id, checked, scope) {
     if (checked) {
         if (!trackedProductIds.includes(id)) trackedProductIds.push(id);
     } else {
         trackedProductIds = trackedProductIds.filter(x => x !== id);
     }
+    const countEl = document.getElementById(trkId('trackedProductsCount', scope));
+    if (countEl) countEl.textContent = trackedProductIds.length ? `${trackedProductIds.length} product${trackedProductIds.length === 1 ? '' : 's'} selected` : '';
+}
+
+// Tick every product the current search shows — search "Khaas" and one
+// click picks the whole frozen range instead of 20 separate ticks.
+function selectAllShownProducts(scope) {
+    productOptions.forEach(p => { if (!trackedProductIds.includes(p.id)) trackedProductIds.push(p.id); });
+    renderProductPicker(scope);
 }
 
 // ==========================================================================
@@ -3323,6 +3798,12 @@ async function createCampaign() {
         alert('You chose to track specific products but haven\'t picked any. Select at least one product, or switch back to "Any order they place".');
         return;
     }
+    if (trackingType === 'category' && trackedCategories.length === 0) {
+        btn.disabled = false;
+        btn.innerHTML = 'Create Campaign';
+        alert('You chose to track a category but haven\'t picked one. Tick a category (e.g. Khaas · Frozen), or switch back to "Any order they place".');
+        return;
+    }
 
     const data = await apiFetch('/campaigns/create', {
         method: 'POST',
@@ -3333,6 +3814,7 @@ async function createCampaign() {
             filters: buildFilters('create'),
             tracking_type: trackingType,
             tracked_product_ids: trackingType === 'products' ? trackedProductIds : [],
+            tracked_categories: trackingType === 'category' ? trackedCategories : [],
             tracking_window_days: parseInt(document.getElementById('filterTrackingDays').value) || 30,
             dedup_window_days: Number.isFinite(dedupDays) ? dedupDays : 0,
             session_limit: Number.isFinite(sessionLimit) && sessionLimit > 0 ? sessionLimit : 100,
