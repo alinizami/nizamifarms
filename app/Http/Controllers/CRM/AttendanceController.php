@@ -1123,7 +1123,24 @@ class AttendanceController extends Controller
         } elseif (str_ends_with($type, '_absent')) {
             // Absent is only meaningful up to today (future working days aren't absences yet).
             $dates = $this->absentWorkingDates($userId, $shiftService, $start, min($end, $today));
-            $items = array_map(fn($d) => ['date' => $d, 'label' => null], $dates);
+            // Each date says what its MONTH's absence decision was (Oct-20 2026) — a decision is
+            // per employee-month. Undecided months stay unlabelled.
+            $decByMonth = [];
+            foreach ((($this->absenceDecisionSummary($userId) ?? [])['months'] ?? []) as $m) {
+                $decByMonth[$m['month']] = $m;
+            }
+            $items = array_map(function ($d) use ($decByMonth) {
+                $m = $decByMonth[substr($d, 0, 7)] ?? null;
+                if (!$m) { return ['date' => $d, 'label' => null]; }
+                // A decision covers only the days it froze; a day absent AFTER it is outside it.
+                if ($m['decided_at'] && $d > $m['decided_at']) {
+                    return ['date' => $d, 'label' => 'after the decision · not decided'];
+                }
+                $word = ['park' => 'parked', 'excuse' => 'excused', 'cut' => 'deducted'][$m['decision']] ?? $m['decision'];
+                $by = $m['decided_by_name'] ? ' · by ' . $m['decided_by_name'] : '';
+                $on = $m['decided_at'] ? ' · ' . date('j M', strtotime($m['decided_at'])) : '';
+                return ['date' => $d, 'label' => $word . $by . $on];
+            }, $dates);
         } else {
             $leaveMap = $this->approvedLeaveDates($userId, $start, $end);
             ksort($leaveMap);
@@ -1132,6 +1149,33 @@ class AttendanceController extends Controller
         }
 
         return response()->json(['success' => true, 'type' => $type, 'count' => count($items), 'dates' => $items]);
+    }
+
+    private ?\App\Services\HR\AbsenceDecisionService $absenceSvcMemo = null;
+
+    /**
+     * Every absence decision recorded for one employee (oldest month first) and the days still
+     * owed — read-only, straight from AbsenceDecisionService, the engine Payroll decides with.
+     * Null when the feature is off or nothing was ever decided. One service instance per
+     * request so the table check runs once for the whole Month grid.
+     */
+    private function absenceDecisionSummary(int $userId): ?array
+    {
+        try {
+            $svc = $this->absenceSvcMemo ??= new \App\Services\HR\AbsenceDecisionService();
+            if (!$svc->enabled()) { return null; }
+            $rows = array_reverse($svc->historyFor($userId));   // historyFor is newest first
+            if (!$rows) { return null; }
+            $keep = ['month', 'days_absent', 'decision', 'decided_by_name', 'decided_at', 'covered_ot',
+                     'covered_leave', 'days_cut', 'amount_cut_later', 'cut_in_month', 'cut_paid_at',
+                     'days_excused', 'outstanding', 'notes'];
+            return [
+                'owed'   => $svc->outstandingDays($userId),
+                'months' => array_map(fn ($r) => array_intersect_key($r, array_flip($keep)), $rows),
+            ];
+        } catch (\Throwable $e) {
+            return null;   // a missing history must never blank the Month grid
+        }
     }
 
     /**
@@ -3285,6 +3329,10 @@ class AttendanceController extends Controller
             } catch (\Throwable $e) {
                 $userData['leave_remaining'] = null;
             }
+
+            // ⭐ Oct-20 2026 — Absent (yr) is only a count; say what was DECIDED about those days
+            // (parked / excused / deducted, by whom) and what is still owed. Same rows Payroll reads.
+            $userData['absence_decisions'] = $this->absenceDecisionSummary($userId);
         }
         
         Log::info('Monthly report processed', [

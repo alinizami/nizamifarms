@@ -263,6 +263,17 @@ class OrderController extends Controller
             // non-fatal — ticks just don't show on first paint
         }
 
+        // ✂ Oct-2026 — split-invoice links for the first paint (filter() does the
+        // AJAX refetches). Live rows only — staging ids collide with live ids.
+        if ($source !== 'shopify') {
+            $pageOrdersForSplit = collect($orders->items());
+            $splitRelMap = \App\Services\CRM\OrderSplitService::relationsFor($pageOrdersForSplit->pluck('id')->all());
+            foreach ($pageOrdersForSplit as $o) {
+                $o->split_from = $splitRelMap[$o->id]['split_from'] ?? null;
+                $o->split_into = $splitRelMap[$o->id]['split_into'] ?? [];
+            }
+        }
+
         // Jul-2026 — "this automation is running" strips for the Open Orders tab.
         // SEASONAL WhatsApp automations (the monsoon storage guidelines) are easy
         // to switch on and then forget for months, so every rule that declares
@@ -2338,7 +2349,9 @@ class OrderController extends Controller
                         try {
                             $result = $this->handlePaymentMethodChange($order, $ledger, $newPaymentMethod, $oldPaymentMethod);
                             $paymentMethodChanged = true;
-                            $paymentMethodChangeMessage = "Payment method changed from '{$oldPaymentMethod}' to '{$newPaymentMethod}'. Ledger entry updated.";
+                            $paymentMethodChangeMessage = $result['new_ledger_id']
+                                ? "Payment method changed from '{$oldPaymentMethod}' to '{$newPaymentMethod}'. Ledger entry updated."
+                                : "Payment method changed from '{$oldPaymentMethod}' to '{$newPaymentMethod}'. Cash invoice reversed — this shop order is now settled from Online Approvals → Shop tab.";
                             
                             \Log::info("Payment method changed successfully", [
                                 'order_id' => $order->id,
@@ -2352,7 +2365,23 @@ class OrderController extends Controller
                                 'order_id' => $order->id,
                                 'error' => $e->getMessage()
                             ]);
-                            
+
+                            // Oct-19-2026 — the order row was saved with the NEW method
+                            // before the ledger step (outside its transaction); the ledger
+                            // step rolled back. Put the old method back so the order and
+                            // its invoice agree, and a retry is still seen as a change
+                            // (KS-36 stayed "Online" with a cash invoice on the rider).
+                            try {
+                                $order->refresh();
+                                $order->update(['payment_method' => $oldPaymentMethod]);
+                            } catch (\Throwable $restoreError) {
+                                \Log::error("Could not restore payment method after failed change", [
+                                    'order_id' => $order->id,
+                                    'restore_to' => $oldPaymentMethod,
+                                    'error' => $restoreError->getMessage()
+                                ]);
+                            }
+
                             return response()->json([
                                 'success' => false,
                                 'message' => 'Failed to change payment method: ' . $e->getMessage(),
@@ -2488,16 +2517,35 @@ class OrderController extends Controller
                         // (webhook/sync updates just clear it rather than claim 'manual').
                         $oldQty = (float) ($oldItem->quantity ?? 0);
                         $newQty = (float) ($lineItem['quantity'] ?? 0);
+                        // ⭐ Oct-19-2026: the "originally ordered" quantity rides along the
+                        // same way. Unchanged → carried as is; changed here by a person →
+                        // the first original wins, else the old quantity becomes it (same
+                        // rule as the scanner, OrderLineItemModel::originalToKeep). A
+                        // webhook / sync change carries nothing: the source order itself
+                        // changed, so its new number IS what was ordered. Live orders only
+                        // (the approval queue's line table has no such column), and only
+                        // once the SQL has run.
+                        $keepOriginal = \App\Models\CRM\OrderLineItemModel::supportsOriginalQuantity()
+                            && !($order instanceof \App\Models\CRM\ShopifyOrderModel);
                         if (abs($oldQty - $newQty) < 0.0005) {
                             $lineItem['quantity_source'] = $oldItem->quantity_source;
                             $lineItem['quantity_updated_by'] = $oldItem->quantity_updated_by;
                             $lineItem['quantity_updated_at'] = $oldItem->quantity_updated_at;
                             $lineItem['quantity_scanned_barcode'] = $oldItem->quantity_scanned_barcode;
+                            if ($keepOriginal && $oldItem->original_quantity !== null) {
+                                $lineItem['original_quantity'] = (float) $oldItem->original_quantity;
+                            }
                         } elseif (!$isWebhookUpdate) {
                             $lineItem['quantity_source'] = 'manual';
                             $lineItem['quantity_updated_by'] = auth()->check() ? auth()->id() : null;
                             $lineItem['quantity_updated_at'] = now();
                             $lineItem['quantity_scanned_barcode'] = null;
+                            if ($keepOriginal) {
+                                $keep = \App\Models\CRM\OrderLineItemModel::originalToKeep($oldItem->original_quantity, $oldQty, $newQty);
+                                if ($keep !== null) {
+                                    $lineItem['original_quantity'] = $keep;
+                                }
+                            }
                         }
                     }
 
@@ -4461,8 +4509,15 @@ class OrderController extends Controller
                 $riderProofMap = [];
             }
 
+            // ✂ Oct-2026 — split-invoice links for the row chip ("✂ from SH-23808").
+            // LIVE rows only: staging ids collide with live ids (CLAUDE.md), so the
+            // Shopify approval queue never gets a lookup.
+            $splitRelMap = $source !== 'shopify'
+                ? \App\Services\CRM\OrderSplitService::relationsFor($orders->pluck('id')->all())
+                : [];
+
             // Add customer order count and region info to each order
-            $orders->transform(function($order) use ($customerOrderCounts, $regionMap, $dispatcherNames, $customerReplyMap, $orderReplyMap, $invoiceSentMap, $riderProofMap) {
+            $orders->transform(function($order) use ($customerOrderCounts, $regionMap, $dispatcherNames, $customerReplyMap, $orderReplyMap, $invoiceSentMap, $riderProofMap, $splitRelMap) {
                 $orderCount = $customerOrderCounts[$order->customer_id] ?? 0;
                 $isNewCustomer = $orderCount <= 1;
 
@@ -4491,6 +4546,9 @@ class OrderController extends Controller
 
                 // Payment-proof badge for the rider's card (empty map on web).
                 $order->payment_proof = $riderProofMap[$order->id] ?? null;
+
+                $order->split_from = $splitRelMap[$order->id]['split_from'] ?? null;
+                $order->split_into = $splitRelMap[$order->id]['split_into'] ?? [];
 
                 return $order;
             });
@@ -5515,7 +5573,26 @@ class OrderController extends Controller
             if (!$result['success']) {
                 throw new \Exception("Failed to repost invoice: " . $result['message']);
             }
-            
+
+            // Oct-19-2026 — success WITHOUT a ledger_id means posting was skipped on
+            // purpose: a SHOP customer's online order (settled in the Shop tab via
+            // payments) or a Qurbani order. The reversal above is then the whole job.
+            // Reading $result['ledger_id'] here used to throw, roll the reversal back
+            // and leave the order saying Online while the cash invoice stayed on the
+            // rider's Daily Closing (KS-36, 19-Oct).
+            // ("Already posted" also comes back without an id — that one is NOT a
+            // skip, so it still falls through to the throw below and rolls back.)
+            if (empty($result['ledger_id']) && ($result['message'] ?? '') !== 'Already posted') {
+                \DB::commit();
+
+                return [
+                    'success' => true,
+                    'old_ledger_id' => $oldLedger->id,
+                    'new_ledger_id' => null,
+                    'skipped_message' => $result['message'] ?? null,
+                ];
+            }
+
             // 5. Add note to new ledger entry
             $newLedger = \App\Models\FIN\LedgerModel::find($result['ledger_id']);
             if ($newLedger) {

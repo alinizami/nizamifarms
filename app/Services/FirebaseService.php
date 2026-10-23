@@ -127,6 +127,111 @@ class FirebaseService
             'messages');
     }
 
+    // ─── 🔴⏳ Tag alerts + tagger reminders (Oct-2026, MentionFollowupService) ───
+    //
+    // Two delivery shapes, chosen PER TOKEN:
+    //   • the token's APK declared `team_alerts` (t_wa_device_tokens.capabilities, sent by the
+    //     round-2 APK) → DATA-ONLY high-priority push; the app draws it itself (own channel,
+    //     own tone, sticky, buttons). Payload contract (all strings):
+    //       team_alert       {cycle_id, conversation_id, mentioned_by, kind:first|rebuzz, title, body}
+    //       team_followup    {cycle_id, conversation_id, on_user, kind:reminder|opened|on_it|gave_up, title, body, minutes?, reminder?}
+    //       team_alert_clear {cycle_id}
+    //   • every other token (every APK installed today) → a normal push of type
+    //     'whatsapp_mention' on the existing 'whatsapp_messages' channel, i.e. exactly the shape
+    //     today's apps already show and deep-link. ⚠ Never send data-only to such a token:
+    //     its background handler ignores unknown types, so the user would see NOTHING.
+
+    /** Loud alert / re-buzz to the TAGGED person. Prefers the NF Messages app (no double buzz). */
+    public function notifyTeamAlert(int $userId, string $title, string $body, array $data): void
+    {
+        $this->sendTeamPush($userId, $title, $body, $data, 'team_alert');
+    }
+
+    /** Reminder / opened / on-it / gave-up to the person who TAGGED. */
+    public function notifyFollowupToTagger(int $userId, string $title, string $body, array $data): void
+    {
+        $this->sendTeamPush($userId, $title, $body, $data, 'team_followup');
+    }
+
+    /** Remove the sticky alert on phones that draw one. Plain-push phones: nothing to clear. */
+    public function clearTeamAlert(int $userId, int $cycleId): void
+    {
+        if (!$this->projectId || !file_exists($this->credentialsPath)) return;
+        try {
+            $rows = array_filter($this->teamTokenRows($userId), fn ($r) => $this->tokenCan($r, 'team_alerts'));
+            if (!$rows) return;
+            $accessToken = $this->getAccessToken();
+            if (!$accessToken) return;
+            foreach ($rows as $r) {
+                $this->sendDataOnly($accessToken, $r->fcm_token, ['type' => 'team_alert_clear', 'cycle_id' => (string) $cycleId]);
+            }
+        } catch (\Throwable $e) {
+            Log::warning('Firebase: clearTeamAlert failed', ['user_id' => $userId, 'error' => $e->getMessage()]);
+        }
+    }
+
+    private function sendTeamPush(int $userId, string $title, string $body, array $data, string $capableType): void
+    {
+        if (!$this->projectId || !file_exists($this->credentialsPath)) {
+            Log::debug('Firebase: Skipping team push (not configured)', ['user_id' => $userId]);
+            return;
+        }
+        try {
+            $rows = $this->teamTokenRows($userId);
+            if (!$rows) return;
+            $accessToken = $this->getAccessToken();
+            if (!$accessToken) {
+                Log::error('Firebase: Failed to get access token for team push', ['user_id' => $userId]);
+                return;
+            }
+            $data = array_map(fn ($v) => (string) $v, $data); // FCM v1: every data value a string
+            foreach ($rows as $r) {
+                if ($this->tokenCan($r, 'team_alerts')) {
+                    $this->sendDataOnly($accessToken, $r->fcm_token,
+                        array_merge($data, ['type' => $capableType, 'title' => $title, 'body' => $body]));
+                } else {
+                    $this->sendToDevice($accessToken, $r->fcm_token, ['title' => $title, 'body' => $body],
+                        array_merge($data, ['type' => 'whatsapp_mention']), 'whatsapp_messages');
+                }
+            }
+        } catch (\Throwable $e) {
+            Log::error('Firebase: team push failed', ['user_id' => $userId, 'error' => $e->getMessage()]);
+        }
+    }
+
+    /** Active tokens for one user, preferring the NF Messages app like every WhatsApp push. */
+    private function teamTokenRows(int $userId): array
+    {
+        $cols = ['fcm_token', 'user_id', 'app_flavor'];
+        if ($this->hasCapabilitiesColumn()) $cols[] = 'capabilities';
+        $rows = DB::table('t_wa_device_tokens')
+            ->where('user_id', $userId)
+            ->where('is_active', 1)
+            ->select($cols)
+            ->get()
+            ->all();
+        return $this->preferFlavorPerUser($rows, 'messages');
+    }
+
+    private function tokenCan(object $row, string $capability): bool
+    {
+        $caps = (string) ($row->capabilities ?? '');
+        return $caps !== '' && in_array($capability, array_map('trim', explode(',', $caps)), true);
+    }
+
+    private ?bool $capabilitiesColumn = null;
+    private function hasCapabilitiesColumn(): bool
+    {
+        if ($this->capabilitiesColumn === null) {
+            try {
+                $this->capabilitiesColumn = \Illuminate\Support\Facades\Schema::hasColumn('t_wa_device_tokens', 'capabilities');
+            } catch (\Throwable $e) {
+                $this->capabilitiesColumn = false;
+            }
+        }
+        return $this->capabilitiesColumn;
+    }
+
     /**
      * Send a push notification when a new production plan/demand is created
      */

@@ -141,6 +141,7 @@ class FrozenMonthService
                 'adjustments'          => (int) ($log['adjustments'][$pid] ?? 0),
                 'adjustments_counts'   => (int) ($log['counts'][$pid] ?? 0),
                 'adjustments_returned' => (int) ($log['rejected_back'][$pid] ?? 0),
+                'adjustments_repacked' => (int) ($log['repacked'][$pid] ?? 0),
 
                 'transferred_to_shop' => (int) ($transferred[$pid] ?? 0),
 
@@ -333,7 +334,7 @@ class FrozenMonthService
     private function warehouseLog(int $bu, array $productIds, Carbon $start, Carbon $end): array
     {
         $out = ['stock_in' => [], 'stock_in_batch' => [], 'stock_out' => [],
-                'adjustments' => [], 'counts' => [], 'rejected_back' => []];
+                'adjustments' => [], 'counts' => [], 'rejected_back' => [], 'repacked' => []];
         try {
             $rows = WarehouseInventoryLogModel::where('business_unit_id', $bu)
                 ->whereIn('product_id', $productIds)
@@ -363,6 +364,9 @@ class FrozenMonthService
                         $out['adjustments'][$pid] = ($out['adjustments'][$pid] ?? 0) + $val;
                         if ($ref === 'transfer_rejected') {
                             $out['rejected_back'][$pid] = ($out['rejected_back'][$pid] ?? 0) + $val;
+                        } elseif ($ref === 'repack') {
+                            // 🔁 Oct-19: packs opened and re-packed as another size — not a count, not made
+                            $out['repacked'][$pid] = ($out['repacked'][$pid] ?? 0) + $val;
                         } else {
                             $out['counts'][$pid] = ($out['counts'][$pid] ?? 0) + $val;
                         }

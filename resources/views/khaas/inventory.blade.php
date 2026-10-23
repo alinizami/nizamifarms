@@ -277,6 +277,10 @@
          The 🔗 Recipes tab is a different thing and is deliberately left alone. --}}
     @if($activeTab === 'ingredients')
     <div x-data>
+        {{-- 🍱 Oct-19: one-time "Set up recipe families" — filled by JS for those who may manage recipes,
+             and only while some Frozen packs are in no family. --}}
+        <div id="famSetup" class="hidden mb-6"></div>
+
         <div class="grid grid-cols-1 lg:grid-cols-5 gap-6">
 
             {{-- ── LEFT: the ingredient master ─────────────────────────── --}}
@@ -364,19 +368,27 @@
                 </div>
 
                 <div class="px-5 py-4">
-                    <label class="block text-xs font-medium text-gray-700 mb-1">Product</label>
+                    <label class="block text-xs font-medium text-gray-700 mb-1">Recipe for</label>
                     <select id="recProduct" class="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm bg-white mb-4">
-                        <option value="">Choose a product…</option>
+                        <option value="">Choose a recipe family or a product…</option>
                     </select>
 
+                    {{-- 🍱 the family banner: whose recipe this is, and every size that uses it --}}
+                    <div id="recFamilyHead" class="hidden rounded-lg px-4 py-3 mb-4" style="background:#ECFDF5;border:1px solid #A7F3D0;"></div>
+
                     <div id="recBody" class="hidden">
+                        {{-- 🍱 a family with no recipe yet: start from a pack's own (older) recipe --}}
+                        <div id="recStartFrom" class="hidden rounded-lg px-4 py-3 mb-4" style="background:#FFFBEB;border:1px solid #FDE68A;"></div>
+
                         <div class="rounded-lg p-4 mb-4" style="background:#F9FAFB;">
-                            <label class="block text-xs font-medium text-gray-700 mb-1">
+                            <label id="recBasisLabel" class="block text-xs font-medium text-gray-700 mb-1">
                                 One batch like this makes how many packs?
                             </label>
                             <input type="number" id="recBasis" min="1" step="1" placeholder="e.g. 80"
                                    class="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm">
-                            <p class="text-xs text-gray-500 mt-1">
+                            {{-- 🍱 family mode: "= 10 packs of 8 = 6.67 packs of 12" — type in any box --}}
+                            <div id="recSizes" class="hidden flex flex-wrap items-center gap-2 mt-2 text-xs text-gray-700"></div>
+                            <p id="recBasisHint" class="text-xs text-gray-500 mt-1">
                                 Everything below is what that ONE batch uses, not one pack.
                             </p>
                         </div>
@@ -705,7 +717,19 @@
                         @foreach($demandProducts as $idx => $dp)
                         <div class="flex items-center gap-3 py-2 border-b border-gray-100">
                             <div class="flex-1 min-w-0">
-                                <div class="text-sm font-semibold text-gray-900 truncate">{{ $dp['product_name'] }}</div>
+                                <div class="text-sm font-semibold text-gray-900 truncate">
+                                    {{ $dp['product_name'] }}
+                                    {{-- 🍱 Oct-19: one line per preparation; the sizes are chosen when the batch ends --}}
+                                    @if(!empty($dp['is_family']))
+                                        <span class="ml-1 text-[10px] font-semibold px-1.5 py-0.5 rounded" style="background:#ECFDF5;color:#047857;">🍱 {{ implode(' · ', $dp['sizes'] ?? []) }} — packed at the end</span>
+                                    @endif
+                                </div>
+                                @if(!empty($dp['warning']))
+                                    <div class="text-[11px]" style="color:#B45309;">⚠ {{ $dp['warning'] }}</div>
+                                @endif
+                                @if(!empty($dp['note']))
+                                    <div class="text-[11px]" style="color:#047857;">{{ $dp['note'] }}</div>
+                                @endif
                                 <div class="mt-0.5">
                                     @foreach(($dp['raw_materials'] ?? []) as $rm)
                                     <div class="flex items-center gap-2">
@@ -1263,18 +1287,357 @@ function saveRecipeMappings() {
     };
 
     // ── the recipe editor ──────────────────────────────────────────────
+    // 🍱 Oct-19: RECIPE FAMILIES. The picker lists families first ("f:<id>" — one recipe for every
+    //    pack size), then the products that are in no family. Everything a family screen shows comes
+    //    from Khaas\RecipeController → RecipeFamilyService, the same engine the phone reads.
+    var FAMILY_URL       = @json(route('khaas.recipe-family.show'));
+    var FAMILIES_URL     = @json(route('khaas.recipe-families'));
+    var FAMILY_SAVE_URL  = @json(route('khaas.recipe-family.recipe'));
+    var FAMILY_NAME_URL  = @json(route('khaas.recipe-family.save'));
+    var FAMILY_SETUP_URL = @json(route('khaas.recipe-family.setup'));
+    var FAMILY   = null;   // the open family's shape (RecipeFamilyService::familyRecipe), else null
+    var SELL_BY  = {};     // product id => selling price, per size, while a family is open
+    var COVERAGE = [];
+
     function loadProducts() {
-        return api('{{ route('khaas.recipe.coverage') }}?business_unit_id=' + BU)
-            .then(function (d) {
-                if (!d.success) { return; }
-                var sel = document.getElementById('recProduct');
-                (d.products || []).forEach(function (p) {
+        return Promise.all([
+            api('{{ route('khaas.recipe.coverage') }}?business_unit_id=' + BU),
+            api(FAMILIES_URL + '?business_unit_id=' + BU).catch(function () { return {}; })
+        ]).then(function (res) {
+            var d = res[0], fam = res[1] || {};
+            if (!d.success) { return; }
+            COVERAGE = d.products || [];
+            var sel  = document.getElementById('recProduct');
+            var keep = sel.value;
+            sel.innerHTML = '<option value="">Choose a recipe family or a product…</option>';
+
+            var fams = (fam.families || []).filter(function (f) { return f.is_active; });
+            if (fams.length) {
+                var g = document.createElement('optgroup');
+                g.label = '🍱 Recipe families — one recipe for every pack size';
+                fams.forEach(function (f) {
+                    var o = document.createElement('option');
+                    o.value = 'f:' + f.id;
+                    o.textContent = f.name + ' — ' +
+                        (f.members.length ? f.members.map(function (m) { return m.label; }).join(', ') : 'no pack sizes yet') +
+                        (f.recipe ? '' : '  · no recipe yet');
+                    g.appendChild(o);
+                });
+                sel.appendChild(g);
+            }
+            var loose = COVERAGE.filter(function (p) { return !p.family_id; });
+            if (loose.length) {
+                var g2 = document.createElement('optgroup');
+                g2.label = fams.length ? 'Products in no family' : 'Products';
+                loose.forEach(function (p) {
                     var o = document.createElement('option');
                     o.value = p.product_id;
                     o.textContent = p.product_name + (p.has_recipe ? '' : '  — no recipe yet');
-                    sel.appendChild(o);
+                    g2.appendChild(o);
                 });
+                sel.appendChild(g2);
+            }
+
+            renderSetup(fam.setup || null);
+
+            // 📖 deep links: ?family=ID, or ?product=ID (a card's "View / edit recipe") — a pack that
+            //    belongs to a family opens its FAMILY, never its derived snapshot.
+            var qs   = new URLSearchParams(window.location.search);
+            var want = keep || (qs.get('family') ? 'f:' + qs.get('family') : null);
+            if (!want && qs.get('product')) {
+                var cp = COVERAGE.filter(function (p) { return String(p.product_id) === String(qs.get('product')); })[0];
+                want = cp && cp.family_id ? 'f:' + cp.family_id : qs.get('product');
+            }
+            if (want && sel.querySelector('option[value="' + String(want).replace(/"/g, '') + '"]')) {
+                sel.value = want;
+                sel.dispatchEvent(new Event('change'));
+                if (!keep && sel.scrollIntoView) { sel.scrollIntoView({block: 'start', behavior: 'smooth'}); }
+            }
+        });
+    }
+
+    /** A stored base quantity shown back the way a person types it (≥ 1000 g → kg). */
+    function lineFromBase(l) {
+        var qty = l.qty_per_basis, unit = l.base_unit;
+        if ((l.base_unit === 'g' || l.base_unit === 'ml') && Math.abs(qty) >= 1000) {
+            qty = qty / 1000;
+            unit = (l.base_unit === 'g') ? 'kg' : 'L';
+        }
+        return {ingredient_id: l.ingredient_id, qty: qty ? String(qty) : '', unit: unit};
+    }
+
+    /** "12.5 g" / "1.1 kg" — the same stepping as IngredientModel::display(). */
+    function fmtBase(base, u) {
+        var shown = base, unit = u;
+        if ((u === 'g' || u === 'ml') && Math.abs(base) >= 1000) { shown = base / 1000; unit = (u === 'g') ? 'kg' : 'L'; }
+        return (Math.round(shown * 1000) / 1000) + ' ' + unit;
+    }
+
+    function familySizes() { return (FAMILY && FAMILY.sizes) || []; }
+
+    function setBasisLabels(isFamily) {
+        document.getElementById('recBasisLabel').textContent = isFamily
+            ? 'One batch like this makes how many PIECES?'
+            : 'One batch like this makes how many packs?';
+        document.getElementById('recBasisHint').textContent = isFamily
+            ? 'Everything below is what that ONE batch uses. Every pack size takes its share by its pieces — nothing to enter per size.'
+            : 'Everything below is what that ONE batch uses, not one pack.';
+        document.getElementById('recSizes').classList.toggle('hidden', !isFamily || !familySizes().length);
+        if (!isFamily) {
+            document.getElementById('recFamilyHead').classList.add('hidden');
+            document.getElementById('recStartFrom').classList.add('hidden');
+        }
+    }
+
+    /** "= [10] packs of 8 pcs = [6.67] packs of 12 pcs" — type in any box, the others follow. */
+    function renderSizes() {
+        var box = document.getElementById('recSizes');
+        var sizes = familySizes();
+        if (!sizes.length) { box.innerHTML = ''; return; }
+        box.innerHTML = sizes.map(function (s) {
+            return '<span>=</span><input type="number" min="0" step="any" class="rec-packs w-20 px-2 py-1 border border-gray-300 rounded" data-p="' +
+                s.pieces_per_pack + '"><span>packs of ' + esc(s.label) + '</span>';
+        }).join(' ');
+        Array.prototype.forEach.call(box.querySelectorAll('.rec-packs'), function (el) {
+            el.oninput = function () {
+                var packs = parseFloat(el.value);
+                var p = Number(el.getAttribute('data-p'));
+                if (packs > 0) {
+                    document.getElementById('recBasis').value = Math.round(packs * p);
+                }
+                syncSizes(el);
+                updatePerPack();
+            };
+        });
+        syncSizes(null);
+    }
+
+    function syncSizes(except) {
+        var basis = parseInt(document.getElementById('recBasis').value, 10) || 0;
+        Array.prototype.forEach.call(document.querySelectorAll('#recSizes .rec-packs'), function (el) {
+            if (el === except) { return; }
+            var p = Number(el.getAttribute('data-p'));
+            el.value = basis ? String(Math.round(basis / p * 100) / 100) : '';
+        });
+    }
+
+    function renderFamilyHead() {
+        var box = document.getElementById('recFamilyHead');
+        if (!FAMILY) { box.classList.add('hidden'); return; }
+        var sizes = familySizes();
+        var chips = sizes.map(function (s) {
+            return '<span class="px-2 py-0.5 rounded-full font-semibold" style="background:#D1FAE5;color:#065F46;">' + esc(s.label) + '</span>';
+        }).join(' ');
+        box.innerHTML =
+            '<div class="flex items-start justify-between gap-3">' +
+                '<div class="text-sm font-semibold" style="color:#065F46;">📖 ' + esc(FAMILY.family.name) + ' — family recipe</div>' +
+                (CAN_MANAGE_ING ? '<button type="button" id="famRename" class="text-xs underline" style="color:#047857;">Rename</button>' : '') +
+            '</div>' +
+            '<div class="mt-1 flex flex-wrap items-center gap-1.5 text-xs" style="color:#065F46;">' +
+                (sizes.length ? 'Used by ' + chips : '<span>No pack sizes yet — put a product in this family from its edit page (Products → edit → Recipe family).</span>') +
+            '</div>' +
+            (sizes.length ? '<div class="text-xs mt-1" style="color:#047857;">Changing this changes the cost and stock use of ' +
+                (sizes.length > 1 ? 'EVERY size above' : 'this pack') + '. A pack’s pieces are set on the product itself.</div>' : '');
+        box.classList.remove('hidden');
+        var rn = document.getElementById('famRename');
+        if (rn) {
+            rn.onclick = function () {
+                var name = window.prompt('New name for this family (its packs keep their own titles):', FAMILY.family.name);
+                if (!name || name.trim() === FAMILY.family.name) { return; }
+                api(FAMILY_NAME_URL, {method: 'POST', body: {business_unit_id: BU, family_id: FAMILY.family.id, name: name.trim()}})
+                    .then(function (d) {
+                        if (!d.success) { alert(d.message || 'Not renamed.'); return; }
+                        loadProducts();
+                    })
+                    .catch(function () { alert('Could not reach the server. Nothing was changed.'); });
+            };
+        }
+    }
+
+    /** A family with no recipe yet: offer each pack's own older recipe, already counted in pieces. */
+    function renderStartFrom() {
+        var box = document.getElementById('recStartFrom');
+        if (!FAMILY || FAMILY.has_recipe) { box.classList.add('hidden'); box.innerHTML = ''; return; }
+        var c = FAMILY.start_from || [];
+        box.innerHTML = c.length
+            ? '<div class="text-xs font-semibold mb-1" style="color:#92400E;">This family has no recipe yet. Start from a pack’s own recipe:</div>' +
+              c.map(function (x, i) {
+                  return '<button type="button" class="rec-start mr-2 mb-1 px-2.5 py-1 rounded text-xs font-semibold" data-i="' + i + '" ' +
+                      'style="background:#FEF3C7;color:#92400E;border:1px solid #FDE68A;">' + esc(x.title) + ' v' + x.version + ' — ' +
+                      x.basis_packets + ' packs × ' + x.pieces_per_pack + ' = ' + x.basis_pieces + ' pieces</button>';
+              }).join('')
+            : '<div class="text-xs" style="color:#92400E;">No recipe yet — write it once below and every size uses it.</div>';
+        box.classList.remove('hidden');
+        Array.prototype.forEach.call(box.querySelectorAll('.rec-start'), function (b) {
+            b.onclick = function () {
+                var x = c[Number(b.getAttribute('data-i'))];
+                api('{{ route('khaas.recipe.show') }}?business_unit_id=' + BU + '&product_id=' + x.product_id).then(function (d) {
+                    if (!d.success || !d.recipe) { alert('Could not load that recipe.'); return; }
+                    lines = (d.recipe.lines || []).map(lineFromBase);
+                    (d.recipe.lines || []).forEach(function (l) { SUPPLY[l.ingredient_id] = l.supply_state; });
+                    document.getElementById('recBasis').value = x.basis_pieces;
+                    document.getElementById('recNote').value = 'From ' + x.title + ' v' + x.version + ': ' + x.basis_packets + ' packs × ' + x.pieces_per_pack + ' = ' + x.basis_pieces + ' pieces';
+                    syncSizes(null);
+                    renderLines();
+                });
+            };
+        });
+    }
+
+    function loadFamily(id) {
+        var body = document.getElementById('recBody');
+        return api(FAMILY_URL + '?business_unit_id=' + BU + '&family_id=' + id).then(function (d) {
+            if (!d.success) { alert(d.message || 'Could not load that family.'); return; }
+            FAMILY   = d.recipe;
+            current  = d.recipe;
+            ingredients = d.ingredients || ingredients;
+            PRICES   = d.prices || {};
+            CAN_COST = !!d.can_see_cost;
+            ON_SHELF = d.on_shelf || {};
+            SELL     = null;
+            SELL_BY  = {};
+            Object.keys(d.costs || {}).forEach(function (pid) { SELL_BY[pid] = d.costs[pid] ? d.costs[pid].selling_price : null; });
+            SUPPLY   = {};
+            (FAMILY.lines || []).forEach(function (l) { SUPPLY[l.ingredient_id] = l.supply_state; });
+
+            document.getElementById('recBasis').value = FAMILY.basis_pieces || '';
+            document.getElementById('recNote').value  = '';
+            lines = (FAMILY.lines || []).map(lineFromBase);
+
+            renderFamilyHead();
+            renderStartFrom();
+            setBasisLabels(true);
+            renderSizes();
+
+            document.getElementById('recVersion').textContent = FAMILY.has_recipe
+                ? 'Family version ' + FAMILY.version + ', in force from ' + FAMILY.effective_from
+                : 'No family recipe yet.';
+            var warn = document.getElementById('recWarn');
+            if ((FAMILY.warnings || []).length) {
+                warn.innerHTML = FAMILY.warnings.map(esc).join('<br>');
+                warn.classList.remove('hidden');
+            } else {
+                warn.classList.add('hidden');
+            }
+            body.classList.remove('hidden');
+            renderLines();
+        });
+    }
+
+    // ── 🍱 ONE-TIME SET-UP: group the packs that are in no family ────────
+    function renderSetup(setup) {
+        var box = document.getElementById('famSetup');
+        if (!setup || !setup.ready || (!(setup.groups || []).length && !(setup.unparsed || []).length)) {
+            box.classList.add('hidden');
+            box.innerHTML = '';
+            return;
+        }
+        var groups = setup.groups || [];
+        var h = '<div class="bg-white border rounded-xl overflow-hidden" style="border-color:#A7F3D0;">' +
+            '<div class="px-5 py-4 border-b flex items-start justify-between gap-3" style="background:#ECFDF5;border-color:#A7F3D0;">' +
+                '<div><h3 class="font-semibold text-sm" style="color:#065F46;">🍱 Set up recipe families</h3>' +
+                '<p class="text-xs mt-0.5" style="color:#047857;">One recipe per preparation — every pack size (8 pcs, 12 pcs…) uses it, by its pieces. ' +
+                'Grouped from the product titles; check each one, then set it up. Nothing is lost: old recipes stay as history.</p></div>' +
+                (groups.length > 1 ? '<button type="button" id="famSetupAll" class="shrink-0 px-3 py-1.5 rounded-lg text-xs font-semibold text-white" style="background:#047857;">Set up all ' + groups.length + '</button>' : '') +
+            '</div><div class="divide-y divide-gray-100">';
+
+        groups.forEach(function (g, gi) {
+            var withRecipe = g.members.filter(function (m) { return m.recipe; });
+            h += '<div class="px-5 py-4 fam-group" data-gi="' + gi + '">' +
+                '<div class="flex flex-wrap items-center gap-2 mb-2">' +
+                    '<input type="text" class="fam-name px-2 py-1 border border-gray-300 rounded text-sm font-semibold w-72" value="' + esc(g.name) + '"' + (g.family ? ' disabled' : '') + '>' +
+                    (g.family ? '<span class="text-xs" style="color:#047857;">joins the existing family</span>' : '') +
+                '</div>' +
+                '<table class="w-full text-xs mb-2"><tbody>' +
+                g.members.map(function (m) {
+                    return '<tr>' +
+                        '<td class="py-1 w-6"><input type="checkbox" class="fam-m" data-p="' + m.product_id + '" checked></td>' +
+                        '<td class="py-1">' + esc(m.title) + '</td>' +
+                        '<td class="py-1 w-32"><input type="number" min="1" step="1" class="fam-pc w-16 px-1.5 py-0.5 border border-gray-300 rounded" data-p="' + m.product_id + '" value="' + m.pieces_per_pack + '"> pcs a pack</td>' +
+                        '<td class="py-1 w-56 text-gray-600">' + (m.recipe
+                            ? '📖 own recipe v' + m.recipe.version + ' · ' + m.recipe.basis_packets + ' packs = ' + m.recipe.basis_pieces + ' pieces'
+                            : '<span class="text-gray-400">no recipe</span>') + '</td>' +
+                    '</tr>';
+                }).join('') +
+                '</tbody></table>' +
+                (withRecipe.length
+                    ? '<div class="text-xs text-gray-700 mb-1">The family recipe comes from: ' + withRecipe.map(function (m) {
+                          return '<label class="mr-3"><input type="radio" name="fam-src-' + gi + '" class="fam-src" value="' + m.product_id + '"' +
+                              (m.product_id === g.source_product_id ? ' checked' : '') + '> ' + esc(m.title.replace(/^NF\s*[–-]\s*/, '')) + ' v' + m.recipe.version + '</label>';
+                      }).join('') + '</div>' +
+                      (g.recipe_choices > 1 ? '<div class="text-xs mb-1" style="color:#B45309;">⚠ More than one size has its own recipe — pick the one that is right; the others stay as history.</div>' : '')
+                    : (g.family_has_recipe ? '<div class="text-xs text-gray-600 mb-1">Uses the family’s existing recipe.</div>'
+                        : '<div class="text-xs text-gray-500 mb-1">No size has a recipe yet — write the family recipe once after setting it up.</div>')) +
+                '<div class="text-xs text-gray-600 mb-2">🥩 Meat: ' + (g.meat ? esc(g.meat) : '<span style="color:#B91C1C;">none set — Accept Demand will refuse it until a meat is set</span>') +
+                    (g.meat_conflict ? ' <span style="color:#B91C1C;">⚠ the sizes have DIFFERENT meats — the first size’s is kept for all</span>' : '') +
+                    (g.meat ? ' — every ticked size will use it.' : '') + '</div>' +
+                '<button type="button" class="fam-go px-3 py-1.5 rounded text-xs font-semibold text-white" style="background:#047857;">Set up this family</button>' +
+                '<span class="fam-msg text-xs ml-2"></span>' +
+            '</div>';
+        });
+        if ((setup.unparsed || []).length) {
+            h += '<div class="px-5 py-3 text-xs text-gray-600">These products have no “(N pcs)” in the title, so they are not grouped — put each in a family from its edit page: ' +
+                setup.unparsed.map(function (u) { return esc(u.title); }).join(', ') + '.</div>';
+        }
+        h += '</div></div>';
+        box.innerHTML = h;
+        box.classList.remove('hidden');
+
+        var setupOne = function (gi) {
+            var el = box.querySelector('.fam-group[data-gi="' + gi + '"]');
+            var g  = groups[gi];
+            var members = [];
+            var bad = null;
+            Array.prototype.forEach.call(el.querySelectorAll('.fam-m'), function (c) {
+                if (!c.checked) { return; }
+                var pid = Number(c.getAttribute('data-p'));
+                var pc  = el.querySelector('.fam-pc[data-p="' + pid + '"]');
+                var v   = Number(pc.value);
+                if (!(v >= 1) || Math.round(v) !== v) { bad = pc; }
+                members.push({product_id: pid, pieces_per_pack: v});
             });
+            var msg = el.querySelector('.fam-msg');
+            if (!members.length) { msg.textContent = 'Tick at least one pack.'; msg.style.color = '#B91C1C'; return Promise.resolve(false); }
+            if (bad) { msg.textContent = 'Pieces are whole numbers, 1 or more.'; msg.style.color = '#B91C1C'; bad.focus(); return Promise.resolve(false); }
+            var src = el.querySelector('.fam-src:checked');
+            var body = {
+                business_unit_id: BU,
+                name: el.querySelector('.fam-name').value.trim(),
+                family_id: g.family ? g.family.id : null,
+                source_product_id: src ? Number(src.value) : null,
+                members: members
+            };
+            var go = el.querySelector('.fam-go');
+            go.disabled = true;
+            msg.textContent = 'Setting up…'; msg.style.color = '#6B7280';
+            return api(FAMILY_SETUP_URL, {method: 'POST', body: body}).then(function (d) {
+                go.disabled = false;
+                msg.textContent = d.message || (d.success ? 'Done.' : 'Not set up.');
+                msg.style.color = d.success ? '#047857' : '#B91C1C';
+                if (d.success) { go.classList.add('hidden'); el.style.opacity = '0.6'; }
+                return !!d.success;
+            }).catch(function () {
+                go.disabled = false;
+                msg.textContent = 'Could not reach the server. Nothing was changed.'; msg.style.color = '#B91C1C';
+                return false;
+            });
+        };
+        Array.prototype.forEach.call(box.querySelectorAll('.fam-go'), function (b) {
+            b.onclick = function () {
+                var gi = Number(b.closest('.fam-group').getAttribute('data-gi'));
+                setupOne(gi).then(function (ok) { if (ok) { loadProducts(); } });
+            };
+        });
+        var all = document.getElementById('famSetupAll');
+        if (all) {
+            all.onclick = function () {
+                if (!window.confirm('Set up all ' + groups.length + ' families as shown?')) { return; }
+                all.disabled = true;
+                var chain = Promise.resolve();
+                groups.forEach(function (g, gi) { chain = chain.then(function () { return setupOne(gi); }); });
+                chain.then(function () { all.disabled = false; loadProducts(); });
+            };
+        }
     }
 
     function unitOptions(baseUnit, chosen) {
@@ -1354,20 +1717,25 @@ function saveRecipeMappings() {
         Array.prototype.forEach.call(spans, function (span, idx) {
             var ln  = lines[idx];
             var qty = parseFloat(ln && ln.qty);
-            if (!basis || !qty || qty <= 0) { span.textContent = ''; return; }
+            if (!basis || !qty || qty <= 0) { span.textContent = ''; span.title = ''; return; }
 
             var factor = (ln.unit === 'kg' || ln.unit === 'L') ? 1000 : 1;
-            var base   = qty * factor / basis;
             var ing    = ingredients.filter(function (x) { return x.id === ln.ingredient_id; })[0];
             var u      = ing ? ing.base_unit : 'g';
 
-            var shown = base, unit = u;
-            if ((u === 'g' || u === 'ml') && Math.abs(base) >= 1000) {
-                shown = base / 1000;
-                unit  = (u === 'g') ? 'kg' : 'L';
+            if (FAMILY) {
+                // 🍱 one formula: batch × pieces ÷ pieces-a-batch, in ONE step per size
+                var batchBase = qty * factor;
+                var parts = familySizes().map(function (s) {
+                    return fmtBase(batchBase * s.pieces_per_pack / basis, u) + '/' + s.pieces_per_pack;
+                });
+                span.textContent = parts.length ? parts.join(' · ') : fmtBase(batchBase / basis, u) + '/pc';
+                span.title = fmtBase(batchBase / basis, u) + ' a piece';
+                return;
             }
-            span.textContent = (Math.round(shown * 1000) / 1000) + ' ' + unit + '/pack';
+            span.textContent = fmtBase(qty * factor / basis, u) + '/pack';
         });
+        if (FAMILY) { syncSizes(document.activeElement && document.activeElement.classList.contains('rec-packs') ? document.activeElement : null); }
 
         updateCost();
     }
@@ -1438,13 +1806,23 @@ function saveRecipeMappings() {
             span.style.color = '#312E81';
             span.title = p.price_text + ' · ' + (p.source === 'meat_order' ? 'meat order' : (p.source === 'older_bill' ? 'older bill' : 'bill')) +
                 ' of ' + p.bought_on + (p.vendor_name ? ' · ' + p.vendor_name : '');
-            span.textContent = lineBase(ln) > 0 ? rs(cost) + (basis ? ' · ' + rs(cost / basis, 2) + '/pack' : '') : '';
+            span.textContent = lineBase(ln) > 0 ? rs(cost) + (basis && !FAMILY ? ' · ' + rs(cost / basis, 2) + '/pack' : '') : '';
         });
 
         if (!lines.length) { box.classList.add('hidden'); return; }
 
         var h = '';
-        if (CAN_COST && priced > 0) {
+        if (CAN_COST && priced > 0 && FAMILY) {
+            // 🍱 every size priced from the ONE batch: batch × pieces ÷ pieces-a-batch
+            var sizes = familySizes();
+            h += '<div class="font-semibold">💲 At today’s prices: ' + rs(batch) + ' a batch</div>' +
+                (basis ? sizes.map(function (s) {
+                    var perPack = batch * s.pieces_per_pack / basis;
+                    var sell = SELL_BY[String(s.product_id)];
+                    return '<div class="mt-0.5">· <b>' + rs(perPack, 2) + ' a pack of ' + esc(s.label) + '</b>' +
+                        (sell ? ' — ' + (Math.round(perPack * 1000 / sell) / 10) + '% of the ' + rs(sell) + ' price' : '') + '</div>';
+                }).join('') + '<div class="mt-0.5 text-[11px]" style="color:#6366F1;">' + rs(batch / basis, 2) + ' a piece</div>' : '');
+        } else if (CAN_COST && priced > 0) {
             h += '<div class="font-semibold">💲 At today’s prices: ' + rs(batch) + ' a batch' +
                 (basis ? ' · <b>' + rs(batch / basis, 2) + ' a pack</b>' : '') +
                 (basis && SELL ? ' — ' + (Math.round(batch / basis * 1000 / SELL) / 10) + '% of the ' + rs(SELL) + ' price' : '') +
@@ -1590,7 +1968,20 @@ function saveRecipeMappings() {
     document.getElementById('recProduct').onchange = function () {
         var pid = this.value;
         var body = document.getElementById('recBody');
-        if (!pid) { body.classList.add('hidden'); return; }
+        if (!pid) {
+            body.classList.add('hidden');
+            FAMILY = null;
+            setBasisLabels(false);
+            return;
+        }
+
+        // 🍱 a family: its ONE recipe, in pieces
+        if (String(pid).indexOf('f:') === 0) {
+            loadFamily(Number(String(pid).slice(2)));
+            return;
+        }
+        FAMILY = null;
+        setBasisLabels(false);
 
         api('{{ route('khaas.recipe.show') }}?business_unit_id=' + BU + '&product_id=' + pid)
             .then(function (d) {
@@ -1645,33 +2036,54 @@ function saveRecipeMappings() {
         var pid   = document.getElementById('recProduct').value;
         var basis = parseInt(document.getElementById('recBasis').value, 10) || 0;
 
-        if (!pid) { alert('Choose a product first.'); return; }
-        if (basis < 1) { alert('Say how many packs one batch makes.'); return; }
+        if (!pid) { alert('Choose a recipe family or a product first.'); return; }
+        if (basis < 1) { alert(FAMILY ? 'Say how many PIECES one batch makes.' : 'Say how many packs one batch makes.'); return; }
+        if (FAMILY && String(document.getElementById('recBasis').value).indexOf('.') !== -1) {
+            alert('Pieces are whole numbers.'); return;
+        }
         if (!lines.length) { alert('A recipe needs at least one ingredient.'); return; }
 
         var bad = lines.filter(function (l) { return !(parseFloat(l.qty) > 0); });
         if (bad.length) { alert('Every ingredient needs a quantity.'); return; }
 
+        var linesOut = lines.map(function (l) {
+            return {ingredient_id: l.ingredient_id, qty: parseFloat(l.qty), unit: l.unit};
+        });
+        // 🍱 a family saves ONE recipe; every size follows (RecipeFamilyService::saveFamilyRecipe)
+        if (FAMILY) {
+            var sizes = familySizes();
+            if (sizes.length > 1 && !window.confirm('This changes the recipe of every size: ' +
+                    sizes.map(function (s) { return s.label; }).join(', ') + '. Save?')) {
+                return;
+            }
+        }
+
         btn.disabled = true;
         btn.textContent = 'Saving…';
 
-        api('{{ route('khaas.recipe.save') }}', {
+        api(FAMILY ? FAMILY_SAVE_URL : '{{ route('khaas.recipe.save') }}', {
             method: 'POST',
-            body: {
+            body: FAMILY ? {
+                business_unit_id: BU,
+                family_id: FAMILY.family.id,
+                basis_pieces: basis,
+                note: document.getElementById('recNote').value,
+                lines: linesOut
+            } : {
                 business_unit_id: BU,
                 product_id: Number(pid),
                 basis_packets: basis,
                 note: document.getElementById('recNote').value,
-                lines: lines.map(function (l) {
-                    return {ingredient_id: l.ingredient_id, qty: parseFloat(l.qty), unit: l.unit};
-                })
+                lines: linesOut
             }
         })
         .then(function (d) {
             btn.disabled = false;
             btn.textContent = 'Save recipe';
             alert(d.message || (d.success ? 'Saved.' : 'Could not save that recipe.'));
-            if (d.success) { document.getElementById('recProduct').dispatchEvent(new Event('change')); }
+            if (d.success) {
+                if (FAMILY) { loadProducts(); } else { document.getElementById('recProduct').dispatchEvent(new Event('change')); }
+            }
         })
         .catch(function () {
             btn.disabled = false;
@@ -1959,11 +2371,16 @@ function saveRecipeMappings() {
                 d.refusals.map(esc).join('<br>') + '</div>';
             return;
         }
+        // ⭐ Oct-18: grams ↔ ml — the server suggests the old amounts (1 g ≈ 1 ml); boxes start filled
+        if (d.suggestion_note) {
+            html += '<div class="text-[12px] rounded p-2 mb-2" style="background:#FFFBEB;color:#92400E;">💡 ' + esc(d.suggestion_note) + '</div>';
+        }
         html += '<div class="text-[12px] text-gray-800 mb-1"><b>Current recipes</b></div>';
         html += (d.recipes || []).length ? (d.recipes || []).map(function (r) {
             return '<div class="text-[12px] mb-1">' + esc(r.product_name) + ' v' + r.version + ': ' + esc(r.old_text) + ' → ' +
                 (r.needs_qty
-                    ? '<input type="number" step="any" min="0" class="rep-rq w-20 px-1.5 py-1 border border-gray-300 rounded text-xs" data-r="' + r.recipe_id + '"> ' + esc(word) +
+                    ? '<input type="number" step="any" min="0" class="rep-rq w-20 px-1.5 py-1 border border-gray-300 rounded text-xs" data-r="' + r.recipe_id + '"' +
+                      (r.suggested_qty !== null && r.suggested_qty !== undefined ? ' value="' + r.suggested_qty + '"' : '') + '> ' + esc(word) +
                       ' <span class="text-gray-500">per batch of ' + r.basis_packets + '</span>'
                     : '<b>the same amount</b>') + ' <span class="text-gray-400">(becomes v' + (r.version + 1) + ')</span></div>';
         }).join('') : '<div class="text-[12px] text-gray-500 mb-1">None use it now.</div>';
@@ -1971,7 +2388,10 @@ function saveRecipeMappings() {
         html += (d.products || []).length ? (d.products || []).map(function (p) {
             return '<div class="text-[12px] mb-1">' + esc(p.vendor_name || '') + ' · ' + esc(p.product_name) + ' (' + esc(p.unit) + '): ' +
                 (p.needs_size
-                    ? 'how many ' + esc(word) + ' in one ' + esc(p.unit) + '? <input type="number" step="any" min="0" class="rep-ps w-20 px-1.5 py-1 border border-gray-300 rounded text-xs" data-p="' + p.id + '">'
+                    ? 'how many ' + esc(word) + ' in one ' + esc(p.unit) + '? <input type="number" step="any" min="0" class="rep-ps w-20 px-1.5 py-1 border border-gray-300 rounded text-xs" data-p="' + p.id + '"' +
+                      (p.suggested_size !== null && p.suggested_size !== undefined ? ' value="' + p.suggested_size + '"' : '') + '>' +
+                      // ⏸ Oct-18 (owner): the old product of the WRONG kind need not be re-sized — switch it off instead.
+                      '<label class="block mt-1 text-[11px] text-gray-700"><input type="checkbox" class="rep-off mr-1" data-p="' + p.id + '"> ⏸ switch this product off instead — I buy a new ' + esc(word === 'ml' ? 'litre' : (word === 'pcs' ? 'pieces' : 'kg')) + ' product now</label>'
                     : 'counts automatically (' + p.new_pack_qty_base + ' ' + esc(word) + ' each)') + '</div>';
         }).join('') : '<div class="text-[12px] text-gray-500 mb-1">None are tagged to it.</div>';
         html += '<div class="text-[11px] text-gray-600 mt-2">Past bills, batches, weigh-ins and old recipe versions stay exactly as they were. ' +
@@ -1995,9 +2415,15 @@ function saveRecipeMappings() {
                 if (!(parseFloat(i.value) > 0)) { missing = true; }
                 body.recipe_qty[i.getAttribute('data-r')] = parseFloat(i.value);
             });
+            body.deactivate_products = [];
+            Array.prototype.forEach.call(out.querySelectorAll('.rep-off'), function (c) {
+                if (c.checked) { body.deactivate_products.push(parseInt(c.getAttribute('data-p'), 10)); }
+            });
             Array.prototype.forEach.call(out.querySelectorAll('.rep-ps'), function (i) {
+                var pid = i.getAttribute('data-p');
+                if (body.deactivate_products.indexOf(parseInt(pid, 10)) !== -1) { return; }   // switched off: no size needed
                 if (!(parseFloat(i.value) > 0)) { missing = true; }
-                body.product_sizes[i.getAttribute('data-p')] = parseFloat(i.value);
+                body.product_sizes[pid] = parseFloat(i.value);
             });
             if (missing) { alert('Fill in every amount first.'); return; }
             if (!confirm('Replace ' + ing.name + ' now?')) { return; }
@@ -2006,6 +2432,13 @@ function saveRecipeMappings() {
                 btn.disabled = false;
                 alert(r.message || (r.success ? 'Done.' : 'Could not replace it.'));
                 if (!r.success) { return; }
+                // 🔁 Oct-18: came here from a vendor product page ("Replace X with…")? Go BACK to it with
+                //    the NEW ingredient ready to link. Only a same-site vendor-products path is honoured.
+                var back = new URLSearchParams(window.location.search).get('return');
+                if (back && r.to && r.to.id && /^\/finance\/vendors\/\d+\/products\/?$/.test(back)) {
+                    window.location.href = back + '?link_ingredient=' + encodeURIComponent(r.to.id);
+                    return;
+                }
                 document.getElementById('ingForm').classList.add('hidden');
                 loadIngredients().then(function () { refreshLineSelects(); loadStock(); });
                 if (document.getElementById('recProduct').value) {
@@ -2015,7 +2448,18 @@ function saveRecipeMappings() {
         };
     }
 
-    loadIngredients().then(loadProducts).then(loadStock);
+    loadIngredients().then(loadProducts).then(loadStock).then(function () {
+        // 🔁 Oct-18: arrived from a vendor product page with ?replace=<ingredient id> — select that
+        //    ingredient and open its Replace box at once, instead of landing on the bare list.
+        var want = new URLSearchParams(window.location.search).get('replace');
+        if (!want) { return; }
+        var ing = (ingredients || []).filter(function (x) { return String(x.id) === String(want); })[0];
+        if (!ing || ing.is_meat) { return; }
+        openIngForm(ing.id);   // takes the id (strict match against the master list)
+        openReplace(ing);
+        var box = document.getElementById('ingReplace');
+        if (box && box.scrollIntoView) { box.scrollIntoView({block: 'start', behavior: 'smooth'}); }
+    });
 })();
 </script>
 @endpush

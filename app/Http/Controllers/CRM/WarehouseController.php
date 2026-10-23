@@ -1403,6 +1403,100 @@ class WarehouseController extends Controller
     /**
      * End a batch — records quantity produced and auto-triggers warehouse stock_in
      */
+    /**
+     * 🍱 Oct-19: the sizes a batch may be packed into (its product's recipe family, from
+     * RecipeFamilyService::sizesFor — the one engine), for the End Batch screens.
+     */
+    public function batchSizes(Request $request, $batchId)
+    {
+        $batch = ProductBatchModel::find($batchId);
+        if (!$batch) {
+            return response()->json(['success' => false, 'message' => 'That batch no longer exists.'], 404);
+        }
+        $svc   = new \App\Services\Khaas\RecipeFamilyService();
+        $sizes = $svc->sizesFor((int) $batch->product_id);
+        $p     = ProductModel::find($batch->product_id);
+        $family = ($p && $p->recipe_family_id && \App\Services\Khaas\RecipeFamilyService::ready())
+            ? $svc->summary((int) $p->recipe_family_id) : null;
+
+        // 🍱 Oct-19 (owner): the LIVE check while packs are typed — what one pack of each size takes,
+        //    per ingredient, from the recipe in force today; and the meat the plan took at accept.
+        //    Information only, never a block: a 5–10% gap is normal yield.
+        $takenKg = null;
+        try {
+            $sum = DB::table('t_crm_khaas_production_demand_item')->where('batch_id', $batch->id)->sum('storage_deducted_qty');
+            $takenKg = $sum !== null && (float) $sum > 0 ? round((float) $sum, 3) : null;
+        } catch (\Throwable $e) {
+            $takenKg = null;
+        }
+        $hasRecipe = false;
+        foreach ($sizes as &$sz) {
+            try {
+                $sz['lines'] = $svc->perPackLines((int) $sz['product_id']);
+            } catch (\Throwable $e) {
+                $sz['lines'] = [];
+            }
+            $hasRecipe = $hasRecipe || count($sz['lines']) > 0;
+            $meat = array_sum(array_map(fn ($l) => $l['is_meat'] ? $l['per_pack'] : 0, $sz['lines']));
+            $sz['meat_g_per_pack'] = $meat > 0 ? round($meat, 3) : null;
+            // "1 kg taken ≈ 10 × 8 pcs" — whole packs the taken meat makes of this size, by the recipe
+            $sz['packs_from_taken'] = ($takenKg && $meat > 0) ? (int) floor($takenKg * 1000 / $meat) : null;
+        }
+        unset($sz);
+
+        return response()->json([
+            'success'    => true,
+            'batch'      => ['id' => (int) $batch->id, 'batch_number' => $batch->batch_number, 'product_id' => (int) $batch->product_id],
+            'family'     => $family ? ['id' => $family['id'], 'name' => $family['name']] : null,
+            'sizes'      => $sizes,
+            'multi_size' => count($sizes) > 1,
+            'taken_kg'   => $takenKg,
+            'has_recipe' => $hasRecipe,
+        ]);
+    }
+
+    /** 🔁 Oct-19: what one product can be repacked into (other sizes of its family, with stock). */
+    public function repackOptions(Request $request)
+    {
+        if (!(auth()->user()?->hasMobilePermission('access_khaas_mode'))) {
+            return response()->json(['success' => false, 'message' => 'Frozen mode access is needed.'], 403);
+        }
+        try {
+            return response()->json(['success' => true]
+                + (new \App\Services\Khaas\RepackService())->options((int) $request->input('product_id')));
+        } catch (\InvalidArgumentException $e) {
+            return response()->json(['success' => false, 'message' => $e->getMessage()], 404);
+        }
+    }
+
+    /** 🔁 Oct-19: open packs of one size and pack them as another size of the same family. */
+    public function repack(Request $request)
+    {
+        if (!(auth()->user()?->hasMobilePermission('access_khaas_mode'))) {
+            return response()->json(['success' => false, 'message' => 'Frozen mode access is needed.'], 403);
+        }
+        $int = function ($v) {
+            return (is_numeric($v) && (int) $v == $v) ? (int) $v : -1;
+        };
+        try {
+            $r = (new \App\Services\Khaas\RepackService())->repack(
+                (int) $request->input('from_product_id'),
+                $int($request->input('from_packs')),
+                (int) $request->input('to_product_id'),
+                $int($request->input('to_packs')),
+                $request->filled('loose_pieces') ? $int($request->input('loose_pieces')) : 0,
+                $request->input('notes'),
+                auth()->id()
+            );
+            return response()->json(['success' => true] + $r);
+        } catch (\InvalidArgumentException $e) {
+            return response()->json(['success' => false, 'message' => $e->getMessage()], 422);
+        } catch (\Throwable $e) {
+            \Log::error('Frozen repack failed', ['error' => $e->getMessage()]);
+            return response()->json(['success' => false, 'message' => 'Could not repack. Nothing was changed.'], 500);
+        }
+    }
+
     public function endBatch(Request $request, $batchId)
     {
         try {
@@ -1420,6 +1514,33 @@ class WarehouseController extends Controller
             $rawQty = $request->input('quantity_produced');
             $quantityProduced = ($rawQty !== null && $rawQty !== '') ? (int) $rawQty : 0;
 
+            // 🍱 Oct-19 — packs PER SIZE: "3 × 12 pcs and 2 × 8 pcs". Each size is its own stock-in
+            //    (so "made" and the recipe consumption stay right per product); the sizes allowed are
+            //    the batch product's family (RecipeFamilyService::sizesFor — the one engine). Absent =
+            //    the old single number for the batch's own product, exactly as before.
+            $outputs = null;
+            if ($request->has('outputs')) {
+                $allowed = collect((new \App\Services\Khaas\RecipeFamilyService())->sizesFor((int) $batch->product_id))
+                    ->keyBy('product_id');
+                $outputs = [];
+                foreach ((array) $request->input('outputs', []) as $o) {
+                    $pid = (int) ($o['product_id'] ?? 0);
+                    $raw = $o['packs'] ?? 0;
+                    if ($raw === null || $raw === '') {
+                        $raw = 0;
+                    }
+                    if (!is_numeric($raw) || (int) $raw != $raw || (int) $raw < 0) {
+                        return response()->json(['success' => false, 'message' => 'Packs are whole numbers (0 or more).'], 422);
+                    }
+                    if (!$allowed->has($pid)) {
+                        return response()->json(['success' => false,
+                            'message' => 'That size is not part of this batch\'s family — pick from the sizes shown.'], 422);
+                    }
+                    $outputs[$pid] = ($outputs[$pid] ?? 0) + (int) $raw;
+                }
+                $quantityProduced = array_sum($outputs);
+            }
+
             DB::beginTransaction();
 
             // 1. End the batch
@@ -1433,7 +1554,39 @@ class WarehouseController extends Controller
 
             // 2. Auto stock-in to warehouse (only if quantity > 0)
             $stockLog = null;
-            if ($quantityProduced > 0) {
+            $sizeLines = [];
+            if ($outputs !== null) {
+                // 🍱 one stock-in per size (consumption hangs off each stock_in, per its own recipe)
+                $hasOutputTable = \Illuminate\Support\Facades\Schema::hasTable('t_crm_product_batch_output');
+                foreach ($outputs as $pid => $packs) {
+                    if ($packs <= 0) {
+                        continue;
+                    }
+                    $variantId = $pid === (int) $batch->product_id
+                        ? $batch->product_variant_id
+                        : ProductModel::find($pid)?->variants?->first()?->id;
+                    $inventory = WarehouseInventoryModel::getOrCreate($pid, $variantId, $batch->business_unit_id);
+                    $title = ProductModel::where('id', $pid)->value('title');
+                    $log = $inventory->adjustQuantity(
+                        $packs,
+                        'stock_in',
+                        "Auto stock-in from batch {$batch->batch_number} ({$packs} × {$title})",
+                        'batch',
+                        $batch->id
+                    );
+                    $stockLog = $stockLog ?: $log;
+                    $sizeLines[] = "{$packs} × " . trim(preg_replace('/^NF\s*[–-]\s*/u', '', (string) $title));
+                    if ($hasOutputTable) {
+                        DB::table('t_crm_product_batch_output')->insert([
+                            'batch_id' => $batch->id, 'product_id' => $pid, 'packs' => $packs,
+                            'warehouse_log_id' => $log->id ?? null, 'created_by' => auth()->id(), 'created_at' => now(),
+                        ]);
+                    }
+                }
+                if ($stockLog) {
+                    $batch->update(['warehouse_stock_log_id' => $stockLog->id]);
+                }
+            } elseif ($quantityProduced > 0) {
                 $inventory = WarehouseInventoryModel::getOrCreate(
                     $batch->product_id,
                     $batch->product_variant_id,
@@ -1503,15 +1656,49 @@ class WarehouseController extends Controller
                 ? $duration->h . 'h ' . $duration->i . 'm' 
                 : $duration->i . 'm';
 
-            $message = $quantityProduced > 0 
+            $message = $quantityProduced > 0
                 ? "Batch {$batch->batch_number} completed. {$quantityProduced} units added to warehouse."
                 : "Batch {$batch->batch_number} completed (0 units produced — no stock change).";
+            if ($sizeLines) {
+                $message = "Batch {$batch->batch_number} completed. Added to the warehouse: " . implode(', ', $sizeLines) . '.';
+            }
+
+            // 🍱 Oct-19 — YIELD: the meat taken at Accept (from the plan) against what the recipe
+            //    says these packs hold. Information, never a second deduction.
+            $yield = null;
+            try {
+                $takenKg = (float) DB::table('t_crm_khaas_production_demand_item')
+                    ->where('batch_id', $batch->id)->sum('storage_deducted_qty');
+                $recipeG = (float) DB::table('t_crm_khaas_batch_consumption as c')
+                    ->join('t_crm_khaas_ingredient as i', 'i.id', '=', 'c.ingredient_id')
+                    ->where('c.batch_id', $batch->id)->whereNotNull('i.storage_product_id')
+                    ->sum('c.qty_base');
+                if ($takenKg > 0 && $quantityProduced > 0) {
+                    $recipeKg = round($recipeG / 1000, 3);
+                    $gap = round($takenKg - $recipeKg, 3);
+                    $fmt = fn ($v) => rtrim(rtrim(number_format(abs($v), 3, '.', ''), '0'), '.');
+                    $yield = [
+                        'taken_kg'  => round($takenKg, 3),
+                        'recipe_kg' => $recipeKg,
+                        'gap_kg'    => $recipeKg > 0 ? $gap : null,
+                        'text'      => $recipeKg <= 0
+                            ? "Meat: {$fmt($takenKg)} kg taken at accept — no recipe for these packs, so nothing to compare."
+                            : ("Meat: {$fmt($takenKg)} kg taken at accept · the recipe says {$fmt($recipeKg)} kg for these packs"
+                                . (abs($gap) < 0.0005 ? ' · exact.'
+                                    : ($gap > 0 ? " · {$fmt($gap)} kg not in packs." : " · {$fmt($gap)} kg MORE in packs than was taken — check the count."))),
+                    ];
+                    $message .= "\n" . $yield['text'];
+                }
+            } catch (\Throwable $e) {
+                // the yield line is information; the batch is already safely ended
+            }
 
             $responseData = [
                 'id' => $batch->id,
                 'batch_number' => $batch->batch_number,
                 'quantity_produced' => $quantityProduced,
                 'duration' => $durationStr,
+                'yield' => $yield,
             ];
 
             // Include warehouse qty if stock was added
@@ -2126,6 +2313,12 @@ class WarehouseController extends Controller
                 'order_status' => 'pending',
                 'order_date' => now()->toDateString(),
                 'currency' => 'PKR',
+                // Oct-19-2026 — Khaas storage orders are always ONLINE (the shop
+                // customer settles them from Online Approvals → Shop tab). Left NULL,
+                // a rider delivery booked them as CASH on the rider (KS-36); every
+                // earlier KS order had to be switched by hand. Same spelling the
+                // rider/store apps write. Carried to the live order by convertOrder().
+                'payment_method' => 'online_payment',
                 'name' => trim($customer->first_name . ' ' . ($customer->last_name ?? '')),
                 'contact_email' => $customer->email ?? null,
                 'subtotal_price' => $subtotal,
@@ -3166,7 +3359,11 @@ class WarehouseController extends Controller
                 );
             }
 
-            return response()->json(['success' => true, 'message' => 'Recipe mapping saved']);
+            // 🍱 Oct-19: a pack in a recipe family shares its meat with every other size
+            $shared = (new \App\Services\Khaas\RecipeFamilyService())->fanOutMapping((int) $khaasProductId);
+
+            return response()->json(['success' => true, 'message' => 'Recipe mapping saved'
+                . ($shared ? " — and for the {$shared} other size" . ($shared === 1 ? '' : 's') . ' of its family' : '')]);
         } catch (\Exception $e) {
             \Log::error('Failed to save recipe', ['error' => $e->getMessage()]);
             return response()->json(['success' => false, 'message' => 'Failed to save: ' . $e->getMessage()], 500);
@@ -3252,8 +3449,12 @@ class WarehouseController extends Controller
     {
         try {
             $recipeId = $request->input('recipe_id');
+            $owner = DB::table('t_crm_khaas_product_recipe')->where('id', $recipeId)->value('khaas_product_id');
             DB::table('t_crm_khaas_product_recipe')->where('id', $recipeId)->update(['is_active' => 0]);
-            return response()->json(['success' => true, 'message' => 'Mapping removed']);
+            // 🍱 Oct-19: removed from every size of its family, not just this one
+            $shared = $owner ? (new \App\Services\Khaas\RecipeFamilyService())->fanOutMapping((int) $owner) : 0;
+            return response()->json(['success' => true, 'message' => 'Mapping removed'
+                . ($shared ? " — and from the {$shared} other size" . ($shared === 1 ? '' : 's') . ' of its family' : '')]);
         } catch (\Exception $e) {
             return response()->json(['success' => false, 'message' => 'Failed to remove'], 500);
         }
@@ -3320,7 +3521,18 @@ class WarehouseController extends Controller
                 $customRecipes = collect();
             }
 
-            $products = $allProducts->map(function($p) use ($invRecipes, $customRecipes) {
+            // 🍱 Oct-19: the family and whether a kitchen recipe stands behind each product, so the
+            //    picker can mark "no meat set" / "no recipe" BEFORE someone accepts a demand
+            $coverage = [];
+            try {
+                foreach ((new \App\Services\Khaas\RecipeService())->coverage((int) $businessUnitId) as $c) {
+                    $coverage[(int) $c['product_id']] = $c;
+                }
+            } catch (\Throwable $e) {
+                $coverage = [];
+            }
+
+            $products = $allProducts->map(function($p) use ($invRecipes, $customRecipes, $coverage) {
                 $pid = $p->id;
                 $materials = [];
 
@@ -3346,6 +3558,7 @@ class WarehouseController extends Controller
                 }
 
                 $invMaterials = array_filter($materials, fn($m) => !$m['is_custom']);
+                $cov = $coverage[(int) $pid] ?? null;
                 return [
                     'khaas_product_id' => $pid,
                     'product_name' => $p->title,
@@ -3353,10 +3566,49 @@ class WarehouseController extends Controller
                     'raw_material_name' => empty($materials) ? 'Unlinked' : implode(' + ', array_column($materials, 'raw_material_name')),
                     'raw_material_available' => empty($invMaterials) ? 0 : round(min(array_column($invMaterials, 'raw_material_available')), 3),
                     'has_recipe' => !empty($materials),
+                    // 🍱 Oct-19 (additive keys — older apps ignore them)
+                    'has_kitchen_recipe' => $cov ? (bool) $cov['has_recipe'] : false,
+                    'family_id'       => $cov['family_id'] ?? null,
+                    'family_name'     => $cov['family_name'] ?? null,
+                    'pieces_per_pack' => $cov['pieces_per_pack'] ?? null,
+                    'warning'         => empty($materials)
+                        ? ($cov && $cov['has_recipe'] && !($cov['has_storage_line'] ?? true)
+                            ? null
+                            : 'No raw material from Storage set — accepting would take nothing from Storage')
+                        : ($cov && !$cov['has_recipe'] ? 'No recipe — salt, oil and the rest will not be counted' : null),
+                    // 🥔 a preparation with nothing counted by Storage (all from the shelf) is fine to plan
+                    'note'            => empty($materials) && $cov && $cov['has_recipe'] && !($cov['has_storage_line'] ?? true)
+                        ? 'Nothing from Storage — its recipe has no meat or potato; everything comes from the shelf'
+                        : null,
                 ];
             })->values();
 
-            return response()->json(['success' => true, 'products' => $products]);
+            // 🍱 Oct-19 (owner): THE PLAN IS BY FAMILY. One line per preparation — "Chicken Cheese
+            //    Samosa", not "(8 pcs)" and "(12 pcs)" — standing on the family's smallest active size
+            //    (the ANCHOR), so the meat is taken once and the sizes are decided when the batch ends.
+            //    Packs in no family stay as they are. Same rows for the web production tab and the phone.
+            $byFamily = [];
+            foreach ($products as $row) {
+                if ($row['family_id']) {
+                    $byFamily[$row['family_id']][] = $row;
+                }
+            }
+            $products = $products->filter(fn ($row) => !$row['family_id'])->map(function ($row) {
+                return $row + ['is_family' => false, 'sizes' => $row['pieces_per_pack'] ? [\App\Services\Khaas\RecipeFamilyService::sizeLabel((int) $row['pieces_per_pack'])] : [], 'sku_name' => $row['product_name']];
+            })->values()->all();
+            foreach ($byFamily as $rows) {
+                usort($rows, fn ($a, $b) => [(int) $a['pieces_per_pack'], $a['khaas_product_id']] <=> [(int) $b['pieces_per_pack'], $b['khaas_product_id']]);
+                $fam = $rows[0];                       // the anchor's mapping, recipe and warning
+                $fam['sku_name']     = $fam['product_name'];
+                $fam['product_name'] = $fam['family_name'];
+                $fam['is_family']    = true;
+                $fam['sizes']        = array_values(array_unique(array_map(
+                    fn ($r) => \App\Services\Khaas\RecipeFamilyService::sizeLabel((int) $r['pieces_per_pack']), $rows)));
+                $products[] = $fam;
+            }
+            usort($products, fn ($a, $b) => strcasecmp($a['product_name'], $b['product_name']));
+
+            return response()->json(['success' => true, 'products' => array_values($products)]);
         } catch (\Exception $e) {
             \Log::error('Failed to get demand products', ['error' => $e->getMessage()]);
             return response()->json(['success' => false, 'message' => 'Failed to load products'], 500);
@@ -3403,6 +3655,7 @@ class WarehouseController extends Controller
                 ->orderBy('kp.title')
                 ->get()
                 ->groupBy('demand_id');
+            $items = $this->planNamed($items);   // 🍱 a family line is called by its family
 
             // Pre-load recipe mappings with ratio and availability info
             $allKhaasIds = $items->flatten(1)->pluck('khaas_product_id')->unique()->toArray();
@@ -3474,6 +3727,8 @@ class WarehouseController extends Controller
                         'id' => $i->id,
                         'khaas_product_id' => $i->khaas_product_id,
                         'product_name' => $i->product_name,
+                        'sku_name' => $i->sku_name ?? $i->product_name,       // 🍱 the anchor pack's own title
+                        'family_name' => $i->family_name ?? null,
                         'quantity_kg' => (float) $i->quantity_kg,
                         'raw_material_name' => $rawMaterialName,
                         'raw_materials' => $materialNames,
@@ -3510,6 +3765,33 @@ class WarehouseController extends Controller
     /**
      * Get completed/cancelled demand history
      */
+    /**
+     * 🍱 Oct-19: plan lines are CALLED by their family ("Chicken Cheese Samosa"), the pack's own
+     * title kept as sku_name. One query for the whole list (RecipeFamilyService::planNames).
+     * @param \Illuminate\Support\Collection $grouped  demand_id => collection of item rows
+     */
+    private function planNamed($grouped)
+    {
+        try {
+            $ids = $grouped->flatten(1)->pluck('khaas_product_id')->all();
+            $names = (new \App\Services\Khaas\RecipeFamilyService())->planNames($ids);
+            foreach ($grouped as $rows) {
+                foreach ($rows as $row) {
+                    $n = $names[(int) $row->khaas_product_id] ?? null;
+                    $row->sku_name    = $row->product_name;
+                    $row->family_id   = $n['family_id'] ?? null;
+                    $row->family_name = $n['family_name'] ?? null;
+                    if ($n && $n['family_id']) {
+                        $row->product_name = $n['name'];
+                    }
+                }
+            }
+        } catch (\Throwable $e) {
+            \Log::warning('Plan names: could not apply family names', ['error' => $e->getMessage()]);
+        }
+        return $grouped;
+    }
+
     public function getDemandHistory(Request $request)
     {
         try {
@@ -3538,6 +3820,7 @@ class WarehouseController extends Controller
                 ->orderBy('kp.title')
                 ->get()
                 ->groupBy('demand_id');
+            $items = $this->planNamed($items);   // 🍱 a family line is called by its family
 
             $allKhaasIds = $items->flatten(1)->pluck('khaas_product_id')->unique()->toArray();
             $recipeMap = [];
@@ -3560,6 +3843,8 @@ class WarehouseController extends Controller
                     return [
                         'id' => $i->id,
                         'product_name' => $i->product_name,
+                        'sku_name' => $i->sku_name ?? $i->product_name,
+                        'family_name' => $i->family_name ?? null,
                         'quantity_kg' => (float) $i->quantity_kg,
                         'raw_material_name' => $rawMaterialName,
                         'raw_materials' => $materialNames,
@@ -3612,6 +3897,11 @@ class WarehouseController extends Controller
 
             $businessUnitId = $request->input('business_unit_id');
             $demandDate = $request->input('demand_date');
+
+            // 🍱 one line per preparation (two sizes of one family would take the meat twice)
+            if ($problem = (new \App\Services\Khaas\RecipeFamilyService())->planLineProblem((array) $request->input('items', []))) {
+                return response()->json(['success' => false, 'message' => $problem], 422);
+            }
 
             DB::beginTransaction();
 
@@ -3681,6 +3971,10 @@ class WarehouseController extends Controller
             }
             if (!in_array($demand->status, ['draft', 'submitted'])) {
                 return response()->json(['success' => false, 'message' => 'Can only edit plans in draft or submitted status'], 400);
+            }
+            // 🍱 one line per preparation
+            if ($problem = (new \App\Services\Khaas\RecipeFamilyService())->planLineProblem((array) $request->input('items', []))) {
+                return response()->json(['success' => false, 'message' => $problem], 422);
             }
 
             DB::beginTransaction();
@@ -3756,6 +4050,48 @@ class WarehouseController extends Controller
                 return response()->json(['success' => false, 'message' => 'No pending items to process'], 400);
             }
 
+            // 🍱 Oct-19 — NEVER accept what deducts nothing. The 12-pcs products had no meat
+            //    mapping: accept took 0 kg, started the batches and still said "Raw materials
+            //    deducted". A product with no mapping at all (no storage meat, no custom
+            //    material) is refused here, by name, with the way to fix it.
+            //    🥔 Oct-19 (owner): every preparation needs a way out of the plan. A product whose
+            //    kitchen recipe has NO Storage-counted ingredient at all (no meat, no potato — all
+            //    from the shelf) is accepted with nothing taken, and the message says so. Refused =
+            //    no mapping AND (no recipe, or a recipe that DOES want something from Storage).
+            $unmapped = [];
+            $shelfOnly = [];   // accepted, nothing from Storage, by name
+            $famSvc = new \App\Services\Khaas\RecipeFamilyService();
+            foreach ($items as $item) {
+                $hasAny = DB::table('t_crm_khaas_product_recipe')
+                    ->where('khaas_product_id', $item->khaas_product_id)
+                    ->where('is_active', 1)
+                    ->where(function ($q) {
+                        $q->whereNotNull('storage_product_id')->orWhereNotNull('custom_material_id');
+                    })
+                    ->exists();
+                if ($hasAny) {
+                    continue;
+                }
+                $title = $famSvc->planNames([(int) $item->khaas_product_id])[(int) $item->khaas_product_id]['name']
+                    ?? (DB::table('t_crm_prod_product')->where('id', $item->khaas_product_id)->value('title') ?: ('product #' . $item->khaas_product_id));
+                $lines = $famSvc->perPackLines((int) $item->khaas_product_id);
+                if ($lines && !array_filter($lines, fn ($l) => $l['is_meat'])) {
+                    $shelfOnly[] = $title;   // a recipe, and nothing in it is counted by Storage
+                    continue;
+                }
+                $unmapped[] = $title;
+            }
+            if ($unmapped) {
+                DB::rollBack();
+                return response()->json([
+                    'success'  => false,
+                    'message'  => 'Not accepted — no raw material from Storage (meat, potato…) is set for: ' . implode(', ', $unmapped)
+                        . '. Nothing would come off Storage. Put it in its recipe family (Products → edit → Recipe family), '
+                        . 'set its raw material on Frozen → Planning → 🔗 Recipes, or write its recipe if nothing in it comes from Storage — then accept again.',
+                    'unmapped' => $unmapped,
+                ], 400);
+            }
+
             // Check storage availability inside transaction with locked rows
             $shortages = [];
             $storageNeeds = [];
@@ -3826,6 +4162,7 @@ class WarehouseController extends Controller
             }
 
             // Process each item: deduct inventory-linked raw materials (skip custom materials)
+            $taken = [];   // 🍱 Oct-19: what actually came off Storage, per item, for the message
             foreach ($items as $item) {
                 $recipes = DB::table('t_crm_khaas_product_recipe')
                     ->where('khaas_product_id', $item->khaas_product_id)
@@ -3834,6 +4171,10 @@ class WarehouseController extends Controller
                     ->get();
 
                 $totalDeducted = 0;
+                // 🍱 a family line is named by its family in the "taken from Storage" message
+                $itemTitle = (new \App\Services\Khaas\RecipeFamilyService())->planNames([(int) $item->khaas_product_id])[(int) $item->khaas_product_id]['name']
+                    ?? (DB::table('t_crm_prod_product')->where('id', $item->khaas_product_id)->value('title') ?: ('#' . $item->khaas_product_id));
+                $itemTaken = [];
 
                 foreach ($recipes as $recipe) {
                     $deductQty = round($item->quantity_kg * (float) $recipe->ratio_kg, 3);
@@ -3891,8 +4232,16 @@ class WarehouseController extends Controller
                         ]);
 
                         $totalDeducted += $deductQty;
+                        $meatName = DB::table('t_crm_prod_product')->where('id', $recipe->storage_product_id)->value('title');
+                        $itemTaken[] = rtrim(rtrim(number_format($deductQty, 3, '.', ''), '0'), '.') . ' kg '
+                            . trim(preg_replace('/\s*per kg.*$/i', '', preg_replace('/^(?:KW|DKC)\s*[–-]\s*/i', '', (string) $meatName)));
                     }
                 }
+                $taken[] = '• ' . $itemTitle . ': ' . ($itemTaken
+                    ? implode(' + ', $itemTaken)
+                    : (in_array($itemTitle, $shelfOnly, true)
+                        ? 'nothing from Storage — its recipe has no meat or potato, everything comes from the shelf'
+                        : 'no storage meat (custom material only)'));
 
                 // Auto-start batch for this product
                 $existingBatch = \App\Models\CRM\ProductBatchModel::getActiveBatch($item->khaas_product_id, $businessUnitId);
@@ -3940,7 +4289,9 @@ class WarehouseController extends Controller
 
             return response()->json([
                 'success' => true,
-                'message' => 'Demand accepted. Raw materials deducted and batches started.',
+                // 🍱 Oct-19: say WHAT came off Storage, per item — never a fixed sentence
+                'message' => "Demand accepted, batches started. Taken from Storage:\n" . implode("\n", $taken),
+                'taken'   => $taken,
             ]);
         } catch (\Exception $e) {
             if (DB::transactionLevel() > 0) {

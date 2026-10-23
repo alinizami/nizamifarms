@@ -377,6 +377,9 @@
 
                 <!-- 📦 Bundled product (Oct-2026) -->
                 @include('pages.products.partials.bundle-section', ['bundleProduct' => $product])
+
+                <!-- 🍱 Recipe family (Oct-2026) — Frozen, not a bundle -->
+                @include('pages.products.partials.recipe-family-section', ['familyProduct' => $product])
             </div>
         </div>
 

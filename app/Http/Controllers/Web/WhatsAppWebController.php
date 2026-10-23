@@ -1011,6 +1011,10 @@ class WhatsAppWebController extends Controller
                     : null,
                 'seen_by' => $seenBy,
                 'labels' => $convLabels,
+                // 🔴⏳ Oct-2026 — tag follow-up strip for the person who TAGGED on this chat
+                // ("⏳ Taimur hasn't opened this · 25 min"); null for everyone else.
+                'followup' => app(\App\Services\WhatsApp\MentionFollowupService::class)
+                    ->stripForViewer((int) $conversation->id, (int) (auth()->id() ?? 0)),
             ],
             'messages' => $messages->map(function ($msg) use ($reactionCtx) {
                 return [
@@ -1311,6 +1315,12 @@ class WhatsAppWebController extends Controller
                 ->where('l.user_id', $userId)
                 ->whereNull('cl.mention_seen_at')
                 ->update(['cl.mention_seen_at' => $now]);
+        }
+
+        // 🔴⏳ Oct-2026: opening the chat on the WEB ends the tag follow-up too (and clears the
+        // sticky alert on his phone). Instant return for anyone not on the tag-alert list.
+        if ($userId) {
+            app(\App\Services\WhatsApp\MentionFollowupService::class)->onOpened((int) $conversationId, (int) $userId);
         }
 
         // Legacy column is still zeroed out so global badge sums stay sane.
@@ -1679,10 +1689,14 @@ class WhatsAppWebController extends Controller
 
         // Fire FCM mention push (Phase 2) — only on first apply and not a
         // self-mention. Non-fatal on any failure.
+        // 🔴⏳ Oct-2026: people on the tag-alert list (Taimur) are owned by the follow-up
+        // engine (loud alert + tagger reminders); null for everyone else → today's push below.
         try {
-            $label = \App\Models\WhatsApp\LabelModel::find($data['label_id']);
             $me = auth()->user();
-            if ($isNewApply && $label && $label->user_id && (int) $label->user_id !== (int) ($me->id ?? 0)) {
+            $owned = app(\App\Services\WhatsApp\MentionFollowupService::class)
+                ->onTagged((int) $conversationId, (int) $data['label_id'], (int) ($me->id ?? 0));
+            $label = $owned === null ? \App\Models\WhatsApp\LabelModel::find($data['label_id']) : null;
+            if ($owned === null && $isNewApply && $label && $label->user_id && (int) $label->user_id !== (int) ($me->id ?? 0)) {
                 app(\App\Services\FirebaseService::class)->notifyWhatsAppMention(
                     (int) $label->user_id,
                     $me->fullname ?? ('User #' . ($me->id ?? 0)),
@@ -1703,9 +1717,32 @@ class WhatsAppWebController extends Controller
         if (!$access['allowed']) {
             return response()->json(['success' => false, 'message' => 'No permission'], 403);
         }
+        // 🔴⏳ Oct-2026: close any tag follow-up BEFORE the pivot row disappears.
+        app(\App\Services\WhatsApp\MentionFollowupService::class)->onUntagged((int) $conversationId, (int) $labelId);
         \App\Models\WhatsApp\ConversationLabelModel::where('conversation_id', $conversationId)
             ->where('label_id', $labelId)->delete();
         return response()->json(['success' => true, 'labels' => $this->labelsForConversation($conversationId)]);
+    }
+
+    /**
+     * 🔴⏳ Oct-2026 — web twin of API\WhatsAppController::mentionFollowupAction. The buttons on
+     * the "⏳ Taimur hasn't opened this" strip. Same service, same rules.
+     */
+    public function mentionFollowupAction(Request $request, $id)
+    {
+        $access = $this->resolveWhatsAppAccess();
+        if (!$access['allowed']) {
+            return response()->json(['success' => false, 'message' => 'No permission'], 403);
+        }
+        $data = $request->validate(['action' => 'required|string|in:wait10,called,stop,on_it']);
+        try {
+            $r = app(\App\Services\WhatsApp\MentionFollowupService::class)->act((int) $id, (int) auth()->id(), $data['action']);
+        } catch (\Throwable $e) {
+            Log::error('mentionFollowupAction (web) failed', ['error' => $e->getMessage()]);
+            return response()->json(['success' => false, 'message' => 'Could not save that — try again.'], 500);
+        }
+        $status = $r['ok'] ? 200 : (['forbidden' => 403, 'not_found' => 404, 'bad_action' => 422][$r['code']] ?? 409);
+        return response()->json(['success' => $r['ok'], 'code' => $r['code'], 'message' => $r['message'], 'followup' => $r['followup']], $status);
     }
 
     /**
@@ -1743,6 +1780,12 @@ class WhatsAppWebController extends Controller
         // Fire-and-forget after the response flushes; self-throttled to ~1/min.
         try {
             app(\App\Services\Payments\PaymentSignalAutoRunner::class)->fireFromRequest();
+        } catch (\Throwable $e) {
+            // never affect the unread-count response
+        }
+        // 🔴⏳ Oct-2026: same drumbeat for tag reminders (backup to the StackCP task).
+        try {
+            app(\App\Services\WhatsApp\MentionFollowupService::class)->fireFromRequest();
         } catch (\Throwable $e) {
             // never affect the unread-count response
         }

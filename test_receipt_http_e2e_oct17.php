@@ -78,6 +78,20 @@ $jpeg = base64_decode('/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQND
 $tmp = tempnam(sys_get_temp_dir(), 'rcpt'); file_put_contents($tmp, $jpeg);
 $uuid = (string) Illuminate\Support\Str::uuid();
 
+// Oct-19 refresh: sizes and ids come from the replica, not from the day the proof was written (Qasim
+// re-made Salt as P131 and added Sonf / Garam Masala Whole / Dar Chini on 17-18 Oct; the prod sync brought
+// them in, and his 17-Oct recording TAUGHT "Fresh Onions" → P90 and "Cardamom Black 100g" → P117).
+$activeCount = DB::table('t_fin_vendor_products')->where('vendor_id', 50)->where('is_active', 1)->count();
+$pid = fn (string $name) => (int) DB::table('t_fin_vendor_products')->where('vendor_id', 50)->where('is_active', 1)->where('product_name', $name)->value('id');
+$aliasMap = app(\App\Services\Assistant\SmsCounterpartyMap::class);
+$plog = new \App\Services\Assistant\PurchaseLogService();
+$keyOf = new ReflectionMethod($plog, 'productKey'); $keyOf->setAccessible(true);
+$taughtId = function (string $raw) use ($aliasMap, $keyOf, $plog): int {
+    $a = $aliasMap->byAccount($keyOf->invoke($plog, 50, $raw));
+    return ($a && $a->entity_type === 'product') ? (int) $a->entity_id : 0;
+};
+$saltId = $pid('Salt'); $maidaId = $pid('Maida'); $onionId = $pid('Onions (Piyaaz)');
+
 DB::beginTransaction();
 try {
     // ── 1. the picker's list ────────────────────────────────────────────────
@@ -85,7 +99,7 @@ try {
     [$st, $b] = call('GET', '/api/vendors/50/products/list');
     ok($st === 200 && ($b['success'] ?? false), 'responds 200 success', "$st " . json_encode($b)[0] ?? '');
     $plist = $b['products'] ?? [];
-    ok(count($plist) === 40, '40 products', (string) count($plist));
+    ok(count($plist) === $activeCount, "every active product ($activeCount)", (string) count($plist));
     ok(array_key_exists('ingredient_name', $plist[0] ?? []), 'each product carries ingredient_name (the picker sorts linked first on it)');
     ok(($b['supports_ingredients'] ?? false) === true, 'supports_ingredients true (the "Not an ingredient" tick shows)');
     ok(count(array_filter($plist, fn ($p) => !empty($p['ingredient_name']))) >= 30, 'most products are linked', (string) count(array_filter($plist, fn ($p) => !empty($p['ingredient_name']))));
@@ -98,20 +112,42 @@ try {
     $card = $b['card'] ?? [];
     $L = $card['lines'] ?? [];
     ok(count($L) === 26, '26 lines on the card', (string) count($L));
-    ok(($card['catalogue_size'] ?? 0) === 40, 'catalogue_size 40');
+    ok(($card['catalogue_size'] ?? 0) === $activeCount, "catalogue_size $activeCount", (string) ($card['catalogue_size'] ?? 0));
     ok(($card['reconcile']['matches'] ?? false) === true && abs(($card['reconcile']['lines_total'] ?? 0) - 15665.28) < 0.01, 'reconcile: lines add up to the printed Rs 15,665.28', json_encode($card['reconcile'] ?? null));
     $by = []; foreach ($L as $l) { $by[$l['raw_name']] = $l; }
     ok(($by['Ponam Maida 1kg']['product_name'] ?? null) === 'Maida' && $by['Ponam Maida 1kg']['matched'] === true, 'Maida auto-matched');
     ok(($by['National Salt Refined 800G']['product_name'] ?? null) === 'Salt', 'Salt auto-matched');
-    ok(($by['Fresh Onions']['ai_suggestion']['name'] ?? null) === 'Onions (Piyaaz)' && $by['Fresh Onions']['matched'] === false, 'Fresh Onions: reader suggestion P90, shown not applied');
-    ok(($by['Cardamom Black 100g']['ai_suggestion']['name'] ?? null) === 'Bari Elaichi 100gm', '⭐ Cardamom: ingredient guess → the LINKED product Bari Elaichi 100gm offered');
-    ok(empty($by['Cardamom Black 100g']['ai_ingredient']), '…and no "add it as a product" nudge');
+    // A TAUGHT name matches straight away; an untaught one only gets the reader's guess as a suggestion.
+    // (The untaught case is proved on its own in test_receipt_matcher_oct17.php, section 4.)
+    $on = $by['Fresh Onions'] ?? [];
+    ok($taughtId('Fresh Onions')
+        ? ($on['matched'] ?? false) === true && (int) ($on['product_id'] ?? 0) === $taughtId('Fresh Onions')
+        : ($on['ai_suggestion']['name'] ?? null) === 'Onions (Piyaaz)' && ($on['matched'] ?? true) === false,
+        'Fresh Onions: taught → matched to its taught product; untaught → reader suggestion P90, shown not applied',
+        json_encode(array_intersect_key($on, array_flip(['matched', 'product_id', 'ai_suggestion']))));
+    $ca = $by['Cardamom Black 100g'] ?? [];
+    ok($taughtId('Cardamom Black 100g')
+        ? ($ca['matched'] ?? false) === true && (int) ($ca['product_id'] ?? 0) === $taughtId('Cardamom Black 100g')
+        : ($ca['ai_suggestion']['name'] ?? null) === 'Bari Elaichi 100gm',
+        '⭐ Cardamom: taught → matched; untaught → the LINKED product Bari Elaichi 100gm offered',
+        json_encode(array_intersect_key($ca, array_flip(['matched', 'product_id', 'ai_suggestion']))));
+    ok(empty($ca['ai_ingredient']), '…and no "add it as a product" nudge');
     $bag = $by['Non-Woven Ultrasonic Bag 18"x21" 50gm'] ?? [];
     ok(($bag['matched'] ?? true) === false && empty($bag['product_id']), '⭐ the bag is NOT matched (used to be "Long 50gm")');
     ok(!in_array('Long 50gm', array_column($bag['suggestions'] ?? [], 'name'), true), '…and Long 50gm is not even a did-you-mean');
     ok(!in_array('Bari Elaichi 100gm', array_column($by['Ponam Sonf 100g']['suggestions'] ?? [], 'name'), true), 'Sonf 100g: no Bari Elaichi 100gm did-you-mean');
-    ok(in_array('Garam Masala Sabat 100gm', array_column($by['Ponam Garam Masala Whole 100g']['suggestions'] ?? [], 'name'), true), 'Garam Masala Whole: Sabat offered');
-    ok(in_array('Daar Cheeni', array_column($by['Ponam Dar Chini']['suggestions'] ?? [], 'name'), true) || ($by['Ponam Dar Chini']['ai_suggestion']['name'] ?? '') === 'Daar Cheeni', 'Dar Chini → Daar Cheeni (reader or did-you-mean)');
+    // Garam Masala Whole / Dar Chini: products of those names now exist (P133, P134). Whatever the list holds,
+    // the line lands on a product of THAT name — matched, offered or suggested — never on another 100g pack.
+    $landsOn = function (array $l, string $word): bool {
+        $names = array_merge([$l['matched'] ? ($l['product_name'] ?? '') : ''], array_column($l['suggestions'] ?? [], 'name'), [$l['ai_suggestion']['name'] ?? '']);
+        $hits = array_filter($names, fn ($n) => $n !== '' && stripos(str_replace(['Daar Cheeni'], ['Dar Chini'], $n), $word) !== false);
+        $bad  = array_filter($names, fn ($n) => $n !== '' && stripos($n, 'Bari Elaichi') !== false);
+        return count($hits) >= 1 && count($bad) === 0;
+    };
+    ok($landsOn($by['Ponam Garam Masala Whole 100g'] ?? [], 'Garam Masala'), 'Garam Masala Whole → a garam masala product (matched or offered)',
+        json_encode(array_intersect_key($by['Ponam Garam Masala Whole 100g'] ?? [], array_flip(['matched', 'product_name', 'suggestions']))));
+    ok($landsOn($by['Ponam Dar Chini'] ?? [], 'Dar Chini'), 'Dar Chini → a dar chini product (matched, reader or did-you-mean)',
+        json_encode(array_intersect_key($by['Ponam Dar Chini'] ?? [], array_flip(['matched', 'product_name', 'suggestions', 'ai_suggestion']))));
     ok(is_array($card['warnings'] ?? null) && count($card['warnings']) >= 1, 'the card carries its warnings sentence(s)');
     $draftId = $b['draft_id'] ?? null;
     ok((int) $draftId > 0, 'draft row created', json_encode($draftId));
@@ -126,11 +162,12 @@ try {
     // ── 4. the money door, with a HAND-ADDED line ───────────────────────────
     echo "4. POST /api/vendors/50/receipt/record (rolled back)\n";
     $items = [
-        ['product_id' => 90, 'quantity' => '10.03', 'rate' => '195', 'unit' => 'kg', 'product_name' => 'Onions (Piyaaz)', 'raw_name' => 'Fresh Onions'],
-        ['product_id' => 78, 'quantity' => '10', 'rate' => '165', 'unit' => 'kg', 'product_name' => 'Maida', 'raw_name' => 'Ponam Maida 1kg'],
+        ['product_id' => $onionId, 'quantity' => '10.03', 'rate' => '195', 'unit' => 'kg', 'product_name' => 'Onions (Piyaaz)', 'raw_name' => 'Fresh Onions'],
+        ['product_id' => $maidaId, 'quantity' => '10', 'rate' => '165', 'unit' => 'kg', 'product_name' => 'Maida', 'raw_name' => 'Ponam Maida 1kg'],
         // ➕ added by hand on the card: no raw_name at all (exactly what the phone posts)
-        ['product_id' => 77, 'quantity' => '800', 'rate' => '0.06', 'unit' => 'g', 'product_name' => 'Salt'],
+        ['product_id' => $saltId, 'quantity' => '800', 'rate' => '0.06', 'unit' => 'g', 'product_name' => 'Salt'],
     ];
+    ok($onionId > 0 && $maidaId > 0 && $saltId > 0, "the three products exist on the replica (Onions P$onionId, Maida P$maidaId, Salt P$saltId)");
     $before = DB::table('t_fin_vendor_purchase_items')->count();
     [$st, $b] = call('POST', '/api/vendors/50/receipt/record', [
         'transaction_date' => date('Y-m-d'), 'description' => 'Receipt · Imtiaz', 'adjustment_amount' => '0',
@@ -141,7 +178,7 @@ try {
     ok($tid > 0, 'a ledger transaction id came back', (string) $tid);
     $rows = DB::table('t_fin_vendor_purchase_items')->where('ledger_id', $tid)->get();
     ok(count($rows) === 3, '3 purchase items under that ledger row', (string) count($rows));
-    $salt = $rows->firstWhere('vendor_product_id', 77);
+    $salt = $rows->firstWhere('vendor_product_id', $saltId);
     ok($salt && abs((float) $salt->quantity - 800) < 0.001 && abs((float) $salt->rate_per_unit - 0.06) < 0.0001 && abs((float) $salt->line_total - 48) < 0.01, '⭐ the hand-added Salt line is recorded: 800 × 0.06 = Rs 48', json_encode($salt));
     ok($salt && (int) $salt->ingredient_id === 33 && (string) $salt->product_name === 'Salt', '…stamped with its ingredient (Salt) and product name', json_encode($salt));
     $ledger = DB::table('t_fin_ledger')->where('id', $tid)->first();

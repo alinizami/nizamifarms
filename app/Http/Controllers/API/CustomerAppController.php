@@ -1131,6 +1131,13 @@ class CustomerAppController extends Controller
         if ($value === '') {
             return $value;
         }
+        // ✂ Oct-2026: a SPLIT Shopify invoice reaches the app as "23614-A" (the
+        // payload strips SH- exactly as for the original). Its only letter is the
+        // split suffix, so without this it fell into the "full NF number" branch,
+        // looked up order_number '23614-A' and 404'd on tracking/invoice.
+        if (preg_match('/^\d+-[A-Za-z]$/', $value)) {
+            return 'SH-' . strtoupper($value);
+        }
         if (preg_match('/[A-Za-z]/', $value)) {
             return strtoupper($value);
         }

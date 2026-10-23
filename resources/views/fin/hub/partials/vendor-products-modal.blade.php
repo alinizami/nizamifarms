@@ -269,8 +269,9 @@
             box.innerHTML = '<b>' + escH(ing.name) + ' is counted in ' + escH((KIND_WORD[ing.base_unit]||'').toUpperCase())
                 + (ing.recipe_count > 0 ? ' in your recipes' : '') + ', but this product is set to ' + escH(unit) + '.</b>'
                 + (unitLocked
-                    ? '<div style="margin-top:6px">Its unit is locked by ' + editing.n + ' recorded purchase' + (editing.n === 1 ? '' : 's') + ', so it cannot switch. Leave it untagged, or add a new ' + escH(s) + ' product for ' + escH(ing.name) + ' and switch this one off.</div>'
-                      + '<div style="margin-top:6px"><button type="button" class="mini-btn" onclick="hubPrUntag()">Leave it untagged</button></div>'
+                    ? '<div style="margin-top:6px">Its unit is locked by ' + editing.n + ' recorded purchase' + (editing.n === 1 ? '' : 's') + ', so it cannot switch. Leave it untagged — or replace ' + escH(ing.name) + ' with a new one in the unit this product uses: its recipes and products move in one step, and this product can then be linked.</div>'
+                      + '<div style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap"><button type="button" class="mini-btn" onclick="hubPrUntag()">Leave it untagged</button>'
+                      + '<a class="mini-btn solid" style="text-decoration:none" href="/khaas/inventory?tab=ingredients&replace=' + encodeURIComponent(ing.id) + '">🔁 Replace ' + escH(ing.name) + ' with… →</a></div>'
                     : '<div style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap">'
                       + '<button type="button" class="mini-btn solid" onclick="hubPrUseUnit(\'' + s + '\')">Use ' + escH(unitRow(s) ? unitRow(s).many : s) + '</button>'
                       + '<button type="button" class="mini-btn" onclick="hubPrChangeEverywhere()">Change ' + escH(ing.name) + ' to ' + escH(KIND_WORD[row.kind]) + ' everywhere…</button></div>');

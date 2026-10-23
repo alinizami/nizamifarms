@@ -5,6 +5,7 @@ namespace App\Services\Khaas;
 use App\Models\FIN\VendorProductModel;
 use App\Models\Khaas\IngredientModel;
 use App\Models\Khaas\RecipeLineModel;
+use App\Models\Khaas\RecipeModel;
 use App\Services\FIN\VendorUnits;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
@@ -41,10 +42,13 @@ class IngredientUnitChangeService
 
         $locked = $this->lockReasons($ingredient);
 
+        $familyMode = RecipeFamilyService::ready();
         $lines = RecipeLineModel::query()
             ->join('t_crm_khaas_recipe as r', 'r.id', '=', 't_crm_khaas_recipe_line.recipe_id')
             ->leftJoin('t_crm_prod_product as p', 'p.id', '=', 'r.product_id')
             ->where('t_crm_khaas_recipe_line.ingredient_id', $ingredient->id)
+            // 🍱 Oct-19: a pack's family SNAPSHOT is retyped with its family line below, never asked twice
+            ->when($familyMode, fn ($q) => $q->whereNull('r.family_recipe_id'))
             ->orderBy('p.title')->orderBy('r.version')
             ->get([
                 't_crm_khaas_recipe_line.id', 't_crm_khaas_recipe_line.qty_per_basis',
@@ -60,6 +64,29 @@ class IngredientUnitChangeService
                 'qty'          => (float) $l->qty_per_basis,
                 'unit'         => $from,
             ])->values()->all();
+
+        // 🍱 every version of every FAMILY recipe that uses it — id "f<line id>"
+        if ($familyMode) {
+            $fam = DB::table('t_crm_khaas_family_recipe_line as l')
+                ->join('t_crm_khaas_family_recipe as r', 'r.id', '=', 'l.family_recipe_id')
+                ->join('t_crm_khaas_recipe_family as f', 'f.id', '=', 'r.family_id')
+                ->where('l.ingredient_id', $ingredient->id)
+                ->orderBy('f.name')->orderBy('r.version')
+                ->get(['l.id', 'l.qty_per_basis', 'r.id as family_recipe_id', 'r.version', 'r.is_current', 'r.basis_pieces', 'f.name']);
+            foreach ($fam as $l) {
+                $lines[] = [
+                    'id'           => 'f' . $l->id,
+                    'recipe_id'    => 'f' . $l->family_recipe_id,
+                    'product_name' => $l->name . ' family',
+                    'version'      => (int) $l->version,
+                    'is_current'   => (bool) $l->is_current,
+                    'basis_packets' => (int) $l->basis_pieces,
+                    'basis_word'   => 'pieces',
+                    'qty'          => (float) $l->qty_per_basis,
+                    'unit'         => $from,
+                ];
+            }
+        }
 
         $products = VendorProductModel::query()
             ->leftJoin('t_fin_vendors as v', 'v.id', '=', 't_fin_vendor_products.vendor_id')
@@ -94,6 +121,17 @@ class IngredientUnitChangeService
             'recipe_lines'   => $lines,
             'products'       => $products,
         ];
+    }
+
+    /**
+     * The one sentence every "unit cannot change" refusal ends with — the way out that works.
+     * ⚠ Shared by this service, RecipeService::saveIngredient and the product form's mismatch.
+     */
+    public static function replaceAdvice(string $name, ?string $toBase = null): string
+    {
+        $kind = $toBase ? VendorUnits::kindWord($toBase) : 'the right unit';
+        return "Instead, REPLACE it: Frozen → Ingredient stock → {$name} → \"Replace with…\" a new {$name} counted in "
+            . "{$kind}. Its recipes and vendor products move in one step and its history is kept.";
     }
 
     /**
@@ -150,8 +188,11 @@ class IngredientUnitChangeService
                 throw new \InvalidArgumentException("{$ingredient->name} is already counted in " . VendorUnits::kindWord($toBase) . '.');
             }
             if (!$impact['can_change']) {
+                // ⚠ Oct-18: this used to say "Add a new product instead" — and a new product in the
+                //   other unit is then REFUSED by the one-unit rule (Qasim's Cooking Oil loop). The
+                //   door that works is Replace.
                 throw new \InvalidArgumentException("{$ingredient->name} cannot change its unit: "
-                    . implode('; ', $impact['locked_reasons']) . '. Add a new product instead.');
+                    . implode('; ', $impact['locked_reasons']) . '. ' . self::replaceAdvice($ingredient->name, $toBase));
             }
 
             // Every recipe line needs its new amount — nothing is converted by guessing.
@@ -173,7 +214,24 @@ class IngredientUnitChangeService
             }
 
             foreach ($impact['recipe_lines'] as $l) {
-                RecipeLineModel::whereKey($l['id'])->update(['qty_per_basis' => round((float) $recipeQty[$l['id']], 3)]);
+                $new = round((float) $recipeQty[$l['id']], 3);
+                if (is_string($l['id']) && str_starts_with($l['id'], 'f')) {
+                    // 🍱 a FAMILY line: retype it, then every size's snapshot of that version —
+                    //    snapshot qty = family qty × family_scale, exactly as the engine wrote it
+                    $fl = \App\Models\Khaas\FamilyRecipeLineModel::find((int) substr($l['id'], 1));
+                    if (!$fl) {
+                        continue;
+                    }
+                    $fl->qty_per_basis = $new;
+                    $fl->save();
+                    $snaps = RecipeModel::where('family_recipe_id', $fl->family_recipe_id)->get(['id', 'family_scale']);
+                    foreach ($snaps as $s) {
+                        RecipeLineModel::where('recipe_id', $s->id)->where('ingredient_id', $fl->ingredient_id)
+                            ->update(['qty_per_basis' => round($new * max(1, (int) $s->family_scale), 3)]);
+                    }
+                    continue;
+                }
+                RecipeLineModel::whereKey($l['id'])->update(['qty_per_basis' => $new]);
             }
             foreach ($impact['products'] as $p) {
                 $set = ['pack_qty_base' => $p['needs_size']

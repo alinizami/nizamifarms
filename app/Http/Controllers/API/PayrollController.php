@@ -265,10 +265,25 @@ class PayrollController extends Controller
         }
         try {
             $svc = new \App\Services\HR\LeavePolicyService();
+            // ⭐ Oct-20 2026 — the absence decisions too (parked / excused / deducted, who, when,
+            // and what has paid them off), newest first. Same rows the web Employee tab draws.
+            // Additive keys: an older APK simply ignores them.
+            $abs = new \App\Services\HR\AbsenceDecisionService();
+            $absHist = [];
+            $absOwed = 0.0;
+            if ($abs->enabled()) {
+                $keep = ['month', 'days_absent', 'decision', 'decided_by_name', 'decided_at', 'covered_ot',
+                         'covered_leave', 'days_cut', 'amount_cut_later', 'cut_in_month', 'cut_paid_at',
+                         'days_excused', 'outstanding', 'notes'];
+                $absHist = array_map(fn ($r) => array_intersect_key($r, array_flip($keep)), $abs->historyFor($targetId));
+                $absOwed = $abs->outstandingDays($targetId);
+            }
             return response()->json([
                 'success' => true,
                 'balance' => $svc->balance($targetId),
                 'adjustments' => $svc->adjustments($targetId),
+                'absence_history' => $absHist,
+                'absence_owed' => $absOwed,
             ]);
         } catch (\Throwable $e) {
             \Log::error('Mobile leaveHistory failed', ['user_id' => $targetId, 'error' => $e->getMessage()]);

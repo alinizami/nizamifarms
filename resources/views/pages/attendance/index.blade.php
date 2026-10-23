@@ -2172,6 +2172,19 @@ function renderMonthBody(data) {
         style="background:none;border:none;cursor:pointer;font-weight:700;color:${color};text-decoration:underline;text-decoration-style:dotted;text-underline-offset:2px;font-size:13px;">${n}</button>
     </td>`;
   };
+  // Absent (yr) + what was DECIDED about those days (Oct-20 2026): "13 parked · owed ›" opens
+  // the month-by-month decisions (who, when, what has paid them off). Silent when nothing
+  // was ever decided, so every other employee's cell is unchanged.
+  const yearAbsentCell = (u, uid, nm) => {
+    const ad = u.absence_decisions;
+    const cell = numCell(u.absent_days_year, '#B91C1C', uid, nm, 'year_absent');
+    if (!ad || !(ad.months || []).length) return cell;
+    const owed = Number(ad.owed) || 0;
+    const txt = owed > 0 ? `${owed} parked · owed ›` : 'decisions ›';
+    const line = `<button type="button" onclick="event.stopPropagation(); showAbsenceDecisions(${uid})" title="Who parked / excused / deducted these absences, when, and what has paid them off since"
+      style="display:block;margin:2px auto 0;background:none;border:none;padding:0;cursor:pointer;font-size:9.5px;font-weight:700;color:${owed > 0 ? '#B45309' : '#6B7280'};text-decoration:underline;text-decoration-style:dotted;">${txt}</button>`;
+    return cell.replace(/<\/td>\s*$/, line + '</td>');
+  };
   // W3 — a count that opens the FULL month detail popup pre-filtered to that category
   // (all context: orders, meters, times) instead of a bare date list.
   const filterCell = (val, color, uid, nm, filter) => {
@@ -2254,7 +2267,7 @@ function renderMonthBody(data) {
       ${meterTd}
       ${offTd}
       ${leaveBalCell(u, uid, nm)}
-      ${numCell(u.absent_days_year, '#B91C1C', uid, nm, 'year_absent')}
+      ${yearAbsentCell(u, uid, nm)}
     </tr>`;
   }).join('');
 }
@@ -2678,6 +2691,7 @@ const BREAKDOWN_META = {
   month_leave:  { title: 'Leave days',        sub: 'this month',      color: '#2563EB', icon: '🏖' },
   year_leave:   { title: 'Leave days',        sub: 'this year cycle', color: '#7C3AED', icon: '🏖' },
   year_absent:  { title: 'Absent days',       sub: 'this year cycle', color: '#B91C1C', icon: '❌' },
+  leave_grants: { title: 'Leave adjustments', sub: 'this year cycle · overtime earned, covers, manual', color: '#6D28D9', icon: '🗓' },
   month_overtime: { title: 'Overtime days',   sub: 'this month',      color: '#047857', icon: '⏱' },
   month_late:     { title: 'Late days',       sub: 'this month',      color: '#B45309', icon: '⏰' },
   month_office_checkout: { title: 'Office checkouts', sub: 'delivered but came back to the office', color: '#92400E', icon: '🏢' },
@@ -2746,6 +2760,57 @@ function bdReviewLine(m) {
   else { txt = '✎ adjusted'; }
   return `<div style="font-size:10.5px;font-weight:700;color:#047857;margin-top:2px;">` +
     `${txt}${who ? ` · ${esc2(who)}` : ''}${r.reason ? ` · “${esc2(r.reason)}”` : ''}</div>`;
+}
+
+// ⭐ Oct-20 2026 — the absence decisions behind Absent (yr), month by month, read-only (they are
+// made and settled on the Payroll page). Rows come with the Month grid's own data, so this opens
+// instantly and shows exactly the same numbers Payroll uses.
+function showAbsenceDecisions(userId) {
+  const u = (monthData || []).find(x => Number(x.user_id) === Number(userId));
+  const ad = u && u.absence_decisions;
+  if (!ad) return;
+  const esc2 = (v) => String(v === null || v === undefined ? '' : v).replace(/&/g, '&amp;').replace(/</g, '&lt;');
+  const n = (v) => Number(v) || 0;
+  const dd = (v) => { const x = Math.round(n(v) * 10) / 10; return `${x} day${x === 1 ? '' : 's'}`; };
+  const monthTxt = (ym) => { try { const [y, m] = String(ym).split('-').map(Number); return new Date(y, m - 1, 1).toLocaleDateString('en-GB', { month: 'long', year: 'numeric' }); } catch (e) { return ym; } };
+  const dateTxt = (s) => { try { return new Date(String(s).slice(0, 10) + 'T00:00:00').toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' }); } catch (e) { return s; } };
+  const rs = (v) => 'Rs ' + Math.round(n(v)).toLocaleString('en-US');
+  const name = String(u.fullname || '');
+  const owed = n(ad.owed);
+  document.getElementById('bdTitle').textContent = `❌ Absence decisions — ${name}`;
+  document.getElementById('bdSub').textContent = owed > 0
+    ? `${dd(owed)} still owed · overtime bonus days pay these off automatically, oldest month first`
+    : 'nothing owed now';
+  const rows = [...(ad.months || [])].reverse().map(h => {
+    const word = h.decision === 'park' ? 'parked' : h.decision === 'excuse' ? 'excused' : 'deducted';
+    const color = h.decision === 'park' ? '#B45309' : h.decision === 'excuse' ? '#047857' : '#B91C1C';
+    const who = [h.decided_by_name ? 'by ' + esc2(h.decided_by_name) : '', h.decided_at ? dateTxt(h.decided_at) : ''].filter(Boolean).join(' · ');
+    const bits = [];
+    if (n(h.covered_ot) > 0) bits.push(`${dd(h.covered_ot)} paid off by overtime`);
+    if (n(h.covered_leave) > 0) bits.push(`${dd(h.covered_leave)} taken from his leave`);
+    if (n(h.days_cut) > 0) bits.push(`${dd(h.days_cut)} charged ${rs(h.amount_cut_later)}${h.cut_in_month ? ' in ' + monthTxt(h.cut_in_month) + ' pay' : ''}${h.cut_in_month && !h.cut_paid_at ? ' (not paid yet)' : ''}`);
+    if (n(h.days_excused) > 0) bits.push(`${dd(h.days_excused)} excused later`);
+    const owedLine = h.decision === 'park'
+      ? (n(h.outstanding) > 0 ? `<b style="color:#B45309;">${dd(h.outstanding)} still owed</b>` : '<span style="color:#047857;">fully settled</span>')
+      : '';
+    return `<div style="display:flex;align-items:flex-start;justify-content:space-between;gap:10px;padding:9px 4px;border-bottom:1px solid #F3F4F6;">
+      <div style="min-width:0;">
+        <div style="font-size:13px;color:#111827;font-weight:600;">${monthTxt(h.month)} · ${dd(h.days_absent)} absent</div>
+        ${who ? `<div style="font-size:11px;color:#6B7280;margin-top:2px;">${who}</div>` : ''}
+        ${bits.length ? `<div style="font-size:11px;color:#374151;margin-top:2px;">${bits.join(' · ')}</div>` : ''}
+        ${owedLine ? `<div style="font-size:11px;margin-top:2px;">${owedLine}</div>` : ''}
+        ${h.notes ? `<div style="font-size:11px;color:#6B7280;margin-top:2px;">“${esc2(h.notes)}”</div>` : ''}
+      </div>
+      <span style="font-size:11px;color:${color};background:${color}14;border-radius:5px;padding:1px 7px;font-weight:700;white-space:nowrap;">${word}</span>
+    </div>`;
+  }).join('');
+  const nmEsc = name.replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/"/g, '&quot;');
+  const foot = `<div style="font-size:11px;color:#6B7280;margin-top:10px;line-height:1.5;">
+      Months not listed were never decided — Pay deducts them. Decide or settle on the Payroll page.
+      <button type="button" onclick="showDateBreakdown(${Number(userId)}, '${nmEsc}', 'leave_grants')" style="background:none;border:none;padding:0;cursor:pointer;color:#6D28D9;font-weight:700;text-decoration:underline;text-decoration-style:dotted;font-size:11px;">See leave history (overtime earned, covers) ›</button>
+    </div>`;
+  document.getElementById('bdBody').innerHTML = rows + foot;
+  document.getElementById('dateBreakdownModal').style.display = 'flex';
 }
 
 async function showDateBreakdown(userId, name, type) {

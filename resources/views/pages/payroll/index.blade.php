@@ -2625,6 +2625,27 @@
       + '</span><span class="lv">' + value + '</span></div>';
   }
 
+  // One month of the absence history (AbsenceDecisionService::historyFor row): the decision,
+  // who/when, then everything that has settled it since and what is still owed.
+  function absHistLine(h) {
+    const n = v => Number(v || 0);
+    const dd = v => { const x = Math.round(n(v) * 10) / 10; return x + ' day' + (x === 1 ? '' : 's'); };
+    const word = h.decision === 'park' ? 'Parked' : h.decision === 'excuse' ? 'Excused' : 'Deducted';
+    const who = [h.decided_by_name ? 'by ' + esc(h.decided_by_name) : '', h.decided_at || ''].filter(Boolean).join(' · ');
+    const bits = [];
+    if (h.decision === 'cut' && n(h.amount_cut_now) > 0) bits.push('cut ' + fmt(h.amount_cut_now) + ' in that month');
+    if (n(h.covered_ot) > 0) bits.push(dd(h.covered_ot) + ' paid off by overtime');
+    if (n(h.covered_leave) > 0) bits.push(dd(h.covered_leave) + ' taken from his leave');
+    if (n(h.days_cut) > 0) bits.push(dd(h.days_cut) + ' charged ' + fmt(h.amount_cut_later)
+      + (h.cut_in_month ? ' in ' + esc(monthName(h.cut_in_month)) + ' pay' : '')
+      + (h.cut_in_month && !h.cut_paid_at ? ' (not paid yet)' : ''));
+    if (n(h.days_excused) > 0) bits.push(dd(h.days_excused) + ' excused later');
+    if (h.decision === 'park') bits.push(n(h.outstanding) > 0 ? '<b>' + dd(h.outstanding) + ' still owed</b>' : 'fully settled');
+    return empLine(esc(monthName(h.month)) + ': ' + dd(h.days_absent) + ' absent',
+      '<span style="color:' + (h.decision === 'park' ? '#b45309' : h.decision === 'excuse' ? '#047857' : '#b91c1c') + ';">' + word + '</span>',
+      { why: [who, bits.join(' · '), h.notes ? '“' + esc(h.notes) + '”' : ''].filter(Boolean).join('<br>') });
+  }
+
   // Header shared by both modes.
   function empHeader(u, subtitle) {
     const initials = (u.fullname || '?').split(/\s+/).map(w => w[0]).slice(0, 2).join('').toUpperCase();
@@ -2838,7 +2859,8 @@
     // What happened to this month's absences, and anything still owed from earlier ones.
     let absc = '';
     const owed = Number(r.absence_outstanding || 0);
-    if (Number(r.absent_days || 0) > 0 || owed > 0 || Number(r.held_absence_deduction || 0) > 0) {
+    const absHist = EMP.absence_history || [];
+    if (Number(r.absent_days || 0) > 0 || owed > 0 || Number(r.held_absence_deduction || 0) > 0 || absHist.length) {
       absc = '<div class="pr-emp-card"><h4>Absences</h4>';
       if (Number(r.absent_days || 0) > 0) {
         const dec = r.absence_decision;
@@ -2862,6 +2884,14 @@
              + '<button class="pr-btn-ghost" data-abssettle="use_leave">Use his leave</button>'
              + '<button class="pr-btn-ghost" data-abssettle="excuse">Excuse it</button>'
              + '</div>';
+      }
+      // ⭐ Oct-20 2026 — every month's decision and what has happened to it since, so the
+      // "still owed" total can be traced: who parked it, when, and how much overtime (or his
+      // own leave, a charge, an excuse) has paid it down. The server always sent this
+      // (`absence_history`); nothing drew it.
+      if (absHist.length) {
+        absc += '<div class="pr-emp-why" style="margin-top:12px;font-weight:700;color:#374151;">History</div>'
+             + absHist.map(absHistLine).join('');
       }
       absc += '</div>';
     }

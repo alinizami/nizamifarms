@@ -3,6 +3,7 @@
 namespace App\Services\Khaas;
 
 use App\Models\FIN\VendorProductModel;
+use App\Models\Khaas\FamilyRecipeModel;
 use App\Models\Khaas\IngredientModel;
 use App\Models\Khaas\RecipeModel;
 use App\Services\FIN\VendorUnits;
@@ -35,11 +36,24 @@ class IngredientReplaceService
         $toBase = $to ? $to->base_unit : ($toBase ?: $from->base_unit);
         $refusals = $this->refusals($from, $to);
 
+        // ⭐ Oct-18 (owner): grams ↔ millilitres is the Cooking Oil case — oil and water weigh
+        //   about 1 g per ml, so the old amounts are a sound STARTING value. They are offered
+        //   as suggestions, never applied: the person still sees and confirms every box.
+        $gramsMl = ($from->base_unit === 'g' && $toBase === 'ml') || ($from->base_unit === 'ml' && $toBase === 'g');
+
         $recipes = [];
+        $familyMode = RecipeFamilyService::ready();
         foreach ($this->currentRecipesUsing($from) as $r) {
+            // 🍱 Oct-19: a pack's family SNAPSHOT is not a recipe to re-version on its own — its
+            //    family is listed once below, and every size follows when the family is saved.
+            if ($familyMode && !empty($r->family_recipe_id)) {
+                continue;
+            }
             $line = $r->lines->firstWhere('ingredient_id', $from->id);
             $hasTo = $to ? $r->lines->contains('ingredient_id', $to->id) : false;
+            $needsQty = $from->base_unit !== $toBase;
             $recipes[] = [
+                'suggested_qty' => ($needsQty && $gramsMl) ? (float) $line->qty_per_basis : null,
                 'recipe_id'     => (int) $r->id,
                 'product_id'    => (int) $r->product_id,
                 'product_name'  => $r->product->title ?? ('Product #' . $r->product_id),
@@ -58,12 +72,50 @@ class IngredientReplaceService
             }
         }
 
+        // 🍱 Oct-19: current FAMILY recipes that use it — one entry per family, keyed "f<id>"
+        if ($familyMode) {
+            $fvs = FamilyRecipeModel::with(['lines', 'family'])->where('is_current', 1)
+                ->whereHas('lines', fn ($q) => $q->where('ingredient_id', $from->id))->get();
+            foreach ($fvs as $fv) {
+                $line  = $fv->lines->firstWhere('ingredient_id', $from->id);
+                $hasTo = $to ? $fv->lines->contains('ingredient_id', $to->id) : false;
+                $needsQty = $from->base_unit !== $toBase;
+                $name = ($fv->family->name ?? 'A family') . ' family';
+                $recipes[] = [
+                    'suggested_qty'   => ($needsQty && $gramsMl) ? (float) $line->qty_per_basis : null,
+                    'recipe_id'       => 'f' . $fv->id,
+                    'family_id'       => (int) $fv->family_id,
+                    'product_id'      => null,
+                    'product_name'    => $name,
+                    'version'         => (int) $fv->version,
+                    'basis_packets'   => (int) $fv->basis_pieces,
+                    'basis_word'      => 'pieces',
+                    'old_qty'         => (float) $line->qty_per_basis,
+                    'old_text'        => $from->phrase((float) $line->qty_per_basis),
+                    'new_qty'         => $from->base_unit === $toBase ? (float) $line->qty_per_basis : null,
+                    'needs_qty'       => $needsQty,
+                    'already_has_new' => $hasTo,
+                ];
+                if ($hasTo) {
+                    $refusals[] = "The {$name} recipe already has {$to->name} — remove one of the two lines in that recipe first.";
+                }
+            }
+        }
+
         $products = [];
         foreach ($this->productsTagged($from) as $p) {
             $factor = VendorUnits::factorTo($p->unit, $toBase);
             $keep   = $from->base_unit === $toBase && (float) $p->pack_qty_base > 0 ? (float) $p->pack_qty_base : null;
             $size   = $factor ?: $keep;
+            // A kg product moving to ml: 1000 ml per kg at 1 g/ml; a pack sized in grams: the same
+            // number in ml. Suggested only, for the grams ↔ ml case.
+            $suggestSize = null;
+            if (!$size && $gramsMl) {
+                $suggestSize = VendorUnits::factorTo($p->unit, $from->base_unit)
+                    ?: ((float) $p->pack_qty_base > 0 ? (float) $p->pack_qty_base : null);
+            }
             $products[] = [
+                'suggested_size' => $suggestSize,
                 'id'           => (int) $p->id,
                 'vendor_name'  => $p->vendor_name,
                 'product_name' => $p->product_name,
@@ -83,6 +135,9 @@ class IngredientReplaceService
             'recipes'   => $recipes,
             'products'  => $products,
             'from_was_tracked' => $tracked,
+            'suggestion_note'  => $gramsMl
+                ? 'Oil and water weigh about 1 g per ml, so the old amounts are filled in — check each one before replacing.'
+                : null,
             'can_replace' => empty($refusals),
             'refusals'  => array_values(array_unique($refusals)),
         ];
@@ -93,12 +148,21 @@ class IngredientReplaceService
      * @param array<int,float> $productSizes vendor_product_id => size in the NEW base unit (where asked)
      * @throws \InvalidArgumentException with a message meant for a person
      */
-    public function apply(IngredientModel $from, IngredientModel $to, array $recipeQty, array $productSizes, int $userId): array
+    public function apply(IngredientModel $from, IngredientModel $to, array $recipeQty, array $productSizes, int $userId,
+                          array $deactivate = []): array
     {
         $impact = $this->impact($from, $to);
         if (!$impact['can_replace']) {
             throw new \InvalidArgumentException(implode(' ', $impact['refusals']));
         }
+        // ⏸ Oct-18 (owner): "add a new product and switch this one off". An old product of the
+        //    WRONG kind (a kg oil against a new ml ingredient) can be switched off here instead of
+        //    being re-sized. Only ids from this impact's product list count; it keeps its old tag,
+        //    so its bills still read as they were written. Never deleted — it has history.
+        $deactivate = array_values(array_intersect(
+            array_map('intval', $deactivate),
+            array_map(fn ($p) => (int) $p['id'], $impact['products'])
+        ));
 
         foreach ($impact['recipes'] as $r) {
             $q = $r['needs_qty'] ? (float) ($recipeQty[$r['recipe_id']] ?? 0) : (float) $r['new_qty'];
@@ -110,6 +174,9 @@ class IngredientReplaceService
             }
         }
         foreach ($impact['products'] as $p) {
+            if (in_array((int) $p['id'], $deactivate, true)) {
+                continue; // switched off: no size to ask for
+            }
             if ($p['needs_size'] && !((float) ($productSizes[$p['id']] ?? 0) > 0)) {
                 throw new \InvalidArgumentException("How many {$impact['to_base_word']} of {$to->name} are in one {$p['unit']} of {$p['product_name']}?");
             }
@@ -117,11 +184,42 @@ class IngredientReplaceService
 
         $recipes = app(RecipeService::class);
 
-        return DB::transaction(function () use ($from, $to, $impact, $recipeQty, $productSizes, $userId, $recipes) {
+        return DB::transaction(function () use ($from, $to, $impact, $recipeQty, $productSizes, $userId, $recipes, $deactivate) {
             $versions = 0;
             foreach ($impact['recipes'] as $r) {
-                $recipe = RecipeModel::with('lines')->find($r['recipe_id']);
                 $q = $r['needs_qty'] ? (float) $recipeQty[$r['recipe_id']] : (float) $r['new_qty'];
+
+                // 🍱 a FAMILY recipe: one new family version with the line swapped — every size's
+                //    snapshot follows inside RecipeFamilyService (the one engine)
+                if (is_string($r['recipe_id']) && str_starts_with($r['recipe_id'], 'f')) {
+                    $fv = FamilyRecipeModel::with('lines')->find((int) substr($r['recipe_id'], 1));
+                    $typed = [];
+                    foreach ($fv->lines->sortBy('sort_order') as $l) {
+                        $isOld = (int) $l->ingredient_id === (int) $from->id;
+                        $ing   = $isOld ? $to : IngredientModel::find($l->ingredient_id);
+                        if (!$ing) {
+                            continue;
+                        }
+                        $typed[] = [
+                            'ingredient_id' => (int) $ing->id,
+                            'qty'           => $isOld ? $q : (float) $l->qty_per_basis,
+                            'unit'          => $ing->base_unit,
+                            'is_optional'   => (bool) $l->is_optional,
+                        ];
+                    }
+                    (new RecipeFamilyService())->saveFamilyRecipe(
+                        (int) $fv->family_id,
+                        (int) $fv->basis_pieces,
+                        $recipes->cleanLines($typed),
+                        now()->toDateString(),
+                        mb_substr("{$from->name} replaced with {$to->name}", 0, 255),
+                        $userId
+                    );
+                    $versions++;
+                    continue;
+                }
+
+                $recipe = RecipeModel::with('lines')->find($r['recipe_id']);
                 $lines = [];
                 foreach ($recipe->lines->sortBy('sort_order') as $l) {
                     $isOld = (int) $l->ingredient_id === (int) $from->id;
@@ -148,7 +246,13 @@ class IngredientReplaceService
             }
 
             $moved = 0;
+            $off   = 0;
             foreach ($impact['products'] as $p) {
+                if (in_array((int) $p['id'], $deactivate, true)) {
+                    VendorProductModel::where('id', $p['id'])->update(['is_active' => 0]);
+                    $off++;
+                    continue;
+                }
                 $size = $p['needs_size'] ? (float) $productSizes[$p['id']] : (float) $p['new_pack_qty_base'];
                 VendorProductModel::where('id', $p['id'])->update([
                     'ingredient_id' => $to->id,
@@ -167,13 +271,16 @@ class IngredientReplaceService
             if ($moved) {
                 $parts[] = $moved . ' vendor product' . ($moved === 1 ? '' : 's') . ' now count towards it';
             }
+            if ($off) {
+                $parts[] = $off . ' old product' . ($off === 1 ? '' : 's') . ' switched off (bills kept)';
+            }
             $parts[] = "{$from->name} is hidden (its history is kept)";
             $message = implode('; ', $parts) . '.';
             if ($impact['from_was_tracked']) {
                 $message .= " Enter a starting stock for {$to->name} on the Ingredient stock sheet.";
             }
 
-            return ['recipes' => $versions, 'products' => $moved, 'message' => $message];
+            return ['recipes' => $versions, 'products' => $moved, 'switched_off' => $off, 'message' => $message];
         });
     }
 

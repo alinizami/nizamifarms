@@ -2429,6 +2429,9 @@ class ProductController extends Controller
             // variant price to the bundle total; throws a ValidationException.
             $bundlePlan = $this->bundlePlan($validated, null);
 
+            // 🍱 Recipe family block — checked BEFORE anything is saved.
+            $familyAnswer = $this->readRecipeFamily($request, (int) ($request->business_unit_id ?? 1), !empty($validated['is_bundle']));
+
             // Format data to match API structure
             $productData = $this->formatManualProductData($validated);
 
@@ -2454,17 +2457,22 @@ class ProductController extends Controller
             $product->business_unit_id = $request->business_unit_id ?? 1;
             $product->save();
 
+            // 🍱 …and applied through the one engine once the product exists.
+            $family = $this->applyRecipeFamily($product, $familyAnswer);
+            $createdMsg = 'Product created successfully.' . ($family ? ' ' . $family['message'] : '');
+
             // Return JSON for API requests
             if ($request->expectsJson() || $request->header('X-Requested-With') === 'XMLHttpRequest') {
                 return response()->json([
                     'success' => true,
-                    'message' => 'Product created successfully.',
-                    'product' => $product
+                    'message' => $createdMsg,
+                    'product' => $product->fresh(),
+                    'recipe_family' => $family,
                 ]);
             }
 
             return redirect()->route('products.index')
-                ->with('success', 'Product created successfully.');
+                ->with('success', $createdMsg);
 
         } catch (\Illuminate\Validation\ValidationException $e) {
             if ($request->expectsJson() || $request->header('X-Requested-With') === 'XMLHttpRequest') {
@@ -2641,6 +2649,15 @@ class ProductController extends Controller
             // keeps its price pinned to the bundle total).
             $bundlePlan = $this->bundlePlan($validated, $product);
 
+            // 🍱 Recipe family block — checked BEFORE anything is saved; absent keys = keep.
+            $familyAnswer = $this->readRecipeFamily(
+                $request,
+                (int) ($request->business_unit_id ?? $product->business_unit_id ?? 1),
+                $request->has('is_bundle')
+                    ? (bool) $request->boolean('is_bundle')
+                    : (\App\Services\CRM\ProductBundle::supported() && \App\Services\CRM\ProductBundle::isBundleProductId((int) $product->id))
+            );
+
             // Format data to match API structure
             $productData = $this->formatManualProductData($validated);
 
@@ -2676,18 +2693,23 @@ class ProductController extends Controller
                 $updatedProduct->save();
             }
 
+            // 🍱 …and applied through the one engine.
+            $family = $this->applyRecipeFamily($updatedProduct, $familyAnswer);
+            $updatedMsg = 'Product updated successfully.' . ($family ? ' ' . $family['message'] : '');
+
             // Return JSON for API requests
             if ($request->expectsJson() || $request->header('X-Requested-With') === 'XMLHttpRequest') {
                 return response()->json([
                     'success' => true,
-                    'message' => 'Product updated successfully.',
-                    'product' => $updatedProduct
+                    'message' => $updatedMsg,
+                    'product' => $updatedProduct->fresh(),
+                    'recipe_family' => $family,
                 ]);
             }
 
             // Stay on the edit page after saving, showing success message
             return redirect()->route('products.edit', $id)
-                ->with('success', 'Product updated successfully.');
+                ->with('success', $updatedMsg);
 
         } catch (\Illuminate\Validation\ValidationException $e) {
             if ($request->expectsJson() || $request->header('X-Requested-With') === 'XMLHttpRequest') {
@@ -2709,6 +2731,41 @@ class ProductController extends Controller
             }
             return back()->withInput()
                 ->with('error', 'Failed to update product. Please try again.');
+        }
+    }
+
+    /**
+     * 🍱 Oct-19: the product forms' "Recipe family" block (web create/edit, phone create/edit).
+     * Read and CHECKED before the product is saved — a bad answer is a 422, never a half-saved
+     * product. Absent keys = keep: older forms and APKs never send them.
+     */
+    private function readRecipeFamily(Request $request, int $businessUnitId, bool $isBundle): ?array
+    {
+        try {
+            return (new \App\Services\Khaas\RecipeFamilyService())->readAssignment($request->all(), $businessUnitId, $isBundle);
+        } catch (\InvalidArgumentException $e) {
+            throw \Illuminate\Validation\ValidationException::withMessages(['recipe_family_id' => $e->getMessage()]);
+        }
+    }
+
+    /** Apply the checked answer through RecipeFamilyService — the ONE engine. Never undoes the product save. */
+    private function applyRecipeFamily(ProductModel $product, ?array $answer): ?array
+    {
+        if (!$answer) {
+            return null;
+        }
+        // "no family" on a product that never had one, with nothing else to change: nothing to say
+        if ($answer['leave'] && !$product->recipe_family_id
+            && ($answer['pieces'] === null || (int) $answer['pieces'] === (int) $product->pieces_per_pack)) {
+            return null;
+        }
+        try {
+            return (new \App\Services\Khaas\RecipeFamilyService())->assign(
+                (int) $product->id, $answer['family_id'], $answer['pieces'], auth()->id(), $answer['new_name']
+            );
+        } catch (\Throwable $e) {
+            Log::warning('Product saved but its recipe family was not set', ['product_id' => $product->id, 'error' => $e->getMessage()]);
+            return ['failed' => true, 'message' => 'Its recipe family was NOT set: ' . $e->getMessage()];
         }
     }
 

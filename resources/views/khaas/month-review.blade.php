@@ -282,6 +282,17 @@
             @foreach($split['warnings'] as $w)
                 <div class="mr-split-warn">⚠ {{ $w }}</div>
             @endforeach
+            {{-- ↻ Oct-20 (owner could not find it): the Re-apply button lived only inside the collapsed
+                 "Ingredients · bought, used and left" card. Offer it right here, where the uncosted packs are
+                 named — it presses the SAME button (one handler, one confirm, one engine). --}}
+            @if($canManageRecipes && !empty($split['warnings']))
+                <button type="button" class="mr-reapply" style="margin-top:8px;"
+                        onclick="var b = document.getElementById('mrReapplyBtn'); if (b) { b.click(); }">
+                    ↻ Re-apply recipes for this month
+                </button>
+                <span class="mr-split-hint">Re-counts every pack made this month against the recipe in force on its day —
+                    use it after a recipe was written or corrected late.</span>
+            @endif
         </div>
     @endif
 
@@ -664,6 +675,9 @@
                             @endif
                             @if($p['adjustments_counts'] != 0)
                                 <span class="mr-chip">{{ $p['adjustments_counts'] > 0 ? '+' : '' }}{{ $p['adjustments_counts'] }} counted</span>
+                            @endif
+                            @if(($p['adjustments_repacked'] ?? 0) != 0)
+                                <span class="mr-chip mr-chip-grey" title="Packs opened and packed again as another size of the same family">🔁 {{ $p['adjustments_repacked'] > 0 ? '+' : '' }}{{ $p['adjustments_repacked'] }} repacked</span>
                             @endif
                         </td>
                         <td>{{ number_format($p['selling_price']) }}</td>

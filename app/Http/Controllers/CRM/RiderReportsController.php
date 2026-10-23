@@ -48,7 +48,7 @@ class RiderReportsController extends Controller
                 return response()->json([
                     'success' => true, 'date' => $date, 'realtime' => true,
                     'out_of_window' => true, 'window_days' => $window,
-                    'config' => $this->cfgPublic(), 'riders' => [],
+                    'config' => $this->cfgPublic(), 'riders' => [], 'team_issues' => [],
                 ]);
             }
 
@@ -71,6 +71,11 @@ class RiderReportsController extends Controller
                 'window_days' => $window,
                 'config'      => $this->cfgPublic(),
                 'riders'      => array_values($riders),
+                // 🔴⏳ Oct-2026 — "Taimur was tagged 5 times · 2 took over 1 h to open". A
+                // SEPARATE list, not person rows: both Daily Issues screens drop every
+                // non-rider row (filter is_rider), which would hide Taimur. Old APKs ignore
+                // the unknown key. Own fault-isolation: an error here returns [].
+                'team_issues' => app(\App\Services\WhatsApp\MentionFollowupService::class)->dailyIssues($date),
             ]);
         } catch (\Throwable $e) {
             \Log::error('RiderReports index failed', ['error' => $e->getMessage()]);

@@ -291,6 +291,14 @@
                             <span class="text-xs text-gray-500">SKU: {{ $firstVariant->sku ?? 'N/A' }}</span>
                             <span class="text-xs font-medium text-amber-700">PKR {{ number_format($price) }}</span>
                         </div>
+                        {{-- 🍱 Oct-19: which preparation this pack is — its recipe is the family's --}}
+                        @php $famCov = $recipeCoverage[$product->id] ?? null; @endphp
+                        @if(!empty($famCov['family_name']))
+                            <div class="mt-1">
+                                <span class="text-[10px] font-semibold px-2 py-0.5 rounded-full" style="background:#D1FAE5;color:#065F46;"
+                                      title="This pack uses the {{ $famCov['family_name'] }} family recipe">🍱 {{ $famCov['family_name'] }} · {{ $famCov['pieces_per_pack'] }} pcs</span>
+                            </div>
+                        @endif
                     </div>
                     <span class="px-2 py-0.5 rounded text-[10px] font-bold uppercase
                         {{ $product->status === 'active' ? 'bg-green-100 text-green-700' : '' }}
@@ -375,6 +383,14 @@
                         @if($rp['flagged_prices'] > 0)
                             <div class="text-[10px] mt-0.5" style="color:#B45309;">⚠ {{ $rp['flagged_prices'] }} old or jumped price(s) — see the recipe</div>
                         @endif
+                        {{-- 📖 Oct-18 (owner): a card WITH a recipe had no way to it — only "Write one"
+                             on cards without. Opens the Recipes tab with this product pre-selected. --}}
+                        <div class="mt-1 text-right">
+                            <a href="{{ route('khaas.inventory', ['tab' => 'ingredients', 'product' => $product->id]) }}"
+                               class="text-[10px] font-bold px-2 py-0.5 rounded inline-block"
+                               style="background-color:#DCFCE7;color:#166534;border:1px solid #BBF7D0;"
+                               data-testid="recipe-open-{{ $product->id }}">📖 {{ $canManageRecipes ? 'View / edit recipe' : 'View recipe' }}{{ !empty($famCov['family_name']) ? ' (' . $famCov['family_name'] . ' family)' : '' }} →</a>
+                        </div>
                     </div>
                 @endif
                 @if($cov && !$cov['has_recipe'])
@@ -398,6 +414,12 @@
                             {{ number_format($rc['made_plan']) }} through a plan ·
                             {{ number_format($rc['made_direct']) }} entered directly
                         </div>
+                        {{-- 🍱 Oct-20: "made" is every pack (as Month Review); say which ones the estimate cannot see --}}
+                        @if(($rc['made_no_recipe'] ?? 0) > 0)
+                            <div class="text-[10px] mt-0.5" style="color:#B45309;" data-testid="made-no-recipe-{{ $product->id }}">
+                                ⚠ {{ number_format($rc['made_no_recipe']) }} made before {{ ($rc['costed'] ?? 0) > 0 ? 'its recipe' : 'any recipe' }} — not in the estimate
+                            </div>
+                        @endif
                         @if($canSeeIngredientCost && $rc['cost_per_pack'] !== null)
                             <div class="flex items-center justify-between mt-1 pt-1" style="border-top:1px solid #C7D2FE;">
                                 <span class="text-[11px]" style="color:#4338CA;">Ingredients, estimated</span>
@@ -483,6 +505,14 @@
                     onmouseover="this.style.backgroundColor='#bfdbfe'" onmouseout="this.style.backgroundColor='{{ $openRequest ? '#dbeafe' : '#eff6ff' }}'">
                     📨 {{ $openRequest ? 'Change request (' . $requestedQty . ')' : 'Request from warehouse' }}
                 </button>
+                {{-- 🔁 Oct-19: open warehouse packs of this size and pack them as another size of its family --}}
+                @if(!empty($famCov['family_name']) && $warehouseQty > 0)
+                    <button type="button" onclick="openRepackModal({{ $product->id }})" data-testid="repack-open-{{ $product->id }}"
+                        class="w-full mt-2 px-2 py-1.5 border text-xs font-medium rounded-lg text-center"
+                        style="background-color:#ECFDF5;color:#065F46;border-color:#A7F3D0;">
+                        🔁 Repack into another size
+                    </button>
+                @endif
             </div>
         </div>
         @empty
@@ -1858,5 +1888,88 @@ document.addEventListener('keydown', function(e) {
         closePendingOrdersModal();
     }
 });
+</script>
+<script>
+// 🔁 Oct-19 — REPACK: open warehouse packs of one size, pack them as another size of the SAME family.
+//    Pieces are conserved (RepackService on the server is the one engine; the phone calls the same).
+(function () {
+    var OPTS = @json(route('khaas.repack.options'));
+    var DO   = @json(route('khaas.repack'));
+    function esc(s) { return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) { return {"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c]; }); }
+    function csrf() { var m = document.querySelector("meta[name=\"csrf-token\"]"); return m ? m.getAttribute("content") : ""; }
+    function close() { var el = document.getElementById("repackOverlay"); if (el) { el.remove(); } document.body.style.overflow = ""; }
+
+    window.openRepackModal = function (productId) {
+        close();
+        fetch(OPTS + "?product_id=" + productId, {headers: {"Accept": "application/json", "X-Requested-With": "XMLHttpRequest"}, credentials: "same-origin"})
+            .then(function (r) { return r.json(); })
+            .then(function (d) {
+                if (!d.success) { alert(d.message || "Could not load the sizes."); return; }
+                if (!d.can_repack) { alert(d.reason || "This pack cannot be repacked."); return; }
+                render(d);
+            })
+            .catch(function () { alert("Could not reach the server."); });
+    };
+
+    function render(d) {
+        var from = d.from, to = d.to;
+        var ov = document.createElement("div");
+        ov.id = "repackOverlay";
+        ov.style.cssText = "position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:9999;display:flex;align-items:center;justify-content:center;padding:16px;";
+        ov.innerHTML =
+            "<div style=\"background:#fff;border-radius:14px;max-width:440px;width:100%;padding:18px;\">" +
+              "<div style=\"font-weight:700;color:#065F46;font-size:15px;\">🔁 Repack into another size</div>" +
+              "<div style=\"font-size:12px;color:#6B7280;margin-top:2px;\">" + esc(from.title) + " — " + from.warehouse + " in the warehouse</div>" +
+              "<label style=\"display:block;font-size:12px;margin-top:12px;\">Packs of " + esc(from.label) + " to open</label>" +
+              "<input id=\"rpFrom\" type=\"number\" min=\"1\" max=\"" + from.warehouse + "\" step=\"1\" class=\"form-control\" style=\"width:120px;\">" +
+              "<label style=\"display:block;font-size:12px;margin-top:10px;\">Pack them as</label>" +
+              "<select id=\"rpTo\" class=\"form-select\">" + to.map(function (t) { return "<option value=\"" + t.product_id + "\" data-p=\"" + t.pieces_per_pack + "\">" + esc(t.title) + "</option>"; }).join("") + "</select>" +
+              "<div id=\"rpPlan\" style=\"font-size:13px;margin-top:10px;color:#065F46;\"></div>" +
+              "<label style=\"display:block;font-size:12px;margin-top:8px;\">Note (optional)</label>" +
+              "<input id=\"rpNote\" type=\"text\" maxlength=\"255\" class=\"form-control\" placeholder=\"e.g. customer wanted 8s\">" +
+              "<div style=\"display:flex;gap:8px;justify-content:flex-end;margin-top:14px;\">" +
+                "<button type=\"button\" id=\"rpCancel\" style=\"padding:7px 14px;border:1px solid #D1D5DB;border-radius:8px;background:#fff;\">Cancel</button>" +
+                "<button type=\"button\" id=\"rpGo\" style=\"padding:7px 14px;border-radius:8px;background:#047857;color:#fff;font-weight:600;\">Repack</button>" +
+              "</div>" +
+            "</div>";
+        document.body.appendChild(ov);
+        document.body.style.overflow = "hidden";
+        var fromIn = document.getElementById("rpFrom"), toSel = document.getElementById("rpTo"), plan = document.getElementById("rpPlan");
+        var state = {toPacks: 0, loose: 0};
+        function update() {
+            var n = parseInt(fromIn.value, 10) || 0;
+            var pt = Number(toSel.options[toSel.selectedIndex].getAttribute("data-p"));
+            var pieces = n * from.pieces_per_pack;
+            state.toPacks = Math.floor(pieces / pt);
+            state.loose = pieces - state.toPacks * pt;
+            plan.innerHTML = n < 1 ? "Type how many packs to open." :
+                (n > from.warehouse ? "<span style=\"color:#B91C1C;\">Only " + from.warehouse + " in the warehouse.</span>" :
+                 (state.toPacks < 1 ? "<span style=\"color:#B91C1C;\">" + pieces + " pieces do not make one pack of " + pt + ".</span>" :
+                  n + " × " + from.pieces_per_pack + " = <b>" + pieces + " pieces</b> → <b>" + state.toPacks + " pack" + (state.toPacks === 1 ? "" : "s") + " of " + pt + "</b>" +
+                  (state.loose ? " + <b style=\"color:#B45309;\">" + state.loose + " loose</b> (left over, not stocked)" : " — exact")));
+        }
+        fromIn.oninput = update; toSel.onchange = update; update();
+        document.getElementById("rpCancel").onclick = close;
+        ov.addEventListener("click", function (e) { if (e.target === ov) { close(); } });
+        document.getElementById("rpGo").onclick = function () {
+            var n = parseInt(fromIn.value, 10) || 0;
+            if (n < 1 || n > from.warehouse || state.toPacks < 1) { update(); return; }
+            var to = toSel.options[toSel.selectedIndex].text;
+            if (!window.confirm("Open " + n + " × " + from.title + " and pack " + state.toPacks + " × " + to + (state.loose ? " (" + state.loose + " loose left over)" : "") + "?")) { return; }
+            var btn = this; btn.disabled = true;
+            fetch(DO, {method: "POST", credentials: "same-origin",
+                headers: {"Accept": "application/json", "Content-Type": "application/json", "X-Requested-With": "XMLHttpRequest", "X-CSRF-TOKEN": csrf()},
+                body: JSON.stringify({from_product_id: from.product_id, from_packs: n, to_product_id: Number(toSel.value), to_packs: state.toPacks,
+                                      loose_pieces: state.loose, notes: document.getElementById("rpNote").value})})
+                .then(function (r) { return r.json(); })
+                .then(function (r) {
+                    btn.disabled = false;
+                    alert(r.message || (r.success ? "Repacked." : "Not repacked."));
+                    if (r.success) { close(); window.location.reload(); }
+                })
+                .catch(function () { btn.disabled = false; alert("Could not reach the server. Nothing was changed."); });
+        };
+    }
+})();
 </script>
 @endpush

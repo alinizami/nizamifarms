@@ -24,7 +24,8 @@ class OrderLineItemModel extends BaseModel
         'name',
         'vendor',
         'quantity',
-        'quantity_source',            // 'manual' | 'barcode' (weighed) | 'box_scan' (counted box confirmed)
+        'original_quantity',          // first quantity before any post-order change (NULL = never changed) — see supportsOriginalQuantity()
+        'quantity_source',           // 'manual' | 'barcode' (weighed) | 'box_scan' (counted box confirmed)
         'quantity_updated_by',
         'quantity_updated_at',
         'quantity_scanned_barcode',
@@ -56,6 +57,7 @@ class OrderLineItemModel extends BaseModel
 
     protected $casts = [
         'quantity' => 'decimal:3',
+        'original_quantity' => 'decimal:3',
         'unit_price' => 'decimal:2',
         'line_subtotal' => 'decimal:2',
         'discount_amount' => 'decimal:2',
@@ -63,6 +65,44 @@ class OrderLineItemModel extends BaseModel
         'line_total' => 'decimal:2',
         'quantity_updated_at' => 'datetime'
     ];
+
+    /**
+     * Does t_crm_prod_order_line_item have `original_quantity` yet? (Oct-19-2026,
+     * database/migrations/line_item_original_quantity_oct2026.sql.)
+     *
+     * Every writer and every explicit column list checks this first, so web files
+     * uploaded before the SQL simply record and show nothing instead of failing an
+     * INSERT / SELECT on a column that is not there. Memoised per request.
+     */
+    public static function supportsOriginalQuantity(): bool
+    {
+        static $supported = null;
+        if ($supported === null) {
+            try {
+                $supported = \Illuminate\Support\Facades\Schema::hasColumn('t_crm_prod_order_line_item', 'original_quantity');
+            } catch (\Throwable $e) {
+                $supported = false;
+            }
+        }
+        return $supported;
+    }
+
+    /**
+     * The quantity to keep as "originally ordered" when a line's quantity moves
+     * from $oldQuantity to $newQuantity. The one already kept always wins — it is
+     * written ONCE and never overwritten; otherwise the old quantity, but only
+     * when the number really moves. NULL = nothing to keep.
+     */
+    public static function originalToKeep($alreadyKept, float $oldQuantity, float $newQuantity): ?float
+    {
+        if ($alreadyKept !== null && $alreadyKept !== '') {
+            return (float) $alreadyKept;
+        }
+        if (abs($oldQuantity - $newQuantity) < 0.0005 || $oldQuantity <= 0) {
+            return null;
+        }
+        return round($oldQuantity, 3);
+    }
 
     // Relationships
     public function order(): BelongsTo

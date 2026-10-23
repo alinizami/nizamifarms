@@ -2,6 +2,7 @@
   "version": "0.0.1",
   "configurations": [
     { "name": "nf-web", "runtimeExecutable": "php", "runtimeArgs": ["artisan", "serve", "--port=8000"], "port": 8000 },
-    { "name": "nizamifarms-web", "runtimeExecutable": "php", "runtimeArgs": ["artisan", "serve", "--port=8931"], "port": 8931 }
+    { "name": "nizamifarms-web", "runtimeExecutable": "php", "runtimeArgs": ["artisan", "serve", "--port=8931"], "port": 8931 },
+    { "name": "nf-web-safe", "runtimeExecutable": "cmd", "runtimeArgs": ["/c", "set PAYMENT_SIGNALS_ENABLED=false&& set WHATSAPP_ACCESS_TOKEN=local-disabled&& set FIREBASE_CREDENTIALS_PATH=no-such-file-local.json&& php artisan serve --port=8932"], "port": 8932 }
   ]
 }

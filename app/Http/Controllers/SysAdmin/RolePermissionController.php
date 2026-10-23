@@ -31,7 +31,11 @@ class RolePermissionController extends Controller
             // Sep-2026 — returning a DELIVERED order. Not a view permission: it
             // decides where the customer's money goes and writes stock off.
             'return_orders' => 'Return a Delivered Order (money + stock)',
-            
+            // Oct-2026 — move items that can't go today into a new <number>-A invoice
+            // (OrderSplitService). ⚠ Must ALSO have a checkbox on permissions.blade.php,
+            // or every Save of the role page writes it back as not-allowed.
+            'split_orders' => 'Split an Invoice (move items to a new -A order)',
+
             // Invoices & Quantities
             'view_invoices' => 'View Invoices',
             'view_all_invoices' => 'View All Invoices (vs own orders)',

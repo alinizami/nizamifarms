@@ -632,14 +632,31 @@ class VendorProductController extends Controller
 
         $user = auth()->user();
 
+        // ⚠ Oct-18: when the ingredient's unit is LOCKED by history, "change it everywhere" is
+        //   refused and "add a new product" loops back here (Qasim's Cooking Oil). Say the door
+        //   that works — Replace — in the sentence old APKs show, and hand new ones the ids.
+        $locked = $impact && !$impact['can_change'];
+        $tail = '.';
+        if ($unitKind && $locked) {
+            $tail = '. ' . \App\Services\Khaas\IngredientUnitChangeService::replaceAdvice($ingredient->name, $unitKind);
+        } elseif ($unitKind) {
+            $tail = ", or change {$ingredient->name} to " . VendorUnits::kindWord($unitKind) . ' everywhere.';
+        }
+
         return [
             'success'        => false,
             'code'           => 'unit_mismatch',
             'message'        => "{$ingredient->name} is counted in " . strtoupper(VendorUnits::kindWord($base))
                 . ($inRecipes ? ' in your recipes' : '') . ', but this product is set to ' . VendorUnits::word($unit)
                 . '. Choose ' . VendorUnits::word($suggested) . ' (or pack / box with the number of '
-                . VendorUnits::baseWord($base) . ' in one)'
-                . ($unitKind ? ", or change {$ingredient->name} to " . VendorUnits::kindWord($unitKind) . ' everywhere.' : '.'),
+                . VendorUnits::baseWord($base) . ' in one)' . $tail,
+            // 🔁 The Replace door, for a client that can open it in place.
+            'replace'        => ($unitKind && $locked) ? [
+                'ingredient_id' => (int) $ingredient->id,
+                'name'          => $ingredient->name,
+                'to_base'       => $unitKind,
+                'can_manage'    => $user ? $user->hasMobilePermission('manage_khaas_recipes') : false,
+            ] : null,
             'ingredient'     => [
                 'id'        => (int) $ingredient->id,
                 'name'      => $ingredient->name,

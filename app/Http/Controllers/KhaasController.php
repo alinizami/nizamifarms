@@ -342,8 +342,9 @@ class KhaasController extends Controller
         try {
             $month = now()->format('Y-m');
             $costing = new \App\Services\Khaas\FrozenCostingService();
-            foreach ($costing->productMonth((int) $khaasBU->id, $month)['rows'] as $row) {
-                $recipeCosts[(int) $row['product_id']] = $row;
+            // 🍱 Oct-20: every pack made (as Month Review) + how many had no recipe — same method as the phone
+            foreach ($costing->cardMonth((int) $khaasBU->id, $month) as $pid => $row) {
+                $recipeCosts[(int) $pid] = $row;
             }
             foreach ((new \App\Services\Khaas\RecipeService())->coverage((int) $khaasBU->id) as $row) {
                 $recipeCoverage[(int) $row['product_id']] = $row;
@@ -2394,12 +2395,28 @@ class KhaasController extends Controller
             ->limit(20)
             ->get();
 
+        // 🍱 Oct-19: a plan line in a family is called by its family (same rule as the phone's lists)
+        $planName = function ($items) {
+            try {
+                $names = (new \App\Services\Khaas\RecipeFamilyService())->planNames($items->pluck('khaas_product_id')->all());
+                foreach ($items as $row) {
+                    $row->sku_name = $row->product_name;
+                    $n = $names[(int) $row->khaas_product_id] ?? null;
+                    if ($n && $n['family_id']) {
+                        $row->product_name = $n['name'];
+                    }
+                }
+            } catch (\Throwable $e) {
+                // the title stays
+            }
+            return $items;
+        };
         foreach ($demands as $demand) {
-            $demand->items = DB::table('t_crm_khaas_production_demand_item as di')
+            $demand->items = $planName(DB::table('t_crm_khaas_production_demand_item as di')
                 ->leftJoin('t_crm_prod_product as kp', 'kp.id', '=', 'di.khaas_product_id')
                 ->where('di.demand_id', $demand->id)
                 ->select('di.*', 'kp.title as product_name')
-                ->get();
+                ->get());
             $demand->created_by_name = $demand->created_by
                 ? DB::table('t_sys_user')->where('id', $demand->created_by)->value('fullname')
                 : null;
@@ -2414,11 +2431,11 @@ class KhaasController extends Controller
             ->get();
 
         foreach ($demandHistory as $demand) {
-            $demand->items = DB::table('t_crm_khaas_production_demand_item as di')
+            $demand->items = $planName(DB::table('t_crm_khaas_production_demand_item as di')
                 ->leftJoin('t_crm_prod_product as kp', 'kp.id', '=', 'di.khaas_product_id')
                 ->where('di.demand_id', $demand->id)
                 ->select('di.*', 'kp.title as product_name')
-                ->get();
+                ->get());
             $demand->created_by_name = $demand->created_by
                 ? DB::table('t_sys_user')->where('id', $demand->created_by)->value('fullname')
                 : null;

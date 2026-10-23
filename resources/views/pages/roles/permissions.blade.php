@@ -178,6 +178,10 @@
                 'create_orders' => ['Create Orders', 'Create new orders (gates the create button on the Orders page)'],
                 'view_shopify_orders' => ['Shopify Approval Queue', 'See orders from the Shopify approval queue'],
                 'view_open_quantities' => ['Open Order Quantities', 'Access the Open Order Quantities dashboard'],
+                'split_orders' => ['Split an Invoice', 'Move items that cannot go today out of an open invoice into a new invoice (NF-12345-A). Web + phone.'],
+                // ⚠ Oct-2026: this key is in RolePermissionController's list but had no
+                // checkbox, so every Save of this page wrote it back as not-allowed.
+                'return_orders' => ['Return a Delivered Order', 'Take a delivered order back: decides whether the money is reversed, refunded or credited, and writes stock off. Normally Shabib and Taimur only.'],
             ] as $key => $cfg)
             <label class="nfp-row">
                 <div class="meta">

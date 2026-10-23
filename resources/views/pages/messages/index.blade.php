@@ -1489,6 +1489,10 @@ select.wa-mgr-input { background: #fff; cursor: pointer; }
              which is exactly how the Aug-2 pin went unnoticed until after the
              order had shipped. Filled by renderPinPendingBar(). --}}
         <div id="waPinPendingBar" style="display:none;"></div>
+        {{-- Oct-2026 — tag follow-up: shown ONLY to the person who tagged someone on the
+             tag-alert list (Taimur) on this chat — "⏳ Taimur hasn't opened this · 25 min"
+             with I'll call him / Wait 10 min / Stop reminders. Filled by renderTagWaitBar(). --}}
+        <div id="waTagWaitBar" style="display:none;"></div>
         <div class="wa-chat-msgs" id="waChatMessages">
             <div class="wa-loading">Loading messages...</div>
         </div>
@@ -3415,6 +3419,61 @@ select.wa-mgr-input { background: #fff; cursor: pointer; }
         host.style.display = 'block';
     }
 
+    // Oct-2026 — "⏳ Taimur hasn't opened this" strip for the person who TAGGED on this chat.
+    // The server sends conversation.followup only to that person (null for everyone else) and
+    // refreshes it on every chat poll, so the minutes tick and the strip turns green the
+    // moment Taimur opens the chat. Buttons POST to the same engine the phone uses.
+    let waTagWaitNote = '', waTagWaitNoteConv = null; // the confirmation belongs to ONE chat
+    function renderTagWaitBar() {
+        const host = document.getElementById('waTagWaitBar');
+        if (!host) return;
+        const f = activeConv && activeConv.followup;
+        if (!f) { host.style.display = 'none'; host.innerHTML = ''; return; }
+        const who = esc(f.on_user || 'They');
+        let bg = '#FFFBEB', border = '#FCD34D', color = '#92400E', text = '', buttons = '';
+        if (f.state === 'watching') {
+            text = '⏳ ' + who + " hasn't opened this · " + f.minutes + ' min'
+                 + ' <span style="font-weight:500;color:#B45309;">· reminder ' + f.remind_count + ' of ' + f.max_reminders
+                 + (f.next_at ? ' · next ' + esc(f.next_at) : '') + '</span>';
+            const b = (act, label) => '<button type="button" onclick="waTagFollowupAct(' + f.id + ',\'' + act + '\')" '
+                + 'style="font-size:11.5px;font-weight:700;padding:3px 9px;border-radius:6px;border:1px solid #F59E0B;background:#fff;color:#92400E;cursor:pointer;">' + label + '</button>';
+            buttons = b('called', "📞 I'll call him") + b('wait10', '⏰ Wait 10 min') + b('stop', '🔕 Stop reminders');
+        } else if (f.state === 'muted') {
+            bg = '#F3F4F6'; border = '#D1D5DB'; color = '#374151';
+            text = '🔕 Reminders stopped · ' + who + " hasn't opened this yet (" + f.minutes + ' min)';
+        } else if (f.state === 'gave_up') {
+            bg = '#FEF2F2'; border = '#FCA5A5'; color = '#991B1B';
+            text = who + " didn't open this in 2 hours — no more reminders; it's in Daily Issues.";
+        } else if (f.state === 'opened') {
+            bg = '#ECFDF5'; border = '#6EE7B7'; color = '#065F46';
+            text = '✓ ' + who + ' opened it' + (f.opened_at ? ' at ' + esc(f.opened_at) : '') + ' (after ' + f.minutes + ' min)';
+        } else if (f.state === 'acknowledged') {
+            bg = '#ECFDF5'; border = '#6EE7B7'; color = '#065F46';
+            text = '👍 ' + who + ' is on it' + (f.acknowledged_at ? ' (' + esc(f.acknowledged_at) + ')' : '');
+        } else {
+            host.style.display = 'none'; host.innerHTML = ''; return;
+        }
+        host.innerHTML = '<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:7px 12px;background:' + bg + ';border-bottom:1px solid ' + border + ';">'
+            + '<span style="font-size:12px;font-weight:700;color:' + color + ';">' + text + '</span>'
+            + (buttons ? '<span style="margin-left:auto;display:inline-flex;gap:6px;flex-wrap:wrap;">' + buttons + '</span>' : '')
+            + (waTagWaitNote && waTagWaitNoteConv === activeConvId ? '<span style="flex-basis:100%;font-size:11.5px;color:' + color + ';">' + esc(waTagWaitNote) + '</span>' : '')
+            + '</div>';
+        host.style.display = 'block';
+    }
+    window.waTagFollowupAct = function(id, action) {
+        const convId = activeConvId;
+        apiFetch('/messages/mention-followups/' + id + '/action', {method: 'POST', body: JSON.stringify({action: action})})
+            .then(r => {
+                if (activeConvId !== convId) return;
+                waTagWaitNoteConv = convId;
+                waTagWaitNote = (r && r.message) ? r.message : 'Could not save that — try again.';
+                if (r && 'followup' in r && activeConv) activeConv.followup = r.followup;
+                renderTagWaitBar();
+                setTimeout(() => { waTagWaitNote = ''; if (activeConvId === convId) renderTagWaitBar(); }, 5000);
+            })
+            .catch(() => { waTagWaitNoteConv = convId; waTagWaitNote = 'Could not save that — try again.'; renderTagWaitBar(); });
+    };
+
     function renderMessages(msgs, hasMore, preserveHistoryMode) {
         const el = document.getElementById('waChatMessages');
         // May-2026 — Cache the just-rendered list so loadOlderMessages()
@@ -3465,6 +3524,7 @@ select.wa-mgr-input { background: #fff; cursor: pointer; }
         // consumed once, so two pins minutes apart keep their own outcome.
         const usedPinVerdicts = new Set();
         renderPinPendingBar();
+        renderTagWaitBar();
 
         msgs.forEach((m, idx) => {
             if (m.created_at) {
@@ -5989,7 +6049,14 @@ select.wa-mgr-input { background: #fff; cursor: pointer; }
             // 0 or >1 matches: leave the user looking at the filtered list.
         }).catch(() => { /* deep-link is best-effort, never block normal load */ });
     }
-    // Phase 2 — keep the @me pip in sync with the server's mention count.
+    // Oct-2026 — /messages?open=<conversation id> opens that chat directly (Daily Issues
+    // links its "tags not answered" lines here). The chat endpoint does its own access
+    // check, so a link to a chat the viewer cannot see simply opens nothing.
+    try {
+        const openId = new URLSearchParams(window.location.search).get('open');
+        if (openId && /^\d+$/.test(openId)) openConv(parseInt(openId, 10));
+    } catch (e) { /* best-effort, never block normal load */ }
+    // Phase 2 — keep the at-me pip in sync with the server's mention count.
     refreshMentionsPip();
     setInterval(refreshMentionsPip, 30000);
 })();

@@ -813,8 +813,9 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::put('/orders/{orderId}/line-items/{lineItemId}/instructions', [\App\Http\Controllers\API\RiderController::class, 'updateLineItemInstructions']);
     // Barcode-qty: set an open order's line-item quantity from a scanned weight barcode.
     Route::put('/orders/{orderId}/line-items/{lineItemId}/quantity', [\App\Http\Controllers\API\RiderController::class, 'updateLineItemQuantity']);
-    // 📦 Box scan: confirm a COUNTED product (frozen box) by its label. Changes no
-    // quantity — see RiderController::confirmLineItemBoxScan.
+    // 📦 Box scan: confirm a COUNTED product (frozen box) by its label. Oct-19-2026: an
+    // optional `quantity` (boxes the packer confirmed) moves the count like a weight scan;
+    // without it nothing but the stamp changes — see RiderController::confirmLineItemBoxScan.
     Route::post('/orders/{orderId}/line-items/{lineItemId}/box-scan', [\App\Http\Controllers\API\RiderController::class, 'confirmLineItemBoxScan']);
     // Barcode-qty: set MANY line-item quantities in one atomic request (manual "Save all").
     Route::put('/orders/{orderId}/line-items/quantities', [\App\Http\Controllers\API\RiderController::class, 'updateLineItemQuantitiesBatch']);
@@ -822,6 +823,10 @@ Route::middleware('auth:sanctum')->group(function () {
     // (same control as the web Edit Invoice "Make Free" button). Gated by
     // create_orders, not the scan permission — see the controller docblock.
     Route::put('/orders/{orderId}/line-items/{lineItemId}/free', [\App\Http\Controllers\API\RiderController::class, 'updateLineItemFree']);
+    // ✂ SPLIT INVOICE (Oct-2026) — the SAME controller the web orders page uses
+    // (routes/web.php orders.split.*). One engine: OrderSplitService.
+    Route::get('/orders/{id}/split/preview', [\App\Http\Controllers\CRM\OrderSplitController::class, 'preview']);
+    Route::post('/orders/{id}/split', [\App\Http\Controllers\CRM\OrderSplitController::class, 'store']);
     // Line-item quick-note presets (chips next to the "Add note" box).
     // Shared team-wide list; same controller backs the web routes in
     // routes/web.php so there is one source of truth.
@@ -1102,6 +1107,10 @@ Route::middleware('auth:sanctum')->group(function () {
         Route::get('/batch/active', [\App\Http\Controllers\CRM\WarehouseController::class, 'getActiveBatches']);
         Route::post('/batch/start', [\App\Http\Controllers\CRM\WarehouseController::class, 'startBatch']);
         Route::post('/batch/{id}/end', [\App\Http\Controllers\CRM\WarehouseController::class, 'endBatch']);
+        // 🍱 Oct-19: the sizes a batch may be packed into · 🔁 repack between sizes of one family
+        Route::get('/batch/{id}/sizes', [\App\Http\Controllers\CRM\WarehouseController::class, 'batchSizes']);
+        Route::get('/repack/options', [\App\Http\Controllers\CRM\WarehouseController::class, 'repackOptions']);
+        Route::post('/repack', [\App\Http\Controllers\CRM\WarehouseController::class, 'repack']);
         Route::post('/batch/{id}/cancel', [\App\Http\Controllers\CRM\WarehouseController::class, 'cancelBatch']);
         Route::get('/batch/product/{productId}/history', [\App\Http\Controllers\CRM\WarehouseController::class, 'getBatchHistory']);
         
@@ -1170,6 +1179,14 @@ Route::middleware('auth:sanctum')->group(function () {
         Route::get('/product-cost', [\App\Http\Controllers\Khaas\RecipeController::class, 'productCost']);
         Route::get('/product-costs', [\App\Http\Controllers\Khaas\RecipeController::class, 'productCosts']);
         Route::post('/consumption/reapply', [\App\Http\Controllers\Khaas\RecipeController::class, 'reapply']);
+        // 🍱 Oct-19: recipe FAMILIES — the same controller methods as the web /khaas/recipe-famil*
+        Route::get('/recipe-families', [\App\Http\Controllers\Khaas\RecipeController::class, 'recipeFamilies']);
+        Route::get('/recipe-family', [\App\Http\Controllers\Khaas\RecipeController::class, 'recipeFamily']);
+        Route::post('/recipe-family', [\App\Http\Controllers\Khaas\RecipeController::class, 'saveRecipeFamily']);
+        Route::post('/recipe-family/recipe', [\App\Http\Controllers\Khaas\RecipeController::class, 'saveFamilyRecipe']);
+        Route::post('/recipe-family/assign', [\App\Http\Controllers\Khaas\RecipeController::class, 'assignRecipeFamily']);
+        Route::get('/recipe-family/suggest', [\App\Http\Controllers\Khaas\RecipeController::class, 'suggestRecipeFamily']);
+        Route::post('/recipe-family/setup', [\App\Http\Controllers\Khaas\RecipeController::class, 'setupRecipeFamily']);
 
         Route::get('/khaas-badges', [\App\Http\Controllers\CRM\WarehouseController::class, 'getKhaasBadges']);
 
@@ -1287,6 +1304,9 @@ Route::middleware('auth:sanctum')->group(function () {
         Route::delete('/labels/{id}', [WhatsAppController::class, 'deleteLabel']);
         Route::post('/conversations/{id}/labels', [WhatsAppController::class, 'applyLabel']);
         Route::delete('/conversations/{id}/labels/{labelId}', [WhatsAppController::class, 'removeLabel']);
+        // 🔴⏳ Oct-2026 — tag follow-up buttons (wait10 | called | stop | on_it). Web twin:
+        // routes/web.php messages.mentionFollowupAction. One engine: MentionFollowupService.
+        Route::post('/mention-followups/{id}/action', [WhatsAppController::class, 'mentionFollowupAction'])->where('id', '[0-9]+');
         // Labels — Phase 2 (user mentions)
         Route::get('/label-users',     [WhatsAppController::class, 'getLabelUsers']);
         Route::get('/mentions-count',  [WhatsAppController::class, 'getMentionsCount']);

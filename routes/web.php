@@ -507,6 +507,10 @@ Route::middleware(['auth'])->group(function () {
     Route::get('/orders/returns/{returnId}/detail', [\App\Http\Controllers\CRM\OrderReturnController::class, 'detail'])->name('orders.returns.detail');
     Route::get('/orders/{id}/return/preview', [\App\Http\Controllers\CRM\OrderReturnController::class, 'preview'])->name('orders.return.preview');
     Route::post('/orders/{id}/return', [\App\Http\Controllers\CRM\OrderReturnController::class, 'store'])->name('orders.return.store');
+    // ✂ SPLIT INVOICE (Oct-2026) — move items into a new <number>-A order. The SAME
+    // controller is routed in routes/api.php for the phone; OrderSplitService decides.
+    Route::get('/orders/{id}/split/preview', [\App\Http\Controllers\CRM\OrderSplitController::class, 'preview'])->name('orders.split.preview');
+    Route::post('/orders/{id}/split', [\App\Http\Controllers\CRM\OrderSplitController::class, 'store'])->name('orders.split.store');
     // Receipt printout field config (operations "More" menu). Static paths before /orders/{id}.
     // ⚠ The path deliberately avoids the words "config"/"settings": the host's StackProtect bot
     // filter challenges /settings-shaped URLs BEFORE they reach Laravel (verified Aug-2026 — see
@@ -986,6 +990,9 @@ Route::middleware(['auth'])->group(function () {
         Route::delete('/labels/{id}', [\App\Http\Controllers\Web\WhatsAppWebController::class, 'deleteLabel'])->name('messages.deleteLabel');
         Route::post('/conversations/{id}/labels', [\App\Http\Controllers\Web\WhatsAppWebController::class, 'applyLabel'])->name('messages.applyLabel');
         Route::delete('/conversations/{id}/labels/{labelId}', [\App\Http\Controllers\Web\WhatsAppWebController::class, 'removeLabel'])->name('messages.removeLabel');
+        // 🔴⏳ Oct-2026 — tag follow-up strip buttons (wait10 | called | stop | on_it).
+        // Same engine as the phone route (MentionFollowupService).
+        Route::post('/mention-followups/{id}/action', [\App\Http\Controllers\Web\WhatsAppWebController::class, 'mentionFollowupAction'])->name('messages.mentionFollowupAction')->where('id', '[0-9]+');
         // Labels — Phase 2 (user mentions)
         Route::get('/label-users',    [\App\Http\Controllers\Web\WhatsAppWebController::class, 'getLabelUsers'])->name('messages.getLabelUsers');
         Route::get('/mentions-count', [\App\Http\Controllers\Web\WhatsAppWebController::class, 'getMentionsCount'])->name('messages.getMentionsCount');
@@ -1477,6 +1484,17 @@ Route::middleware(['auth'])->group(function () {
         Route::get('/consumption', [\App\Http\Controllers\Khaas\RecipeController::class, 'consumption'])->name('consumption');
         Route::get('/product-costs', [\App\Http\Controllers\Khaas\RecipeController::class, 'productCosts'])->name('product-costs');
         Route::post('/consumption/reapply', [\App\Http\Controllers\Khaas\RecipeController::class, 'reapply'])->name('consumption.reapply');
+        // 🍱 Oct-19: recipe FAMILIES — the same controller methods as /api/warehouse/recipe-famil*
+        Route::get('/recipe-families', [\App\Http\Controllers\Khaas\RecipeController::class, 'recipeFamilies'])->name('recipe-families');
+        Route::get('/recipe-family', [\App\Http\Controllers\Khaas\RecipeController::class, 'recipeFamily'])->name('recipe-family.show');
+        Route::post('/recipe-family', [\App\Http\Controllers\Khaas\RecipeController::class, 'saveRecipeFamily'])->name('recipe-family.save');
+        Route::post('/recipe-family/recipe', [\App\Http\Controllers\Khaas\RecipeController::class, 'saveFamilyRecipe'])->name('recipe-family.recipe');
+        Route::post('/recipe-family/assign', [\App\Http\Controllers\Khaas\RecipeController::class, 'assignRecipeFamily'])->name('recipe-family.assign');
+        Route::get('/recipe-family/suggest', [\App\Http\Controllers\Khaas\RecipeController::class, 'suggestRecipeFamily'])->name('recipe-family.suggest');
+        Route::post('/recipe-family/setup', [\App\Http\Controllers\Khaas\RecipeController::class, 'setupRecipeFamily'])->name('recipe-family.setup');
+        // 🔁 Oct-19: repack between sizes of one family — the same methods as /api/warehouse/repack*
+        Route::get('/repack/options', [\App\Http\Controllers\CRM\WarehouseController::class, 'repackOptions'])->name('repack.options');
+        Route::post('/repack', [\App\Http\Controllers\CRM\WarehouseController::class, 'repack'])->name('repack');
     });
 
     // 📦 Storage (Supplies) — packaging bought in bulk, charged to expenses one packet

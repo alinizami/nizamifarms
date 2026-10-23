@@ -2862,6 +2862,7 @@ document.addEventListener('DOMContentLoaded', function(){
      only opens from the status pill, which is only clickable when that flag is
      true and the server re-checks the permission on both of its endpoints. --}}
 @include('pages.orders.partials.return-modal')
+@include('pages.orders.partials.split-modal')
 
 @endsection
 
@@ -3606,8 +3607,11 @@ function viewOrderDetails(orderId) {
                     // 📦 'box_scan' is a COUNTED product whose box was scanned to confirm the
                     // product — the quantity is the ordered one and NO weight was read, so this
                     // badge must never show a kg figure (the label's digits are a piece count).
-                    var qtySrcBadge = it.quantity_source === 'barcode' ? ' <span title="' + scanTitleView + '" style="display:inline-block; padding:1px 5px; background:#dcfce7; color:#15803d; border-radius:3px; font-size:9px; font-weight:700;">🔖</span>' : it.quantity_source === 'box_scan' ? ' <span title="Box scanned — quantity is as ordered" style="display:inline-block; padding:1px 5px; background:#e0f2fe; color:#0369a1; border-radius:3px; font-size:9px; font-weight:700;">📦</span>' : it.quantity_source === 'manual' ? ' <span title="Set manually" style="display:inline-block; padding:1px 5px; background:#f1f5f9; color:#64748b; border-radius:3px; font-size:9px; font-weight:700;">✏️</span>' : '';
-                    html += '<td style="padding: 8px; border-bottom: 1px solid #f3f4f6; text-align:right;">' + qty + qtySrcBadge + '</td>' +
+                    var qtySrcBadge = it.quantity_source === 'barcode' ? ' <span title="' + scanTitleView + '" style="display:inline-block; padding:1px 5px; background:#dcfce7; color:#15803d; border-radius:3px; font-size:9px; font-weight:700;">🔖</span>' : it.quantity_source === 'box_scan' ? ' <span title="' + (orderedQtyIfChanged(it) === null ? 'Box scanned — quantity is as ordered' : 'Box scanned — box count confirmed by the packer') + '" style="display:inline-block; padding:1px 5px; background:#e0f2fe; color:#0369a1; border-radius:3px; font-size:9px; font-weight:700;">📦</span>' : it.quantity_source === 'manual' ? ' <span title="Set manually" style="display:inline-block; padding:1px 5px; background:#f1f5f9; color:#64748b; border-radius:3px; font-size:9px; font-weight:700;">✏️</span>' : '';
+                    // 📋 What the customer ordered, under the quantity, once it has changed (screen only).
+                    var orderedView = orderedQtyIfChanged(it);
+                    var orderedNote = orderedView === null ? '' : '<div title="Quantity the customer ordered, before it was scanned / changed" style="font-size:10px; color:#b45309; font-weight:600; white-space:nowrap;">ordered ' + orderedView + '</div>';
+                    html += '<td style="padding: 8px; border-bottom: 1px solid #f3f4f6; text-align:right;">' + qty + qtySrcBadge + orderedNote + '</td>' +
                         '<td style="padding: 8px; border-bottom: 1px solid #f3f4f6; text-align:right;">' + (isFreeItem ? '<s style="color:#9ca3af;">' + formatCurrency(unit, order.currency) + '</s>' : formatCurrency(unit, order.currency)) + '</td>' +
                         '<td style="padding: 8px; border-bottom: 1px solid #f3f4f6; text-align:right; font-weight:600;">' + lineTotalDisplay + '</td>' +
                     '</tr>';
@@ -5919,7 +5923,8 @@ function loadEditForm(order) {
                                 </button>
                             </div>
                             ${item.quantity_source ? `<div style="grid-column: 2 / -1; margin-top: 2px; font-size: 11px; display: flex; align-items: center; gap: 5px; flex-wrap: wrap;">
-                                <span style="font-weight: 600; color: ${item.quantity_source === 'barcode' ? '#15803d' : item.quantity_source === 'box_scan' ? '#0369a1' : '#64748b'};">${item.quantity_source === 'barcode' ? '🔖 Qty set by barcode scan' : item.quantity_source === 'box_scan' ? '📦 Box scanned — qty as ordered' : '✏️ Qty set manually'}</span>
+                                <span style="font-weight: 600; color: ${item.quantity_source === 'barcode' ? '#15803d' : item.quantity_source === 'box_scan' ? '#0369a1' : '#64748b'};">${item.quantity_source === 'barcode' ? '🔖 Qty set by barcode scan' : item.quantity_source === 'box_scan' ? (orderedQtyIfChanged(item) === null ? '📦 Box scanned — qty as ordered' : '📦 Box count confirmed') : '✏️ Qty set manually'}</span>
+                                ${orderedQtyBadge(item)}
                                 ${scannedWeightBadge(item, index)}
                                 ${item.quantity_updated_at ? `<span style="color:#9ca3af;">· ${new Date(item.quantity_updated_at).toLocaleString('en-GB',{day:'2-digit',month:'short',year:'numeric',hour:'2-digit',minute:'2-digit'})}</span>` : ''}
                                 ${(item.qty_updater && item.qty_updater.fullname) ? `<span style="color:#9ca3af;">· by ${item.qty_updater.fullname}</span>` : ''}
@@ -6423,6 +6428,30 @@ function scannedWeightBadge(item, index) {
     if (kg === null) return '';
     return '<span style="color:#15803d; font-weight:600;">· scanned ' + kg.toFixed(3) + ' kg</span>' +
            '<span id="scanConv_' + index + '" style="color:#15803d; font-weight:600;"></span>';
+}
+
+// 📋 Oct-19-2026 — what the customer ORDERED, when the quantity has since changed
+// (a meat weight scan, a frozen box count, a typed correction). The server keeps the
+// first number in `original_quantity` and never overwrites it. Returns the plain
+// number ("3", "2.5", "2.15") or null when there is nothing worth showing — never
+// changed, older data, or changed back to exactly what was ordered.
+// ⚠ Screen-only: the printed / PDF / PNG invoice is rendered by the server and
+// never reads this.
+function orderedQtyIfChanged(item) {
+    if (!item || item.original_quantity === null || item.original_quantity === undefined || item.original_quantity === '') return null;
+    var orig = parseFloat(item.original_quantity);
+    var now = parseFloat(item.quantity);
+    if (!isFinite(orig) || orig <= 0) return null;
+    if (isFinite(now) && Math.abs(orig - now) < 0.0005) return null;
+    return String(Math.round(orig * 1000) / 1000);
+}
+
+// Inline "· ordered 3" fragment for the Edit Invoice quantity line ('' when none).
+function orderedQtyBadge(item) {
+    var o = orderedQtyIfChanged(item);
+    if (o === null) return '';
+    var unit = item.quantity_source === 'box_scan' ? (o === '1' ? ' box' : ' boxes') : '';
+    return '<span title="Quantity the customer ordered, before it was scanned / changed" style="color:#b45309; font-weight:600;">· ordered ' + o + unit + '</span>';
 }
 
 // Once weight factors have loaded (same 500ms timing as showWeightFactorFeedbackOnLoad),
@@ -12672,7 +12701,7 @@ function getCellContent(order, columnId) {
         case 'id':
             return `<div class="table-cell-id">${order.id}</div>`;
         case 'order_number':
-            return `<div class="table-cell-order-number">${order.order_number || ''}</div>${orderChannelBadge(order)}`;
+            return `<div class="table-cell-order-number">${order.order_number || ''}</div>${orderChannelBadge(order)}${window.nfSplitChipHtml ? window.nfSplitChipHtml(order) : ''}`;
         case 'order_date':
             return `<div class="table-cell-date">${formatDate(order.order_date)}</div>`;
         case 'delivery_date':
@@ -13020,6 +13049,7 @@ function getCellContent(order, columnId) {
                         <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg>
                     </button>
                     ${sendInvoiceButtonHtml(order)}
+                    ${window.nfSplitButtonHtml ? window.nfSplitButtonHtml(order) : ''}
                 </div>`;
         default:
             return '';

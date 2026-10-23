@@ -15846,7 +15846,11 @@ class RiderController extends Controller
                     $q->select('id', 'fullname');
                 }])
                 ->with(['lineItems' => function($q) {
-                    $q->select('id', 'order_id', 'product_id', 'variant_id', 'name', 'sku', 'quantity', 'unit_price', 'line_total', 'preparation_status', 'is_free', 'instructions', 'quantity_source', 'quantity_updated_at', 'quantity_updated_by')
+                    // original_quantity only once its SQL has run — selecting a missing column would empty this whole list.
+                    $q->select(array_merge(
+                        ['id', 'order_id', 'product_id', 'variant_id', 'name', 'sku', 'quantity', 'unit_price', 'line_total', 'preparation_status', 'is_free', 'instructions', 'quantity_source', 'quantity_updated_at', 'quantity_updated_by'],
+                        \App\Models\CRM\OrderLineItemModel::supportsOriginalQuantity() ? ['original_quantity'] : []
+                    ))
                       ->with(['product:id,attribute_1', 'qtyUpdater:id,fullname']); // category + barcode-qty updater
                 }])
                 ->with(['discounts']) // ⭐ Load discounts for invoice view
@@ -16068,8 +16072,12 @@ class RiderController extends Controller
                     ->toArray();
             }
 
+            // ✂ Oct-2026 — split-invoice links ("from SH-23808" / "moved to SH-23808-A"),
+            //    one batched lookup for the board. [] until the split SQL has run.
+            $splitRelMap = \App\Services\CRM\OrderSplitService::relationsFor($orderIds->all());
+
             // Format for mobile (lightweight)
-            $formattedOrders = $orders->map(function($order) use ($prepSummaries, $khaasOrderIds, $regionMap, $unreadCustomerIds, $hasWaAccess, $paymentProofMap, $dispatchActorMap, $skuCzerlop, $skuWeightFactor, $skuSellUnit, $pinPendingByCustomer, $defaultPmActorMap) {
+            $formattedOrders = $orders->map(function($order) use ($prepSummaries, $khaasOrderIds, $regionMap, $unreadCustomerIds, $hasWaAccess, $paymentProofMap, $dispatchActorMap, $skuCzerlop, $skuWeightFactor, $skuSellUnit, $pinPendingByCustomer, $defaultPmActorMap, $splitRelMap) {
                 // Build customer name
                 $customerName = $order->name ?? 'N/A';
                 if (!$order->name && ($order->address_first_name || $order->address_last_name)) {
@@ -16141,6 +16149,9 @@ class RiderController extends Controller
                 return [
                     'id' => $order->id,
                     'order_number' => $order->order_number ?? 'NF-' . str_pad($order->id, 4, '0', STR_PAD_LEFT),
+                    // ✂ Split invoice — OrderSplitService::relationsFor (null / [] when not split).
+                    'split_from' => $splitRelMap[$order->id]['split_from'] ?? null,
+                    'split_into' => $splitRelMap[$order->id]['split_into'] ?? [],
                     'order_date' => $order->order_date,
                     'order_status' => $order->order_status,
                     'total_price' => $order->total_price,
@@ -16295,6 +16306,8 @@ class RiderController extends Controller
                             'sell_unit' => ($liSku !== '' && isset($skuSellUnit[$liSku])) ? $skuSellUnit[$liSku] : 'kg',
                             'quantity' => (float) $item->quantity,
                             'quantity_source' => $item->quantity_source ?? null,
+                            // What the customer ordered, when the quantity has since changed (NULL = never changed).
+                            'original_quantity' => \App\Services\CRM\LineItemQuantityService::originalOf($item),
                             'quantity_updated_at' => $item->quantity_updated_at ? $item->quantity_updated_at->toIso8601String() : null,
                             'quantity_updated_by_name' => optional($item->qtyUpdater)->fullname,
                             'unit_price' => (float) $item->unit_price,
@@ -17400,11 +17413,16 @@ class RiderController extends Controller
                 }
             }
 
+            // ✂ Split invoice links for the phone's own invoice render (InvoiceTemplate).
+            $splitRel = \App\Services\CRM\OrderSplitService::relationsFor([$order->id])[$order->id] ?? null;
+
             return response()->json([
                 'success' => true,
                 'order' => [
                     'id' => $order->id,
                     'order_number' => $order->order_number ?? 'NF-' . str_pad($order->id, 4, '0', STR_PAD_LEFT),
+                    'split_from' => $splitRel['split_from'] ?? null,
+                    'split_into' => $splitRel['split_into'] ?? [],
                     'order_date' => $order->order_date,
                     'order_status' => $order->order_status,
                     'total_price' => $order->total_price,
@@ -17480,6 +17498,7 @@ class RiderController extends Controller
                             'sell_unit' => $sellUnit,                        // 📦 'kg' weighed | 'pcs' counted boxes
                             'quantity' => $item->quantity,
                             'quantity_source' => $item->quantity_source ?? null, // 'barcode' | 'box_scan' | 'manual' | null
+                            'original_quantity' => \App\Services\CRM\LineItemQuantityService::originalOf($item), // ordered qty when since changed, else null
                             'quantity_updated_at' => $item->quantity_updated_at ? $item->quantity_updated_at->toIso8601String() : null,
                             'quantity_updated_by_name' => optional($item->qtyUpdater)->fullname,
                             'unit_price' => $item->unit_price,
@@ -28496,6 +28515,7 @@ class RiderController extends Controller
                 'previous_source' => $previousSource,
                 'previous_scanned_barcode' => $previousScannedBarcode,
                 'new_quantity' => $result['new_quantity'] ?? null,
+                'original_quantity' => $result['original_quantity'] ?? null,
                 'by_user_id' => (int) $user->id,
                 'by' => $user->fullname ?? null,
             ]);
@@ -28506,6 +28526,12 @@ class RiderController extends Controller
 
     /**
      * 📦 Confirm ONE counted product (a frozen box / pack) by scanning its label.
+     *
+     * Oct-19-2026 (owner ruling): the phone now asks "the order has 3 boxes — how
+     * many are you packing?" (pre-filled with the ordered count) and sends that
+     * `quantity`. A different number moves the line + order total and stock like a
+     * weight scan does, and the first ordered count is kept in original_quantity.
+     * Without `quantity` (an older phone) the original rule below still holds:
      *
      * The quantity is NOT touched — it stays as ordered (owner ruling, 13-Sep-2026).
      * A boxed product's label carries no usable amount and every box of a product
@@ -28521,7 +28547,7 @@ class RiderController extends Controller
      *   - the decoded PLU must equal that product's own Czerlop PLU.
      *
      * POST /api/rider/orders/{orderId}/line-items/{lineItemId}/box-scan
-     * Body: { scanned_barcode: string }
+     * Body: { scanned_barcode: string, quantity?: int 1-999 (boxes confirmed) }
      */
     public function confirmLineItemBoxScan(Request $request, $orderId, $lineItemId)
     {
@@ -28532,6 +28558,9 @@ class RiderController extends Controller
 
         $validated = $request->validate([
             'scanned_barcode' => 'required|string|max:20',
+            // 📦 Number of boxes the packer confirmed. Whole boxes only — a box is
+            //    never split. Absent (older phone) = confirm the product only.
+            'quantity' => 'nullable|integer|min:1|max:999',
         ]);
 
         // The feature is invisible until the column exists, so an APK that lands
@@ -28595,8 +28624,17 @@ class RiderController extends Controller
         }
 
         $previousSource = $lineItem->quantity_source;
+        $previousQuantity = (float) $lineItem->quantity;
         $service = new \App\Services\CRM\LineItemQuantityService();
-        $result = $service->markBoxScanned($order, $lineItem, $decoded['raw'], $user->id);
+        // 📦 Oct-19-2026: a phone with the count box sends the number of boxes the
+        //    packer confirmed (pre-filled with the ordered count). An older phone
+        //    sends none and gets exactly the old confirm-only behaviour.
+        $boxes = array_key_exists('quantity', $validated) && $validated['quantity'] !== null
+            ? (int) $validated['quantity']
+            : null;
+        $result = $boxes !== null
+            ? $service->setBoxCount($order, $lineItem, $boxes, $decoded['raw'], $user->id)
+            : $service->markBoxScanned($order, $lineItem, $decoded['raw'], $user->id);
 
         // Same forensic value as the weighed path: the raw code, the line, and who.
         // ⭐ `scanned_units` is the label's five digits read as a count. Nothing uses
@@ -28612,7 +28650,10 @@ class RiderController extends Controller
                 'plu' => (int) $decoded['plu'],
                 'scanned_barcode' => $decoded['raw'],
                 'scanned_units' => $decoded['units'],
-                'quantity_unchanged' => (float) $lineItem->quantity,
+                'boxes_confirmed' => $boxes,                 // null = older phone, count not asked
+                'previous_quantity' => $previousQuantity,
+                'new_quantity' => (float) $lineItem->quantity,
+                'original_quantity' => $result['original_quantity'] ?? null,
                 'previous_source' => $previousSource,
                 'already_confirmed' => !empty($result['unchanged']),
                 'by_user_id' => (int) $user->id,

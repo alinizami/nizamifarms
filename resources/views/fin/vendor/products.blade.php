@@ -419,7 +419,13 @@ function renderChangePanel(prefix, c) {
     var h = '<div class="p-3 rounded-md text-sm" style="background:#EEF2FF;border:1px solid #A5B4FC;">'
         + '<div class="font-semibold" style="color:#312E81;">Change ' + esc(c.ingredient.name) + ' from ' + esc(c.from_word) + ' to ' + esc(c.to_word) + ' everywhere?</div>';
     if (!c.can_change) {
-        h += '<p class="mt-2" style="color:#991B1B;">It cannot change: ' + esc((c.locked_reasons || []).join('; ')) + '. Those numbers were written in ' + esc(BASE_WORD[c.from]) + '. Use ' + esc(SUGGESTED[c.from]) + ' for this product instead.</p>';
+        h += '<p class="mt-2" style="color:#991B1B;">It cannot change: ' + esc((c.locked_reasons || []).join('; ')) + '. Those numbers were written in ' + esc(BASE_WORD[c.from]) + '. Use ' + esc(SUGGESTED[c.from]) + ' for this product instead — or replace ' + esc(c.ingredient && c.ingredient.name ? c.ingredient.name : 'the ingredient') + ' with a new one counted in ' + esc(c.to_word || 'the right unit') + ': its recipes and products move in one step, its history is kept, and this product can then be linked.</p>';
+        // 🔁 Oct-18 (owner): the door itself, not directions to it — opens the Ingredients tab with
+        //    this ingredient selected and its Replace box open; after a successful replace it comes
+        //    BACK here with the new ingredient ready to link.
+        if (c.ingredient && c.ingredient.id) {
+            h += '<p class="mt-2"><a class="inline-block px-3 py-1.5 rounded text-xs font-semibold" style="background:#4338CA;color:#fff;" href="/khaas/inventory?tab=ingredients&replace=' + encodeURIComponent(c.ingredient.id) + '&return=' + encodeURIComponent(window.location.pathname) + '">🔁 Replace ' + esc(c.ingredient.name) + ' with… →</a></p>';
+        }
     } else if (c.can_manage === false) {
         h += '<p class="mt-2" style="color:#991B1B;">Only Taimur, Shabib or Qasim can change an ingredient\'s unit.</p>';
     } else {

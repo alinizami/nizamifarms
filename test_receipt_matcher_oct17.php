@@ -48,7 +48,12 @@ ok(($r->resolveProduct(50, 'National Salt Refined 800G')->product_name ?? '') ==
 ok(str_contains($r->resolveProduct(50, 'Puck Crm Ches 910G')->product_name ?? '', 'Puck Cream Cheese'), '"Puck Crm Ches 910G" → Puck Cream Cheese still');
 ok(str_contains($r->resolveProduct(50, 'Eva Cokng Oil Stndng Pch 1Ltr')->product_name ?? '', 'Cooking Oil'), '"Eva Cokng Oil … 1Ltr" → Cooking Oil still');
 ok(($r->resolveProduct(50, 'Dashi Pwdr Chkn Scht 18G')->product_name ?? '') === 'Chicken Powder 18gm', '"Dashi Pwdr Chkn Scht 18G" → Chicken Powder 18gm still');
-ok($r->resolveProduct(50, 'Ponam Sonf 100g') === null, '"Ponam Sonf 100g" matches nothing (no sonf on the list)');
+// Oct-19 refresh: Qasim added "Sonf 100gm" (P129) on 17-Oct. The rule is "a size never makes a match":
+// with a sonf product on the list it must match THAT, never another 100g pack; without one, nothing.
+$sonfOnList = DB::table('t_fin_vendor_products')->where('vendor_id', 50)->where('is_active', 1)->where('product_name', 'like', '%sonf%')->first();
+$sonfHit = $r->resolveProduct(50, 'Ponam Sonf 100g');
+ok($sonfOnList ? (int) ($sonfHit->id ?? 0) === (int) $sonfOnList->id : $sonfHit === null,
+    '"Ponam Sonf 100g" → the sonf product if one is on the list, else nothing (never a size-only match)', json_encode($sonfHit->product_name ?? null));
 
 // ── 3. did-you-mean: no size noise, linked first on ties ────────────────────
 echo "3. closestProducts()\n";
@@ -58,7 +63,12 @@ ok(!in_array('Bari Elaichi 100gm', $sonf, true) && !in_array('Garam Masala (Powd
 $methi = $names($closest->invoke($ctrl, 'Ponam Qasuri Methi 100g', $cat, $ing));
 ok(!in_array('Bari Elaichi 100gm', $methi, true), '"Qasuri Methi 100g" neither', json_encode($methi));
 $gm = $names($closest->invoke($ctrl, 'Ponam Garam Masala Whole 100g', $cat, $ing));
-ok(in_array('Garam Masala Sabat 100gm', $gm, true), '"Garam Masala Whole" still offers Garam Masala Sabat', json_encode($gm));
+// Oct-19 refresh: "Garam Masala Sabat 100gm" is gone; Qasim added "Garam Masala Whole 100g" (P133) on 18-Oct.
+// The rule: dropping the size words keeps the NAME evidence — a garam masala product is offered, no other 100g pack.
+$gmNames = array_filter($gm, fn ($n) => stripos($n, 'Garam Masala') !== false);
+ok(count($gmNames) >= 1 && count($gmNames) === count($gm), '"Garam Masala Whole" offers only garam masala products', json_encode($gm));
+$gmHit = $r->resolveProduct(50, 'Ponam Garam Masala Whole 100g');
+ok($gmHit === null || stripos($gmHit->product_name, 'Garam Masala') !== false, '…and an auto match, if any, is a garam masala product', json_encode($gmHit->product_name ?? null));
 $bagS = $names($closest->invoke($ctrl, 'Non-Woven Ultrasonic Bag 18"x21" 50gm', $cat, $ing));
 ok(!in_array('Long 50gm', $bagS, true), 'the bag does not even get "Long 50gm" as a did-you-mean', json_encode($bagS));
 
@@ -86,7 +96,9 @@ $read = [
     'grand_total' => 400.0, 'confidence' => 'high', 'raw' => '{}', 'model' => 'x', 'tokens_in' => 0, 'tokens_out' => 0,
     'hinted_products' => true, 'hinted_ingredients' => true,
     'lines' => [
-        $ln('Cardamom Black 100g', 46),          // I46 Bari Elaichi → P117 Bari Elaichi 100gm is linked to it
+        // Oct-19 refresh: Qasim's own 17-Oct recording TAUGHT "Cardamom Black 100g" → P117, so that name now
+        // matches directly. An untaught name with no word in common keeps this proving the BRIDGE.
+        $ln('Cardamom Kala 100g', 46),           // I46 Bari Elaichi → P117 Bari Elaichi 100gm is linked to it
         $ln('Thoom', 13),                        // I13 Garlic → TWO linked products (P112, P121); no word in common with either — the bridge still offers one
         $ln('Ponam Sonf 100g', 999999),          // an ingredient with no product → no bridge, no product guess
         $ln('Non-Woven Ultrasonic Bag 50gm'),    // nothing at all
@@ -94,7 +106,8 @@ $read = [
 ];
 $card = $build->invoke($ctrl, $vendor, $read, $reader);
 $L = $card['lines'];
-ok(($L[0]['ai_suggestion']['name'] ?? null) === 'Bari Elaichi 100gm', 'Cardamom Black + guess "Bari Elaichi" → suggests the LINKED product P117, not "add new"', json_encode($L[0]['ai_suggestion'] ?? null));
+ok(($L[0]['matched'] ?? true) === false, '"Cardamom Kala": no word match, no taught name → unmatched');
+ok(($L[0]['ai_suggestion']['name'] ?? null) === 'Bari Elaichi 100gm', 'Cardamom + guess "Bari Elaichi" → suggests the LINKED product P117, not "add new"', json_encode($L[0]['ai_suggestion'] ?? null));
 ok(empty($L[0]['ai_ingredient']), '…and no "add it as a product" nudge beside it');
 ok(($L[1]['matched'] ?? true) === false, '"Thoom": no word match, so the resolver refuses (as designed)');
 ok(in_array($L[1]['ai_suggestion']['name'] ?? null, ['Garlic (Lehsan)', 'Fresh Garlic (Peeled)'], true), '"Thoom" + guess I13 → the bridge offers one of the two linked garlic products', json_encode($L[1]['ai_suggestion'] ?? null));
@@ -102,6 +115,25 @@ ok(empty($L[1]['ai_ingredient']), '…and not "add Garlic as a new product"');
 ok(empty($L[2]['ai_suggestion']) && empty($L[2]['ai_ingredient']), 'unknown ingredient id → no suggestion of either kind');
 ok(empty($L[3]['ai_suggestion']) && ($L[3]['matched'] ?? true) === false, 'the bag: unmatched, no suggestion');
 ok(!in_array('Long 50gm', array_column($L[3]['suggestions'] ?? [], 'name'), true), 'the bag: "Long 50gm" not in did-you-mean');
+
+// Oct-19 refresh: a TAUGHT name beats every guess — Qasim taught "Cardamom Black 100g" → P117 on 17-Oct.
+// (Taken from the alias table, so it stays true whatever the replica holds.)
+$aliasMap = app(\App\Services\Assistant\SmsCounterpartyMap::class);
+$keyOf = new ReflectionMethod($r, 'productKey'); $keyOf->setAccessible(true);
+$taught = $aliasMap->byAccount($keyOf->invoke($r, 50, 'Cardamom Black 100g'));
+$card2 = $build->invoke($ctrl, $vendor, ['lines' => [$ln('Cardamom Black 100g', 46)]] + $read, $reader);
+if ($taught && $taught->entity_type === 'product') {
+    ok(($card2['lines'][0]['matched'] ?? false) === true && (int) ($card2['lines'][0]['product_id'] ?? 0) === (int) $taught->entity_id,
+        '"Cardamom Black 100g" (taught) → matched straight to its taught product', json_encode(array_intersect_key($card2['lines'][0], array_flip(['matched', 'product_id']))));
+} else {
+    ok(($card2['lines'][0]['ai_suggestion']['name'] ?? null) === 'Bari Elaichi 100gm', '"Cardamom Black 100g" (not taught here) → the bridge offers P117');
+}
+
+// A reader PRODUCT guess on a line nothing matches is SHOWN, never applied (the slip's onion line used to prove
+// this; it is taught now, so an untaught name does).
+$card3 = $build->invoke($ctrl, $vendor, ['lines' => [$ln('Kanda Red 5kg', null, 90)]] + $read, $reader);
+ok(($card3['lines'][0]['matched'] ?? true) === false && ($card3['lines'][0]['ai_suggestion']['name'] ?? null) === 'Onions (Piyaaz)',
+    'reader guess P90 on an unmatched line → offered as a suggestion, not applied', json_encode(array_intersect_key($card3['lines'][0], array_flip(['matched', 'ai_suggestion']))));
 
 // ── 5. the whole slip, after ─────────────────────────────────────────────────
 echo "5. Qasim's 26 lines against vendor 50 (AUTO / DYM / blank), after the change\n";

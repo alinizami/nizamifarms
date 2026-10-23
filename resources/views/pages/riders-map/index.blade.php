@@ -2614,15 +2614,19 @@ function rrRenderIssues(){
     const delivered = riders.reduce((a,r)=>a+(r.day.delivered_count||0),0);
     const hidden = (rrData.riders||[]).length - riders.length;
 
-    document.getElementById('rrSummaryBar').innerHTML =
-        `<div style="padding:10px 14px;">${rrChip(delivered+' delivered','dim')} ${rrChip(flagged.length+' riders flagged', flagged.length?'warn':'good')} ${rrChip(clean+' clean','good')}${hidden?' '+rrChip(hidden+' office account'+(hidden>1?'s':'')+' hidden','dim'):''}</div>`;
+    const team = rrData.team_issues || [];
+    const teamLate = team.reduce((a,t)=>a+(t.flagged_count||0),0);
+    const teamHtml = rrTeamIssuesHtml(team);
 
-    if(!flagged.length){ box.innerHTML = '<div style="padding:50px;text-align:center;color:#2E7D4F;font-weight:600;">✓ No issues for this date — everyone on time and at the pin.</div>'; return; }
+    document.getElementById('rrSummaryBar').innerHTML =
+        `<div style="padding:10px 14px;">${rrChip(delivered+' delivered','dim')} ${rrChip(flagged.length+' riders flagged', flagged.length?'warn':'good')} ${rrChip(clean+' clean','good')}${teamLate?' '+rrChip('📌 '+teamLate+' tag'+(teamLate>1?'s':'')+' answered late','warn'):''}${hidden?' '+rrChip(hidden+' office account'+(hidden>1?'s':'')+' hidden','dim'):''}</div>`;
+
+    if(!flagged.length){ box.innerHTML = teamHtml + '<div style="padding:50px;text-align:center;color:#2E7D4F;font-weight:600;">✓ No rider issues for this date — everyone on time and at the pin.</div>'; return; }
 
     // red first (any crit item), then amber
     flagged.sort((a,b)=> rrSeverityRank(b) - rrSeverityRank(a));
 
-    box.innerHTML = flagged.map(r => {
+    box.innerHTML = teamHtml + flagged.map(r => {
         const {items, stopItems, oddRoutes, missed, midRuns, storeRows} = rrRiderIssueItems(r);
         const missedHtml = missed ? `<div style="display:flex;gap:8px;align-items:baseline;flex-wrap:wrap;font-size:13px;padding:2px 0;">
                     <span style="min-width:130px;color:#6b7280;">dispatch</span>${rrMissedChips(missed)}
@@ -2738,6 +2742,29 @@ function rrRenderIssues(){
         box.innerHTML += `<div style="padding:10px 14px;background:#FAF8F2;color:#2E7D4F;font-size:13px;">✓ Clean, not shown: ${names}</div>`;
     }
 }
+// 🔴⏳ Oct-2026 — tags the team put on Taimur (or anyone on the tag-alert list) that took
+// longer than 1 hour to open, even if he opened them later. Server decides what is late
+// (MentionFollowupService::dailyIssues); this only draws it. Empty list → nothing.
+function rrTeamIssuesHtml(team){
+    if(!team || !team.length) return '';
+    return team.map(t => {
+        const rows = (t.flagged||[]).map(f => `<div style="display:flex;gap:8px;align-items:baseline;flex-wrap:wrap;font-size:13px;padding:3px 0;border-bottom:1px solid #f3f4f6;">
+                <span style="font-family:monospace;font-size:12px;color:#6b7280;min-width:44px;">${rrEsc(f.tagged_at)}</span>
+                <a href="/messages?open=${Number(f.conversation_id)}" target="_blank" style="font-weight:700;color:#2E64A6;text-decoration:none;min-width:130px;">${rrEsc(f.chat)}</a>
+                <span style="color:#6b7280;">tagged by ${rrEsc(f.tagger)}</span>
+                ${rrChip(rrEsc(f.answered ? (f.response+' · waited '+rrWaitText(f.waited_min)) : ('not opened · '+rrWaitText(f.waited_min)+' so far')), f.answered ? 'warn' : 'crit')}
+                ${f.reminders ? rrChip(f.reminders+' reminder'+(f.reminders>1?'s':''),'dim') : ''}
+                ${f.tagger_action ? `<span style="font-size:12px;color:#6b7280;">· ${rrEsc(f.tagger)} ${rrEsc(f.tagger_action)}</span>` : ''}
+            </div>`).join('');
+        return `<div style="border:1px solid #FCD34D;border-radius:8px;margin:10px 14px;overflow:hidden;">
+                <div style="background:#FFFBEB;padding:8px 14px;display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
+                    <b style="color:#92400E;">📌 ${rrEsc(t.on_user)} · tagged ${t.tagged_count} time${t.tagged_count>1?'s':''} · ${t.flagged_count} took over 1 h to open</b>
+                </div>
+                <div style="padding:4px 14px 8px;">${rows}</div>
+            </div>`;
+    }).join('');
+}
+function rrWaitText(min){ min = Number(min)||0; const h = Math.floor(min/60), m = min%60; return h ? (h+' h'+(m?' '+m+' m':'')) : (m+' min'); }
 function rrSeverityRank(r){
     let rank = 0;
     if(r.missed_dispatch) rank = 2;

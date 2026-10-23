@@ -121,6 +121,8 @@ class ProductModel extends BaseModel
                           //    Weight column on Open Order Quantities. NOT the weighing divisor.
         'czerlop_product_id', // ⭐ Scale PLU embedded in the weight barcode (barcode-qty feature)
         'sell_unit',          // ⭐ 'kg' (weighed) | 'pcs' (counted boxes) — see SELL_UNIT_* below
+        'recipe_family_id',   // 🍱 Oct-19: which preparation this pack is (RecipeFamilyService writes it)
+        'pieces_per_pack',    // 🍱 Oct-19: pieces in one pack — required with a family
         'seo_title',
         'seo_description',
         'featured_image',

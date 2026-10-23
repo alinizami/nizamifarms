@@ -41,9 +41,10 @@ class LineItemQuantityService
      * 'manual'   — somebody typed the quantity.
      * 'barcode'  — the quantity was READ OFF a scale label (weighed products).
      * 'box_scan' — a counted product's box was scanned to confirm the PRODUCT; the
-     *              quantity is the ordered one and no label supplied it. Kept
-     *              distinct from 'barcode' precisely so no screen claims a number
-     *              came from a label that never carried one.
+     *              quantity is the box count the packer confirmed on the phone
+     *              (pre-filled with the ordered count, Oct-19-2026) — no label
+     *              supplied it. Kept distinct from 'barcode' precisely so no
+     *              screen claims a number came from a label that never carried one.
      */
     public const SOURCE_MANUAL = 'manual';
     public const SOURCE_BARCODE = 'barcode';
@@ -102,11 +103,76 @@ class LineItemQuantityService
             'previous_quantity' => $oldQuantity,
             'previous_source' => $previousSource,
             'new_quantity' => (float) $lineItem->quantity,
+            'original_quantity' => self::originalOf($lineItem),
             'quantity_source' => $source,
             'line_total' => (float) $lineItem->line_total,
             'order_subtotal' => (float) $order->subtotal_price,
             'order_total' => (float) $order->total_price,
         ];
+    }
+
+    /**
+     * The kept "originally ordered" quantity of a line, as a float, or NULL when
+     * it never changed (or the column does not exist yet).
+     */
+    public static function originalOf(OrderLineItemModel $lineItem): ?float
+    {
+        if (!OrderLineItemModel::supportsOriginalQuantity()) {
+            return null;
+        }
+        $v = $lineItem->original_quantity;
+        return ($v === null || $v === '') ? null : (float) $v;
+    }
+
+    /**
+     * 📦 Save the BOX COUNT the packer confirmed after scanning a counted product
+     * (Oct-19-2026, owner ruling). The phone pre-fills the ordered count and he
+     * taps "Yes" or types what he actually packed.
+     *
+     *  - same number as the line already has → only the box-scan stamp
+     *    (markBoxScanned): no money, no stock, nothing else moves;
+     *  - a different number → the SAME path as a weight scan (setQuantity):
+     *    line total, order total and stock follow, the first ordered count is
+     *    kept in original_quantity, and closed / invoiced orders are refused.
+     *
+     * The caller (RiderController::confirmLineItemBoxScan) has already proved the
+     * product is sold by the box and that the label belongs to it.
+     *
+     * @return array{success:bool, code?:string, message:string}
+     */
+    public function setBoxCount(
+        OrderModel $order,
+        OrderLineItemModel $lineItem,
+        int $boxes,
+        string $scannedBarcode,
+        ?int $userId
+    ): array {
+        if ($boxes < 1) {
+            return ['success' => false, 'code' => 'bad_qty', 'message' => 'Number of boxes must be at least 1.'];
+        }
+
+        $current = (float) ($lineItem->quantity ?? 0);
+        $previousSource = $lineItem->quantity_source;
+
+        if (abs($current - $boxes) < 0.0005) {
+            $result = $this->markBoxScanned($order, $lineItem, $scannedBarcode, $userId);
+        } else {
+            $result = $this->setQuantity($order, $lineItem, (float) $boxes, self::SOURCE_BOX_SCAN, $userId, $scannedBarcode);
+            if (!empty($result['success'])) {
+                $result['unchanged'] = false;
+                $result['previous_source'] = $previousSource;
+                $result['message'] = 'Box count saved — ' . $boxes . ' (was ' . rtrim(rtrim(number_format($current, 3, '.', ''), '0'), '.') . ').';
+            }
+        }
+
+        if (!empty($result['success'])) {
+            // ⭐ Tells the phone the COUNT was honoured. A server without this round
+            //    ignores the count and keeps the old quantity — the phone must be able
+            //    to tell that apart from "saved", never assume it.
+            $result['quantity_applied'] = true;
+            $result['original_quantity'] = self::originalOf($lineItem);
+        }
+        return $result;
     }
 
     /**
@@ -184,6 +250,7 @@ class LineItemQuantityService
                 'line_item_id' => (int) $li->id,
                 'previous_quantity' => $p['previous_quantity'],
                 'new_quantity' => (float) $li->quantity,
+                'original_quantity' => self::originalOf($li),
                 'quantity_source' => $p['source'],
                 'line_total' => (float) $li->line_total,
             ];
@@ -321,6 +388,11 @@ class LineItemQuantityService
      * Idempotent: scanning box 2 and box 3 of the same line re-confirms the same
      * row and reports `unchanged`, because there is no per-box state to add to.
      *
+     * Oct-19-2026: the packer now CONFIRMS the count on the phone (pre-filled with
+     * the ordered count). That goes through setBoxCount(), which lands here only
+     * when the confirmed count equals the line's quantity. A phone without the
+     * count box still calls this directly — exactly the old behaviour.
+     *
      * @return array{success:bool, code?:string, message:string}
      */
     public function markBoxScanned(
@@ -369,6 +441,7 @@ class LineItemQuantityService
             // The quantity is deliberately untouched — echoed back so the phone can
             // show "stays N" from the server's own reading rather than its cache.
             'new_quantity' => (float) $lineItem->quantity,
+            'original_quantity' => self::originalOf($lineItem),
             'quantity_source' => self::SOURCE_BOX_SCAN,
             'line_total' => (float) $lineItem->line_total,
             'order_subtotal' => (float) $order->subtotal_price,
@@ -398,7 +471,22 @@ class LineItemQuantityService
             $lineItem->restoreInventory(); // sets inventory_deducted = 0, saves
         }
 
-        // 2) Apply the new quantity + recompute this line's totals.
+        // 2) Keep what the customer ordered — ONCE, the first time the number moves
+        //    (a weight scan, a box count, a typed correction). Never overwritten, so
+        //    managers can always see "ordered 3 → packed 2". Nothing is kept when the
+        //    number does not move, and nothing at all before the SQL has run.
+        if (OrderLineItemModel::supportsOriginalQuantity()) {
+            $keep = OrderLineItemModel::originalToKeep(
+                $lineItem->original_quantity,
+                (float) ($lineItem->quantity ?? 0),
+                $newQuantity
+            );
+            if ($keep !== null) {
+                $lineItem->original_quantity = $keep;
+            }
+        }
+
+        // 3) Apply the new quantity + recompute this line's totals.
         $lineItem->quantity = $newQuantity;
         if ($isFree) {
             $lineItem->line_subtotal = 0;
@@ -415,7 +503,7 @@ class LineItemQuantityService
             );
         }
 
-        // 3) Stamp source / audit.
+        // 4) Stamp source / audit.
         $lineItem->quantity_source = $source;
         $lineItem->quantity_updated_by = $userId;
         $lineItem->quantity_updated_at = now();
@@ -427,7 +515,7 @@ class LineItemQuantityService
         }
         $lineItem->save();
 
-        // 4) Re-deduct inventory at the NEW qty if it was deducted before.
+        // 5) Re-deduct inventory at the NEW qty if it was deducted before.
         if ($wasDeducted) {
             $lineItem->deductInventory(); // sets inventory_deducted = 1, saves
         }

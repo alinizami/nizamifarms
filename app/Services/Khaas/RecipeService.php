@@ -117,7 +117,7 @@ class RecipeService
         if ($ingredient->exists && $ingredient->base_unit !== $baseUnit && $this->ingredientInUse($ingredient)) {
             throw new \InvalidArgumentException(
                 'This ingredient is already used in a recipe or a purchase, so its unit cannot change. '
-                . 'Add a new ingredient instead.'
+                . IngredientUnitChangeService::replaceAdvice((string) $ingredient->name, $baseUnit)
             );
         }
 
@@ -206,19 +206,75 @@ class RecipeService
             ];
         }
 
-        $lineIds     = $recipe->lines()->pluck('ingredient_id')->all();
-        $ingredients = IngredientModel::whereIn('id', $lineIds)->get()->keyBy('id');
+        $lines = $this->shapeLines(
+            $recipe->lines()->get()->map(fn ($l) => [
+                'ingredient_id' => (int) $l->ingredient_id,
+                'qty_per_basis' => (float) $l->qty_per_basis,
+                'is_optional'   => (bool) $l->is_optional,
+            ])->all(),
+            fn (float $qty) => $recipe->perPacket(new RecipeLineModel(['qty_per_basis' => $qty]))
+        );
+
+        return [
+            'product_id'     => $productId,
+            'product_name'   => $product->title ?? 'Unknown',
+            'has_recipe'     => true,
+            'is_suggestion'  => false,
+            'recipe_id'      => (int) $recipe->id,
+            'version'        => (int) $recipe->version,
+            'basis_packets'  => (int) $recipe->basis_packets,
+            'effective_from' => optional($recipe->effective_from)->toDateString(),
+            'note'           => $recipe->note,
+            'lines'          => $lines,
+            'warnings'       => $this->warningsFor($recipe->basis_packets, $lines),
+        ] + $this->familyContext($product);
+    }
+
+    /**
+     * 🍱 Oct-19: for a pack that belongs to a recipe FAMILY, the facts every screen needs to
+     * say so ("Chicken Cheese Samosa — family recipe · used by 8 pcs, 12 pcs") and to open the
+     * family editor instead of this pack's derived snapshot. Empty for everything else, so old
+     * clients see exactly what they always saw.
+     */
+    public function familyContext(?ProductModel $product): array
+    {
+        if (!$product || !RecipeFamilyService::ready() || !$product->recipe_family_id || !$product->pieces_per_pack) {
+            return [];
+        }
+        try {
+            $f = (new RecipeFamilyService())->summary((int) $product->recipe_family_id);
+        } catch (\Throwable $e) {
+            return [];
+        }
+        if (!$f) {
+            return [];
+        }
+        return ['family' => $f + ['pieces_per_pack' => (int) $product->pieces_per_pack]];
+    }
+
+    /**
+     * ⭐ ONE line shape for every recipe screen — a product's own recipe and a family recipe
+     * alike — with the supply badge facts (linked / bought) the editors show per line.
+     *
+     * @param array<int,array{ingredient_id:int, qty_per_basis:float, is_optional:bool}> $raw
+     * @param callable(float):float $perUnit  batch quantity → per-pack (or per-piece) quantity
+     */
+    public function shapeLines(array $raw, callable $perUnit): array
+    {
+        $lineIds     = array_map(fn ($l) => (int) $l['ingredient_id'], $raw);
+        $ingredients = IngredientModel::whereIn('id', $lineIds ?: [0])->get()->keyBy('id');
         $facts       = $this->lineFacts($lineIds);
 
         $lines = [];
-        foreach ($recipe->lines()->get() as $line) {
-            $ing = $ingredients->get($line->ingredient_id);
+        foreach ($raw as $line) {
+            $ing = $ingredients->get((int) $line['ingredient_id']);
             if (!$ing) {
                 continue;
             }
 
-            $perPacket = $recipe->perPacket($line);
-            $fact      = $facts[(int) $line->ingredient_id] ?? ['linked_products' => 0, 'linked_vendors' => [], 'last_bought_on' => null];
+            $qty       = (float) $line['qty_per_basis'];
+            $perPacket = (float) $perUnit($qty);
+            $fact      = $facts[(int) $line['ingredient_id']] ?? ['linked_products' => 0, 'linked_vendors' => [], 'last_bought_on' => null];
 
             // What the editor badges: meat comes off storage and is never bought through a
             // catalogue line, so it is "supplied", not "not linked".
@@ -234,33 +290,20 @@ class RecipeService
                 // 🔗 Sep-27: WHICH products, so the recipe sheet can open one to change it.
                 'linked_list'     => $fact['linked_list'] ?? [],
                 'last_bought_on'  => $fact['last_bought_on'],
-                'ingredient_id'   => (int) $line->ingredient_id,
+                'ingredient_id'   => (int) $line['ingredient_id'],
                 'ingredient_name' => $ing->name,
                 'kind'            => $ing->kind,
                 'kind_label'      => $ing->kindLabel(),
                 'base_unit'       => $ing->base_unit,
                 'is_meat'         => $ing->isMeat(),
-                'is_optional'     => (bool) $line->is_optional,
-                'qty_per_basis'   => (float) $line->qty_per_basis,
-                'basis_text'      => $ing->phrase((float) $line->qty_per_basis),
+                'is_optional'     => (bool) $line['is_optional'],
+                'qty_per_basis'   => $qty,
+                'basis_text'      => $ing->phrase($qty),
                 'per_packet'      => round($perPacket, 3),
                 'per_packet_text' => $ing->phrase($perPacket),
             ];
         }
-
-        return [
-            'product_id'     => $productId,
-            'product_name'   => $product->title ?? 'Unknown',
-            'has_recipe'     => true,
-            'is_suggestion'  => false,
-            'recipe_id'      => (int) $recipe->id,
-            'version'        => (int) $recipe->version,
-            'basis_packets'  => (int) $recipe->basis_packets,
-            'effective_from' => optional($recipe->effective_from)->toDateString(),
-            'note'           => $recipe->note,
-            'lines'          => $lines,
-            'warnings'       => $this->warningsFor($recipe->basis_packets, $lines),
-        ];
+        return $lines;
     }
 
     /**
@@ -290,6 +333,60 @@ class RecipeService
             throw new \InvalidArgumentException('Say how many packs the batch makes — it must be at least 1.');
         }
 
+        $clean = $this->cleanLines($lines);
+
+        // 🍱 Oct-19: a pack that belongs to a FAMILY has no recipe of its own — its row is a
+        //    snapshot of the family's. A save aimed at the pack (an older app, the Replace
+        //    door) is the family's recipe seen through this pack: "B packs of N pieces" is
+        //    B × N pieces, with the SAME batch quantities. Exact, nothing divided.
+        if (RecipeFamilyService::ready() && $product->recipe_family_id && (int) $product->pieces_per_pack > 0) {
+            return (new RecipeFamilyService())->saveFromPack(
+                $product, $basisPackets, $clean, $effectiveFrom, $note, $userId
+            );
+        }
+
+        $effectiveFrom = $effectiveFrom ?: now()->toDateString();
+        try {
+            Carbon::parse($effectiveFrom);
+        } catch (\Throwable $e) {
+            $effectiveFrom = now()->toDateString();
+        }
+
+        return DB::transaction(function () use ($productId, $basisPackets, $clean, $effectiveFrom, $note, $userId) {
+            $nextVersion = (int) RecipeModel::where('product_id', $productId)->max('version') + 1;
+
+            RecipeModel::where('product_id', $productId)->update(['is_current' => 0]);
+
+            $recipe = RecipeModel::create([
+                'product_id'     => $productId,
+                'version'        => $nextVersion,
+                'basis_packets'  => $basisPackets,
+                'effective_from' => $effectiveFrom,
+                'is_current'     => 1,
+                'note'           => $note ? mb_substr($note, 0, 255) : null,
+                'created_by'     => $userId,
+            ]);
+
+            foreach ($clean as $row) {
+                RecipeLineModel::create($row + [
+                    'recipe_id'  => $recipe->id,
+                    'created_at' => now(),
+                ]);
+            }
+
+            return $recipe;
+        });
+    }
+
+    /**
+     * The typed lines → base-unit rows, checked. ONE door for both a pack's recipe and a family
+     * recipe, so "kg against a pieces ingredient" is refused the same way everywhere.
+     *
+     * @return array<int,array{ingredient_id:int, qty_per_basis:float, is_optional:bool, sort_order:int}>
+     * @throws \InvalidArgumentException
+     */
+    public function cleanLines(array $lines): array
+    {
         $clean = [];
         $seen  = [];
         foreach ($lines as $row) {
@@ -339,37 +436,7 @@ class RecipeService
             throw new \InvalidArgumentException('A recipe needs at least one ingredient.');
         }
 
-        $effectiveFrom = $effectiveFrom ?: now()->toDateString();
-        try {
-            Carbon::parse($effectiveFrom);
-        } catch (\Throwable $e) {
-            $effectiveFrom = now()->toDateString();
-        }
-
-        return DB::transaction(function () use ($productId, $basisPackets, $clean, $effectiveFrom, $note, $userId) {
-            $nextVersion = (int) RecipeModel::where('product_id', $productId)->max('version') + 1;
-
-            RecipeModel::where('product_id', $productId)->update(['is_current' => 0]);
-
-            $recipe = RecipeModel::create([
-                'product_id'     => $productId,
-                'version'        => $nextVersion,
-                'basis_packets'  => $basisPackets,
-                'effective_from' => $effectiveFrom,
-                'is_current'     => 1,
-                'note'           => $note ? mb_substr($note, 0, 255) : null,
-                'created_by'     => $userId,
-            ]);
-
-            foreach ($clean as $row) {
-                RecipeLineModel::create($row + [
-                    'recipe_id'  => $recipe->id,
-                    'created_at' => now(),
-                ]);
-            }
-
-            return $recipe;
-        });
+        return $clean;
     }
 
     /** Every version ever written for a product, newest first. */
@@ -396,25 +463,54 @@ class RecipeService
     {
         // 📦 A bundle is never cooked — its products inside carry the recipes — so it
         // must not show up as "no recipe".
+        $withFamily = RecipeFamilyService::ready();
         $products = \App\Services\CRM\ProductBundle::excludeBundles(
             ProductModel::where('business_unit_id', $businessUnitId)->where('is_active', 1)
         )
             ->orderBy('title')
-            ->get(['id', 'title']);
+            ->get($withFamily ? ['id', 'title', 'recipe_family_id', 'pieces_per_pack'] : ['id', 'title']);
 
         $current = RecipeModel::whereIn('product_id', $products->pluck('id'))
             ->where('is_current', 1)
             ->get()
             ->keyBy('product_id');
 
-        return $products->map(function ($p) use ($current) {
+        // 🥔 Oct-19: which current recipes want something Storage counts (meat, potato…) — a
+        //    preparation with none is planned and accepted with nothing taken from Storage.
+        $storageRecipeIds = [];
+        try {
+            $storageRecipeIds = \Illuminate\Support\Facades\DB::table('t_crm_khaas_recipe_line as l')
+                ->join('t_crm_khaas_ingredient as i', 'i.id', '=', 'l.ingredient_id')
+                ->whereIn('l.recipe_id', $current->pluck('id')->all() ?: [0])
+                ->whereNotNull('i.storage_product_id')
+                ->distinct()
+                ->pluck('l.recipe_id')
+                ->map(fn ($id) => (int) $id)
+                ->flip()
+                ->all();
+        } catch (\Throwable $e) {
+            $storageRecipeIds = [];
+        }
+
+        // 🍱 Oct-19: which family each pack belongs to, so both pickers can group by family
+        $families = $withFamily
+            ? \App\Models\Khaas\RecipeFamilyModel::whereIn('id', $products->pluck('recipe_family_id')->filter()->unique()->all() ?: [0])
+                ->pluck('name', 'id')->all()
+            : [];
+
+        return $products->map(function ($p) use ($current, $families, $withFamily, $storageRecipeIds) {
             $r = $current->get($p->id);
+            $fid = $withFamily && $p->recipe_family_id && $p->pieces_per_pack ? (int) $p->recipe_family_id : null;
             return [
                 'product_id'    => (int) $p->id,
                 'product_name'  => $p->title,
                 'has_recipe'    => (bool) $r,
+                'has_storage_line' => $r ? isset($storageRecipeIds[(int) $r->id]) : false,
                 'version'       => $r ? (int) $r->version : 0,
                 'basis_packets' => $r ? (int) $r->basis_packets : null,
+                'family_id'     => $fid,
+                'family_name'   => $fid ? ($families[$fid] ?? null) : null,
+                'pieces_per_pack' => $withFamily && $p->pieces_per_pack ? (int) $p->pieces_per_pack : null,
             ];
         })->values()->all();
     }

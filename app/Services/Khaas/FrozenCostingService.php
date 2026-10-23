@@ -412,6 +412,50 @@ class FrozenCostingService
     }
 
     /**
+     * 🍱 Oct-20 (owner) — the product CARD's month, web and phone alike (KhaasController::products,
+     * RecipeController::productCosts). "Made" counts EVERY pack that came into the warehouse this month —
+     * the same stock-ins, the same window, the same plan/direct split as Month Review
+     * (FrozenMonthService::production) — not only the packs that had a recipe. The estimate per pack still
+     * divides the recipe cost by the packs that HAD a recipe (`costed`); `made_no_recipe` says how many
+     * were made before (or without) one, so the card can say so instead of silently showing fewer.
+     *
+     * @return array<int, array{product_id:int, made:int, made_plan:int, made_direct:int, costed:int,
+     *                          made_no_recipe:int, cost_per_pack:?float}>
+     */
+    public function cardMonth(int $businessUnitId, string $month): array
+    {
+        $out = [];
+        foreach ((new FrozenMonthService())->production($businessUnitId, $month)['products'] ?? [] as $p) {
+            $made = (int) ($p['stock_in'] ?? 0);
+            if ($made <= 0) {
+                continue;
+            }
+            $out[(int) $p['product_id']] = [
+                'product_id'     => (int) $p['product_id'],
+                'made'           => $made,
+                'made_plan'      => (int) ($p['stock_in_batch'] ?? 0),
+                'made_direct'    => (int) ($p['stock_in_manual'] ?? 0),
+                'costed'         => 0,
+                'made_no_recipe' => $made,
+                'cost_per_pack'  => null,
+            ];
+        }
+        foreach ($this->productMonth($businessUnitId, $month)['rows'] as $row) {
+            $pid = (int) $row['product_id'];
+            $costed = (int) $row['made'];
+            $base = $out[$pid] ?? [
+                'product_id' => $pid, 'made' => $costed, 'made_plan' => (int) $row['made_plan'],
+                'made_direct' => (int) $row['made_direct'],
+            ];
+            $base['costed']         = $costed;
+            $base['made_no_recipe'] = max(0, $base['made'] - $costed);
+            $base['cost_per_pack']  = $costed > 0 ? (float) $row['cost_per_pack'] : null;
+            $out[$pid] = $base;
+        }
+        return $out;
+    }
+
+    /**
      * One product's estimated ingredient cost per pack, for the card chip.
      * Returns null when there is nothing honest to show.
      */

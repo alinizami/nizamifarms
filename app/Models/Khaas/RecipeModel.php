@@ -38,6 +38,10 @@ class RecipeModel extends Model
         'is_current',
         'note',
         'created_by',
+        // 🍱 Oct-19: set when this row is an exact snapshot of a FAMILY recipe version, written by
+        //    RecipeFamilyService (never by hand). member qty = family qty × family_scale.
+        'family_recipe_id',
+        'family_scale',
     ];
 
     protected $casts = [
@@ -47,6 +51,8 @@ class RecipeModel extends Model
         'effective_from' => 'date',
         'is_current'     => 'boolean',
         'created_by'     => 'integer',
+        'family_recipe_id' => 'integer',
+        'family_scale'   => 'integer',
     ];
 
     public function lines(): HasMany

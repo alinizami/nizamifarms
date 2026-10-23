@@ -197,8 +197,9 @@ class RecipeController extends Controller
             return response()->json(['success' => false, 'message' => 'That ingredient no longer exists.'], 404);
         }
 
+        // 🍱 Oct-19: family recipe lines are keyed "f<id>" — keep those as strings, cast the rest
         $num = fn ($arr) => collect(is_array($arr) ? $arr : [])
-            ->mapWithKeys(fn ($v, $k) => [(int) $k => (float) $v])->all();
+            ->mapWithKeys(fn ($v, $k) => [(is_string($k) && str_starts_with($k, 'f') ? $k : (int) $k) => (float) $v])->all();
 
         try {
             $result = app(\App\Services\Khaas\IngredientUnitChangeService::class)->apply(
@@ -346,9 +347,18 @@ class RecipeController extends Controller
 
             $shaped = $this->recipes->recipeFor((int) $recipe->product_id);
 
+            // 🍱 A pack of a family was saved THROUGH to its family recipe — say so, so nobody
+            //    thinks only the 12-pcs pack changed.
+            $message = "Saved as version {$recipe->version}.";
+            if (!empty($recipe->family_recipe_id) && !empty($shaped['family'])) {
+                $fv = \App\Models\Khaas\FamilyRecipeModel::find($recipe->family_recipe_id);
+                $message = sprintf('Saved the %s family recipe (version %d) — every size uses it.',
+                    $shaped['family']['name'], $fv->version ?? 0);
+            }
+
             return response()->json([
                 'success' => true,
-                'message' => "Saved as version {$recipe->version}.",
+                'message' => $message,
                 'recipe'  => $shaped,
             ] + $this->pricedRecipe($this->businessUnitId($request), $shaped));
         } catch (\InvalidArgumentException $e) {
@@ -356,6 +366,221 @@ class RecipeController extends Controller
         } catch (\Throwable $e) {
             \Log::error('Frozen recipes: save failed', ['error' => $e->getMessage()]);
             return response()->json(['success' => false, 'message' => 'Could not save that recipe.'], 500);
+        }
+    }
+
+    // =================================================================
+    //  🍱 RECIPE FAMILIES (Oct-19) — the same methods for the web page and the phone
+    // =================================================================
+
+    private function families(): \App\Services\Khaas\RecipeFamilyService
+    {
+        return new \App\Services\Khaas\RecipeFamilyService();
+    }
+
+    /** Every family with its sizes, plus (for those who may) the one-time set-up suggestions. */
+    public function recipeFamilies(Request $request)
+    {
+        if (!$this->canAccess()) {
+            return $this->deny('Frozen mode access is needed.');
+        }
+        $bu = $this->businessUnitId($request);
+        $svc = $this->families();
+        return response()->json([
+            'success'    => true,
+            'ready'      => \App\Services\Khaas\RecipeFamilyService::ready(),
+            'families'   => $svc->families($bu),
+            'setup'      => $this->canManage() ? $svc->setupPlan($bu) : null,
+            'can_manage' => $this->canManage(),
+        ]);
+    }
+
+    /**
+     * One family's recipe as both editors open it — by family_id, or by the product_id of any
+     * of its packs. Same price book, shelf and link facts as the per-pack recipe.
+     */
+    public function recipeFamily(Request $request)
+    {
+        if (!$this->canAccess()) {
+            return $this->deny('Frozen mode access is needed to see a recipe.');
+        }
+        $bu = $this->businessUnitId($request);
+        $familyId = (int) $request->input('family_id');
+        if (!$familyId && $request->filled('product_id')) {
+            $p = \App\Models\CRM\ProductModel::find((int) $request->input('product_id'));
+            $familyId = $p && $p->pieces_per_pack ? (int) $p->recipe_family_id : 0;
+        }
+        if (!$familyId) {
+            return response()->json(['success' => false, 'message' => 'Which family?'], 400);
+        }
+        try {
+            $shape = $this->families()->familyRecipe($familyId);
+        } catch (\InvalidArgumentException $e) {
+            return response()->json(['success' => false, 'message' => $e->getMessage()], 404);
+        }
+        return response()->json([
+            'success'      => true,
+            'recipe'       => $shape,
+            'ingredients'  => $this->recipes->ingredients($bu),
+            'can_manage'   => $this->canManage(),
+            'link_vendors' => $this->linkVendors($bu),
+            'on_shelf'     => (object) array_filter($this->onShelfFor($bu)),
+        ] + $this->pricedFamily($bu, $shape));
+    }
+
+    /**
+     * 💲 A family priced PER SIZE — each pack's cost is the family recipe seen through that
+     * pack (RecipeFamilyService::packShape), costed by the same IngredientPriceService::costRecipe
+     * the per-pack recipe uses. Rupees stripped here, like pricedRecipe().
+     */
+    private function pricedFamily(int $bu, array $shape): array
+    {
+        $canCost = $this->canSeeCost();
+        try {
+            $price = new IngredientPriceService();
+            $book  = $price->latest($bu);
+            $ids   = array_column($shape['sizes'] ?? [], 'product_id');
+            $sell  = $ids ? (new FrozenMonthService())->sellingPrices($ids) : [];
+            $costs = [];
+            if (!empty($shape['has_recipe'])) {
+                foreach ($shape['sizes'] as $s) {
+                    $c = $price->costRecipe(
+                        \App\Services\Khaas\RecipeFamilyService::packShape($shape, (int) $s['pieces_per_pack']),
+                        $book,
+                        $sell[$s['product_id']] ?? null
+                    );
+                    $costs[(string) $s['product_id']] = $canCost ? $c : IngredientPriceService::stripRupees($c);
+                }
+            }
+            return [
+                'costs'        => (object) $costs,
+                'prices'       => (object) ($canCost ? $book : IngredientPriceService::stripPriceBook($book)),
+                'can_see_cost' => $canCost,
+            ];
+        } catch (\Throwable $e) {
+            \Log::warning('Recipe family: pricing failed', ['error' => $e->getMessage()]);
+            return ['costs' => (object) [], 'prices' => (object) [], 'can_see_cost' => $canCost];
+        }
+    }
+
+    /** Create a family by name, or rename one (`family_id` + `name`). */
+    public function saveRecipeFamily(Request $request)
+    {
+        if (!$this->canManage()) {
+            return $this->deny('Only Taimur, Shabib or Qasim can change recipe families.');
+        }
+        try {
+            $svc = $this->families();
+            $f = $request->filled('family_id')
+                ? $svc->rename((int) $request->input('family_id'), (string) $request->input('name'))
+                : $svc->createFamily((string) $request->input('name'), $this->businessUnitId($request), auth()->id());
+            return response()->json(['success' => true, 'message' => 'Saved.', 'family' => $svc->summary((int) $f->id)]);
+        } catch (\InvalidArgumentException $e) {
+            return response()->json(['success' => false, 'message' => $e->getMessage()], 422);
+        }
+    }
+
+    /** Save the FAMILY recipe — one new version, an exact snapshot for every size. */
+    public function saveFamilyRecipe(Request $request)
+    {
+        if (!$this->canManage()) {
+            return $this->deny('Only Taimur, Shabib or Qasim can change a recipe. Ask one of them.');
+        }
+        $bu = $this->businessUnitId($request);
+        $lines = $request->input('lines', []);
+        try {
+            $svc = $this->families();
+            $fv = $svc->saveFamilyRecipe(
+                (int) $request->input('family_id'),
+                (int) $request->input('basis_pieces'),
+                $this->recipes->cleanLines(is_array($lines) ? $lines : []),
+                $request->input('effective_from'),
+                $request->input('note'),
+                auth()->id()
+            );
+            $shape = $svc->familyRecipe((int) $fv->family_id);
+            $sizes = implode(', ', array_column($shape['sizes'], 'label'));
+            return response()->json([
+                'success' => true,
+                'message' => sprintf('Saved the %s recipe as version %d.%s', $shape['family']['name'], $fv->version,
+                    $sizes ? " Every size follows it: {$sizes}." : ' It has no pack sizes yet.'),
+                'recipe'  => $shape,
+            ] + $this->pricedFamily($bu, $shape));
+        } catch (\InvalidArgumentException $e) {
+            return response()->json(['success' => false, 'message' => $e->getMessage()], 422);
+        } catch (\Throwable $e) {
+            \Log::error('Recipe family: save failed', ['error' => $e->getMessage()]);
+            return response()->json(['success' => false, 'message' => 'Could not save that recipe. Nothing was changed.'], 500);
+        }
+    }
+
+    /** Put a pack in a family / take it out / change its pieces (from the editor or set-up). */
+    public function assignRecipeFamily(Request $request)
+    {
+        if (!$this->canManage()) {
+            return $this->deny('Only Taimur, Shabib or Qasim can change recipe families.');
+        }
+        try {
+            $r = $this->families()->assign(
+                (int) $request->input('product_id'),
+                $request->filled('family_id') ? (int) $request->input('family_id') : null,
+                $request->filled('pieces_per_pack') ? (int) $request->input('pieces_per_pack') : null,
+                auth()->id(),
+                $request->input('new_family_name') ?: null
+            );
+            return response()->json(['success' => true] + $r);
+        } catch (\InvalidArgumentException $e) {
+            return response()->json(['success' => false, 'message' => $e->getMessage()], 422);
+        }
+    }
+
+    /** While a product title is typed: which family, how many pieces, or "did you mean". */
+    public function suggestRecipeFamily(Request $request)
+    {
+        if (!$this->canAccess()) {
+            return $this->deny('Frozen mode access is needed.');
+        }
+        return response()->json(['success' => true] + $this->families()->suggest(
+            (string) $request->input('title'),
+            $this->businessUnitId($request),
+            $request->filled('product_id') ? (int) $request->input('product_id') : null
+        ));
+    }
+
+    /** One-time set-up: do ONE suggested family (the screen calls this once per family). */
+    public function setupRecipeFamily(Request $request)
+    {
+        if (!$this->canManage()) {
+            return $this->deny('Only Taimur, Shabib or Qasim can set up recipe families.');
+        }
+        $bu = $this->businessUnitId($request);
+        try {
+            $r = $this->families()->setupFamily([
+                'name'              => (string) $request->input('name'),
+                'family_id'         => $request->filled('family_id') ? (int) $request->input('family_id') : null,
+                'source_product_id' => $request->filled('source_product_id') ? (int) $request->input('source_product_id') : null,
+                'members'           => (array) $request->input('members', []),
+            ], $bu, auth()->id());
+
+            $f = $r['family'];
+            $msg = sprintf('%s is set up: %s.', $f['name'], implode(', ', array_column($f['members'], 'label')) ?: 'no sizes');
+            if ($r['converted']) {
+                $msg .= sprintf(' Its recipe comes from %s v%d — %d pieces a batch.',
+                    $r['converted']['from'], $r['converted']['from_version'], $r['converted']['basis_pieces']);
+                if (($r['converted']['versions'] ?? 1) > 1) {
+                    // 🍱 the history came too, so every size is costed back to the first recipe date
+                    $msg .= sprintf(' Its history came with it: %d versions since %s, so every size is costed from that date.',
+                        $r['converted']['versions'], \Carbon\Carbon::parse($r['converted']['first_date'])->format('j M'));
+                }
+            } elseif (!$f['recipe']) {
+                $msg .= ' It has no recipe yet — write it once and every size uses it.';
+            }
+            return response()->json(['success' => true, 'message' => $msg] + $r);
+        } catch (\InvalidArgumentException $e) {
+            return response()->json(['success' => false, 'message' => $e->getMessage()], 422);
+        } catch (\Throwable $e) {
+            \Log::error('Recipe family: set-up failed', ['error' => $e->getMessage()]);
+            return response()->json(['success' => false, 'message' => 'Could not set that family up. Nothing was changed.'], 500);
         }
     }
 
@@ -444,16 +669,19 @@ class RecipeController extends Controller
         }
 
         $bu      = $this->businessUnitId($request);
-        $data    = $this->costing->productMonth($bu, $month);
         $canCost = $this->canSeeCost();
 
+        // 🍱 Oct-20: every pack made (same count as Month Review), plus how many had no recipe —
+        //    FrozenCostingService::cardMonth, the same method the web Products page reads.
         $map = [];
-        foreach ($data['rows'] as $row) {
-            $map[(string) $row['product_id']] = [
-                'made'          => $row['made'],
-                'made_plan'     => $row['made_plan'],
-                'made_direct'   => $row['made_direct'],
-                'cost_per_pack' => $canCost ? $row['cost_per_pack'] : null,
+        foreach ($this->costing->cardMonth($bu, $month) as $pid => $row) {
+            $map[(string) $pid] = [
+                'made'           => $row['made'],
+                'made_plan'      => $row['made_plan'],
+                'made_direct'    => $row['made_direct'],
+                'costed'         => $row['costed'],
+                'made_no_recipe' => $row['made_no_recipe'],
+                'cost_per_pack'  => $canCost ? $row['cost_per_pack'] : null,
             ];
         }
 
@@ -702,12 +930,18 @@ class RecipeController extends Controller
                     ], (int) auth()->id(), $bu);
                 }
 
-                return (new IngredientReplaceService())->apply(
+                $done = (new IngredientReplaceService())->apply(
                     $from->fresh(), $to->fresh(),
                     array_map('floatval', (array) $request->input('recipe_qty', [])),
                     array_map('floatval', (array) $request->input('product_sizes', [])),
-                    (int) auth()->id()
+                    (int) auth()->id(),
+                    // ⏸ Oct-18: old products of the WRONG kind the person would rather switch off
+                    //    than re-size ("I buy the new litre product now") — ids from the preview.
+                    array_values(array_map('intval', (array) $request->input('deactivate_products', [])))
                 );
+                // 🔁 Oct-18: the NEW ingredient, so a product form that started the replace can
+                //    re-point its tag at it without a second request.
+                return $done + ['to' => $to->fresh()->shape()];
             });
         } catch (\InvalidArgumentException $e) {
             return response()->json(['success' => false, 'message' => $e->getMessage()], 422);
@@ -716,7 +950,7 @@ class RecipeController extends Controller
             return response()->json(['success' => false, 'message' => 'Could not replace it. Nothing was changed.'], 500);
         }
 
-        return response()->json(['success' => true, 'message' => $result['message']]);
+        return response()->json(['success' => true, 'message' => $result['message'], 'to' => $result['to'] ?? null]);
     }
 
     /** ingredient id => {qty, text} | null for every active non-meat ingredient. Never throws. */

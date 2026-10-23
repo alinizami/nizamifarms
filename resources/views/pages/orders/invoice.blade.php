@@ -849,6 +849,19 @@ $hideUnitPrice = request('hide_unit_price') == '1';
             $province = $order->address_province ?: ($order->customer->province ?? '');
             $postalCode = $order->address_postal_code ?: ($order->customer->postal_code ?? '');
             $phone = $order->address_phone ?: ($order->customer->phone_original ?? '');
+
+            // ✂ Split invoice (Oct-2026): one line telling the customer this invoice is
+            // part of a split. ⚠ LIVE orders only — a Shopify staging row shares ids with
+            // live orders, so it must never be looked up here.
+            $splitNote = null;
+            if ($order instanceof \App\Models\CRM\OrderModel) {
+                $splitRel = \App\Services\CRM\OrderSplitService::relationsFor([$order->id])[$order->id] ?? null;
+                if (!empty($splitRel['split_from'])) {
+                    $splitNote = 'Split from ' . $splitRel['split_from'] . ' — the rest of that order';
+                } elseif (!empty($splitRel['split_into'])) {
+                    $splitNote = 'Some items moved to ' . implode(', ', $splitRel['split_into']);
+                }
+            }
         @endphp
         @if(!empty($isPdf))
         <div class="invoice-info">
@@ -878,6 +891,9 @@ $hideUnitPrice = request('hide_unit_price') == '1';
                             <h5 class="title">Order Summary</h5>
                             <p><strong>Order No:</strong> {{ $order->order_number }}</p>
                             <p><strong>Order Date:</strong> {{ \Carbon\Carbon::parse($order->order_date)->format('j F Y') }}</p>
+                            @if($splitNote)
+                                <p style="font-size: 11px; color: #92400e;">{{ $splitNote }}</p>
+                            @endif
                         </div>
                     </td>
                 </tr>
@@ -914,6 +930,9 @@ $hideUnitPrice = request('hide_unit_price') == '1';
                         <div class="order-box-content-item">{{ $order->order_number }}</div>
                         <div class="order-box-content-item">{{ \Carbon\Carbon::parse($order->order_date)->format('j F Y') }}</div>
                     </div>
+                    @if($splitNote)
+                        <div style="padding: 6px 10px; font-size: 12px; color: #92400e; background: #fffbeb; border-top: 1px solid #fde68a; text-align: center;">✂ {{ $splitNote }}</div>
+                    @endif
                 </div>
             </div>
         </div>
