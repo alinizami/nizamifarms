@@ -3513,6 +3513,43 @@ class OrderController extends Controller
                 ], 400);
             }
 
+            // Oct-2026 — double-tap guard. The read above is not enough on its own:
+            // two Approve requests for the same staging row inside the same second
+            // (SH-23869 on Oct-22, SH-23737 on Oct-16, three more in May) both passed
+            // it and each built a live order with the SAME SH- number, because the
+            // row was only marked converted at the very end. Claim it atomically
+            // here instead — exactly one request can flip 0 → 1; the other gets the
+            // same "already converted" answer it would get a second later. Every
+            // failure path below RELEASES the claim (see $releaseClaim) so a refused
+            // or failed convert leaves the row exactly as before: waiting in the queue.
+            $claimed = \App\Models\CRM\ShopifyOrderModel::where('id', $originalOrder->id)
+                ->where(function ($q) { $q->whereNull('converted')->orWhere('converted', 0); })
+                ->update(['converted' => 1]);
+            if ($claimed !== 1) {
+                \Log::warning('convertOrder: duplicate approve blocked (row already claimed)', [
+                    'shopify_row_id' => $originalOrder->id,
+                    'order_number'   => $originalOrder->order_number,
+                    'user_id'        => auth()->id(),
+                ]);
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Order has already been converted'
+                ], 400);
+            }
+            $claimOwnerId  = (int) $originalOrder->id;
+            $releaseClaim  = static function () use ($claimOwnerId): void {
+                try {
+                    \App\Models\CRM\ShopifyOrderModel::where('id', $claimOwnerId)
+                        ->where('converted', 1)
+                        ->update(['converted' => 0]);
+                } catch (\Throwable $e) {
+                    \Log::error('convertOrder: could not release claim after failure', [
+                        'shopify_row_id' => $claimOwnerId, 'error' => $e->getMessage(),
+                    ]);
+                }
+            };
+            $convertedOrder = null; // set once the live order exists (claim is then kept)
+
             // Delivery-promise (Jul-2026): the accept button the staff pressed decides
             // BOTH the customer confirmation message and whether the order is active
             // today ('new') or parked for a future day ('pending'). Empty / unknown =
@@ -3532,6 +3569,7 @@ class OrderController extends Controller
             // Validate SKUs and recalculate prices
             $validationResult = $this->validateAndRecalculateOrder($originalOrder);
             if (!$validationResult['success']) {
+                $releaseClaim(); // refused before any live order existed → back to the queue
                 return response()->json($validationResult, 400);
             }
             
@@ -3825,6 +3863,13 @@ class OrderController extends Controller
             ]);
 
         } catch (\Exception $e) {
+            // Release the double-tap claim only if NO live order was created, so the
+            // row behaves exactly as before (still in the queue, can be re-tried). If
+            // the live order already exists, keep the claim: a retry would be the
+            // very duplicate this guard exists to stop.
+            if (isset($releaseClaim) && $convertedOrder === null) {
+                $releaseClaim();
+            }
             return response()->json([
                 'success' => false,
                 'message' => 'Failed to convert order: ' . $e->getMessage()
